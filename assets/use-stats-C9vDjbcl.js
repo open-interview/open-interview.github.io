@@ -1,0 +1,1 @@
+import{r as t,v as u,w as f}from"./index-Bw6uKFX3.js";function h(){const[n,e]=t.useState([]),[r,s]=t.useState(!0),[o,l]=t.useState(null);return t.useEffect(()=>{const a=u();if(a.length>0){e(a),s(!1);return}f.stats.getAll().then(e).catch(c=>{l(c),e([])}).finally(()=>s(!1))},[]),{stats:n,loading:r,error:o}}export{h as u};
