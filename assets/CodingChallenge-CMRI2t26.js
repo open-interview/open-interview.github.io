@@ -1,1 +1,0 @@
-import{j as o}from"./vendor-react-Ct_XtThl.js";import{Z as t}from"./index-yqdOGLaX.js";import"./vendor-radix-Dmoils4g.js";import"./vendor-recharts-Cjn_V97i.js";import"./vendor-lucide-CUW1JFFJ.js";import"./vendor-framer-DWGaSOWf.js";function s(){return o.jsx(t,{to:"/code"})}export{s as default};
