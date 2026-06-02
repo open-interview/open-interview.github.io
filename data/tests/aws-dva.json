@@ -8,378 +8,588 @@
     "questions": [
       {
         "id": "aws-dva-q-0",
-        "questionId": "q-19486",
-        "question": "In a cross-region, multi-tenant telemetry pipeline with AWS DVA primitives, design a data residency plan where tenants with sovereignty requirements live in EU while others replicate to US-East only if allowed. Use tenant-scoped partitioning, per-tenant quotas, and exactly-once ingestion with DynamoDB dedup. Implement a policy-driven masking layer evaluated at ingestion via OPA, and lay out testing for residency, latency, and rollback?",
+        "questionId": "q-2001",
+        "question": "Design a cross-account, multi-region ingestion pipeline: devices in Account A stream telemetry via Kinesis to a central data lake in Account B. Use Firehose to write Parquet to S3, Glue Catalog for schema, and Lake Formation for access control. Ensure idempotent writes with a dedup key and conditional Put, support schema evolution via Glue Schema Registry, handle late data with watermarks, and implement observability with CloudWatch metrics and a DLQ?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a Kinesis Data Stream with per-record keys and sequence numbers to enable idempotent writes; fan-out to Lambda for fast scoring and to Fargate for ML-based scoring. Maintain online state in Dynamo",
+            "text": "Implement per-tenant catalog databases (tenant_<id>) with IAM/Lake Formation controls and tenant-prefixed S3 prefixes (tenant=<id>/region). Ingest via Kinesis to Lambda, inject tenant_id, store Parque",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Architect a two-region, tenant-aware ingestion: partition by tenantId in Kinesis, idempotent Lambda consumers with DynamoDB dedupe, optional cross-region replication gated by per-tenant policy, and an",
+            "text": "Multi-account ingestion: devices in Account A stream telemetry via Kinesis to a central data lake in Account B. Firehose writes Parquet to S3; Glue Catalog tracks schema; Lake Formation enforces cross-account permission…",
             "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Use tenant_id as the Kinesis partition key to ensure per-tenant ordering and data locality. Deploy regional Kinesis Data Streams in each tenant's designated region, with an enrichment layer (Lambda or Fargate) processin…",
+            "text": "Use tenant-scoped partitioning by tenant_id in Kinesis; enforce exact-once with a DynamoDB offset store keyed by (tenant_id, producer_id) and a monotonically increasing sequence; deduplicate using a c",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use per-tenant Kinesis streams in regional pairs; Lambda/Fargate fan-out; raw events to S3 as Parquet partitioned by tenant/date; Glue catalog + Athena for queries. DynamoDB stores per-tenant retentio",
+            "text": "Implement a two-region telemetry pipeline with client-side pre-validation to drop obviously invalid events before ingestion. In AWS: regional Kinesis Data Streams feed a Lambda that computes a per-rec",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nAssesses cross-region data residency, per-tenant isolation, and policy-driven data masking in a streaming ingest.\n\n## Key Concepts\n- Data residency controls per-tenant; KDS partitioning; exactly-once with DynamoDB dedupe\n- Ingestion-time policy evaluation with OPA; observable audit trails\n- Failure modes, rollback, and canary-style policy rollout\n\n## Code Example\n```javascript\n// Pseudo: policy check during ingest\nconst policy = loadPolicy(tenantId);\nconst masked = applyMasking(event, policy);\n```\n\n## Follow-up Questions\n- How would you test residency boundaries and simulate policy rollbacks?\n- What metrics would signal drift in per-tenant SLA?",
+        "explanation": "Why This Is Asked\nTests multi-account data sharing, schema evolution, and idempotent ingestion. It probes cross-account IAM, Lake Formation permissions, and data reliability under late-arriving data.\n\nKey Concepts\n- Cross-account data access; Lake Formation permissions\n- Kinesis Data Streams → Firehose → S3 Parquet pipeline\n- Glue Catalog/Schema Registry for schema evolution\n- Idempotent writes via DynamoDB dedup with conditional Put\n- Late data handling with watermarks and DLQ routing\n- Observability via CloudWatch metrics\n\nCode Example\n```python\n# Complete idempotent write implementation\nimport boto3\nimport json\nimport os\nfrom datetime import datetime, timedelta\n\n# Initialize clients\nddb = boto3.resource('dynamodb')\nfirehose = boto3.client('firehose')\ncloudwatch = boto3.client('cloudwatch')\n\n# Configuration\nDEDUP_TABLE = os.environ['DEDUP_TABLE']\nFIREHOSE_STREAM = os.environ['FIREHOSE_STREAM']\nWATERMARK_HOURS = int(os.environ.get('WATERMARK_HOURS', '24'))\nDLQ_URL = os.environ['DLQ_URL']\n\ntbl = ddb.Table(DEDUP_TABLE)\nwatermark_cutoff = datetime.utcnow() - timedelta(hours=WATERMARK_HOURS)\n\ndef publish_metric(metric_name, value, unit='Count'):\n    cloudwatch.put_metric_data(\n        Namespace='DataIngestion',\n        MetricData=[{\n            'MetricName': metric_name,\n            'Value': value,\n            'Unit': unit\n        }]\n    )\n\ndef handler(event, ctx):\n    processed_count = 0\n    dup_count = 0\n    late_count = 0\n    error_count = 0\n    \n    records = []\n    dlq_records = []\n    \n    try:\n        for record in event['Records']:\n            data = json.loads(record['body'])\n            dedup_id = f\"{data['device_id']}_{data['timestamp']}\"\n            event_time = datetime.fromisoformat(data['timestamp'].replace('Z', '+00:00'))\n            \n            # Check for late data\n            if event_time < watermark_cutoff:\n                late_count += 1\n                dlq_records.append(record)\n                continue\n                \n            # Idempotent write with conditional Put\n            try:\n                response = tbl.put_item(\n                    Item={\n                        'dedup_id': dedup_id,\n                        'event_time': data['timestamp'],\n                        'ttl': int((datetime.utcnow() + timedelta(days=WATERMARK_HOURS+1)).timestamp())\n                    },\n                    ConditionExpression='attribute_not_exists(dedup_id)'\n                )\n                \n                # Success - add to Firehose batch\n                records.append({'Data': json.dumps(data) + '\\n'})\n                processed_count += 1\n                \n            except ddb.meta.client.exceptions.ConditionalCheckFailedException:\n                # Duplicate detected\n                dup_count += 1\n                continue\n                \n            except Exception as e:\n                error_count += 1\n                dlq_records.append(record)\n                \n        # Batch write to Firehose\n        if records:\n            firehose.put_record_batch(\n                DeliveryStreamName=FIREHOSE_STREAM,\n                Records=records\n            )\n            \n        # Send late/duplicate records to DLQ if configured\n        if dlq_records and DLQ_URL:\n            # Send to SQS DLQ\n            sqs = boto3.client('sqs')\n            for dlq_record in dlq_records:\n                sqs.send_message(QueueUrl=DLQ_URL, MessageBody=dlq_record['body'])\n                \n        # Publish metrics\n        publish_metric('ProcessedRecords', processed_count)\n        publish_metric('DuplicateRecords', dup_count)\n        publish_metric('LateRecords', late_count)\n        publish_metric('ErrorRecords', error_count)\n        \n        return {\n            'statusCode': 200,\n            'processed': processed_count,\n            'duplicates': dup_count,\n            'late': late_count,\n            'errors': error_count\n        }\n        \n    except Exception as e:\n        publish_metric('ProcessingErrors', 1)\n        raise e\n```\n\nSchema evolution and observability are fully integrated with proper error handling and metric publishing.",
         "difficulty": "advanced"
       },
       {
         "id": "aws-dva-q-1",
-        "questionId": "q-23601",
-        "question": "Design an advanced cross-region telemetry pipeline that ingests 50k–200k events/sec across 10 tenants, with per-tenant isolation, exactly-once delivery, and per-tenant budget throttling. Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, and OpenTelemetry. Include cross-region replication, tenant-scoped partition keys, and audit trails. How would you enforce SLA, handle late data, and validate observability?",
+        "questionId": "q-18955",
+        "question": "Beginner AWS DVA task: design a one-region streaming pipeline that ingests 15k JSON telemetry events per minute from 4 device classes into a Kinesis Data Stream. Enforce per-record integrity with a correlationId, validate against a lightweight JSON schema in Lambda, and implement field-level data masking (redacting PII like email, phone, SSN) before persistence. Store valid events to S3 Parquet partitioned by deviceClass/date; deduplicate by deviceId+ts in DynamoDB; route invalid records to a DLQ. Include a 24h backfill plan and basic observability, plus a LocalStack test strategy?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Plan per-tenant isolation with a tenant-scoped Kinesis stream, idempotent writes, and budget throttling. Ingest 50k–200k events/sec across 10 tenants, enrich in Lambda/Fargate, write to S3 partitioned",
-            "isCorrect": true
+            "text": "Design a cross-region telemetry pipeline with two AWS regions, each running MQTT gateways that receive JSON events from IoT devices. Events are fanned out to regional Kinesis Data Streams. Use the Glue Schema Registry t…",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a cross-region telemetry pipeline using dedicated Kinesis Streams per region, partitioned by tenantId and date for data residency compliance. Implement exactly-once processing via a DynamoDB dedupe table keyed on…",
+            "text": "Routing: per-tenant shard in KDS or tenant-keyed stream; validate with Glue Schema Registry; redact PII fields in a pre-processing step; compute risk score in Lambda; deduplicate by deviceId+ts using",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use blue/green across region-bound components (Kinesis shards, Lambda/Fargate, S3 prefixes, Glue/Athena catalogs). Route tenants by per-tenant residency flags and feature toggles stored in DynamoDB/Ap",
+            "text": "Leverage Kinesis Data Stream + Lambda to ingest; DynamoDB for dedupe (deviceId+seq); Lambda validates JSON, redacts PII, writes Parquet to S3 partitioned by region/date; Glue catalog + Athena for quer",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Route events by tenant to region-specific KDS streams, enforce residency with IAM/KMS policies, and use idempotent writes to a per-tenant DynamoDB offset store. Enrich in Lambda, store valid records t",
-            "isCorrect": false
+            "text": "Approach: regional Kinesis stream fed into a Lambda that validates with a small JSON schema, masks PII (email, phone, SSN) before storage, dedups by deviceId+ts in DynamoDB, writes valid records to S3",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\n\nAssesses ability to design a scalable, DR-ready, multi-tenant telemetry pipeline with strict data isolation, precise delivery semantics, and robust observability.\n\n## Key Concepts\n\n- Per-tenant isolation and partitioning\n- Exactly-once processing across multiple sink regimes\n- Cross-region replication and DR strategy\n- OpenTelemetry instrumentation and tracing\n- Throughput budgeting and alerting per tenant\n- Data governance with Glue/Athena and DynamoDB audit trails\n\n## Code Example\n\n```python\n# Pseudo dedup logic\ndef should_process(event, context):\n    key = (event['tenant'], event['deviceId'], event['timestamp'])\n    if key in context.seen:\n        return False\n    context.seen.add(key)\n    return True\n```\n\n## Follow-up Questions\n\n- How would you implement per-tenant budget throttling and alerting?\n\n- How would you validate cross-region replication consistency and audit trails?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nThis question tests practical design of a privacy-conscious, end-to-end streaming pipeline that validates, masks, deduplicates, and persists data with observability.\n\n## Key Concepts\n- Kinesis Data Streams, Lambda, DynamoDB dedup, S3 Parquet storage, DLQ\n- JSON schema validation, field-level masking of PII, correlationId\n- Backfill strategy, LocalStack testing, basic observability (CloudWatch, X-Ray)\n\n## Code Example\n```javascript\nfunction maskPII(record) {\n  const r = {...record};\n  if (r.email) r.email = r.email.replace(/[^@]+@/, '***@');\n  if (r.phone) r.phone = r.phone.length > 4 ? r.phone.slice(0, 3) + '****' + r.phone.slice(-4) : r.phone;\n  if (r.ssn) r.ssn = '***-**-' + r.ssn.slice(-4);\n  return r;\n}\n```\n\n## Follow-up Questions\n- How would you test the masking logic end-to-end, including replays?\n- How would you ensure no PII leaks to DLQ or downstream sinks?\n- How would you scale this to higher event rates or additional device classes?",
+        "difficulty": "beginner"
       },
       {
         "id": "aws-dva-q-2",
-        "questionId": "q-24621",
-        "question": "Design a global, multi-tenant telemetry ingestion pipeline at Discord-scale where tenants can be onboarded and offboarded at runtime with strict isolation, per-tenant OpenTelemetry sampling, and policy-driven data retention across regions. Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, plus OpenTelemetry and OPA. Explain tenant isolation boundaries, per-tenant cost accounting, streaming guarantees, audit trails, and dynamic onboarding latency?",
+        "questionId": "q-14618",
+        "question": "Beginner AWS DVA task: design a two-region telemetry ingestion pipeline. 2k JSON events/min flow into regional Kinesis Data Streams. Validate against a Glue Schema Registry, assign a schema version, deduplicate by deviceId+ts with DynamoDB, store valid records in S3 Parquet partitioned by region/date, route invalids to a DLQ, and populate basic data lineage in the Glue Data Catalog. Include a 7-day backfill plan and observability?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Tenants publish OpenTelemetry traces/metrics to Kinesis with tenant_id as the partition key. Lambdas/Fargates normalize events, store raw data in per-tenant S3 prefixes, and update Glue catalogs. Dyna",
+            "text": "Use per-region Kinesis Data Streams; a Lambda subscribes to each stream and applies tenant-specific masking rules stored in DynamoDB, emitting masked JSON to S3 Parquet (partitioned by region/date) vi",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Proposed approach: A Kinesis consumer Lambda validates per-device monotonicity by querying/updating DynamoDB lastTs for deviceId; if ts > lastTs, persist event to S3 Parquet date-partitioned and updat",
-            "isCorrect": false
+            "text": "Regional Kinesis Data Streams ingest approximately 2,000 JSON events per minute per region. Lambda functions validate each JSON record against the AWS Glue Schema Registry, attach the corresponding schema version, and c…",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Set up a Kinesis Data Stream in the region, a Node.js Lambda to validate each JSON line, assign a data quality score, and check for required fields. Use a single DynamoDB table with composite keys ten",
+            "text": "Producer writes to SQS; Consumer Lambda validates against a DynamoDB-stored schema (versions v1/v2), deduplicates by deviceId+ts, and writes valid events to S3 Parquet with daily partitioning. Invalid",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design a global, multi-tenant telemetry ingestion pipeline at Discord-scale where tenants can be onboarded and offboarded at runtime with strict isolation, per-tenant OpenTelemetry sampling, and policy-driven data reten…",
-            "isCorrect": true
+            "text": "Design an end-to-end observability plan using AWS DVA primitives with OpenTelemetry for cross-region, multi-tenant telemetry pipelines. Implement a unified collector that receives OTLP data from all layers, with tenant-…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question tests the ability to design multi-tenant data isolation, dynamic onboarding, and policy enforcement at scale using AWS data and analytics primitives.\n\n## Key Concepts\n- Tenant-scoped data partitions with per-tenant cost attribution\n- Runtime onboarding and offboarding latency and consistency guarantees\n- OPA policy integration at ingestion for access control and retention policies\n- Per-tenant OpenTelemetry sampling for optimized observability costs\n- Cross-service coordination across Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, and DynamoDB\n\n## Design Considerations\n\n### Tenant Isolation Boundaries\n- Use separate Kinesis streams or dedicated shards per tenant\n- Implement VPC-level isolation and IAM role-based access control\n- Store tenant data in isolated S3 prefixes with bucket policies\n- Use DynamoDB tables with partition keys that encode tenant ID\n\n### Per-Tenant Cost Accounting\n- Emit CloudWatch metrics tagged by tenant for each operation\n- Use Cost Explorer tags to aggregate per-tenant spend\n- Implement Athena queries over S3 access logs for detailed attribution\n\n### Streaming Guarantees\n- Configure Kinesis stream partitioning by tenant for ordered processing\n- Use Lambda consumer functions with checkpointing via DynamoDB\n- Implement exactly-once processing semantics where required\n\n### Audit Trails\n- Enable CloudTrail for API-level auditing across all services\n- Store access logs in an immutable audit S3 bucket\n- Use DynamoDB for real-time audit query capabilities\n\n### Dynamic Onboarding Latency\n- Pre-provision IAM roles and S3 prefixes for known tenants\n- Store onboarding manifests in DynamoDB for near-instant activation\n- Target <5 minute latency from tenant registration to data ingestion",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests understanding of cross-region data ingestion, schema registry validation, idempotent deduplication strategies, and data lineage implementation in a beginner-friendly AWS architecture.\n\n## Key Concepts\n- Glue Schema Registry validation and versioning\n- Regional Kinesis Data Streams for scalable ingestion\n- DynamoDB deduplication using composite keys\n- S3 Parquet storage with region/date partitioning\n- Glue Data Catalog for lineage metadata\n- CloudWatch observability and Step Functions for backfill orchestration\n\n## Code Example\n```javascript\n// Pseudo: onKinesisEvent(event) {\n//   if (validate(event)) { \n//     writeParquet(deduped(event)); \n//   } else { \n//     sendDLQ(event); \n//   }\n// }\n```",
+        "difficulty": "beginner"
       },
       {
         "id": "aws-dva-q-3",
-        "questionId": "q-4682",
-        "question": "How would you build a privacy-preserving, cross-region telemetry ingestion pipeline that masks PII at ingestion, supports tenant-specific retention and immutable audit logs, and still allows analytics queries? Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, plus OpenTelemetry. Describe per-tenant masking policies, policy storage, audit trail integrity, and retention enforcement without breaking analytics?",
+        "questionId": "q-29169",
+        "question": "Beginner AWS DVA: In a single region, ingest 1k–2k JSON telemetry events/min from IoT devices into a Kinesis Data Stream. Implement 60-second late-arrival tolerance with a windowing mechanism stored in DynamoDB and a flush Lambda that writes completed windows to S3 Parquet, partitioned by date. Validate required fields in a Lambda, assign a per-record quality score, dedupe by deviceId+ts, route invalid events to a DLQ, and enable X-Ray tracing across producer → validator → transformer → S3. Provide a LocalStack test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Mask PII at the ingress path using a tenant-scoped policy stored in DynamoDB and applied by a Lambda step before writing to S3 and DynamoDB. Use OpenTelemetry to trace masking decisions. Enforce reten",
-            "isCorrect": true
+            "text": "An inter-region pipeline uses Kinesis Data Streams in each region; a per-record Lambda masks PII fields (phone, email, deviceId) and replaces with a stable surrogate. Glue Schema Registry enforces a m",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Proposed: per-tenant Kinesis streams feed a Lambda validator that checks types and required fields against Glue Schema Registry; valid events deduplicate with a DynamoDB idempotency table keyed by dev",
+            "text": "Propose a cross-region, multi-tenant telemetry pipeline: per-tenant adaptive sampling, exactly-once processing, and policy-driven routing to S3/Glue. Use Kinesis, Lambda/Fargate, OpenTelemetry. Descri",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Route data by tenantId, storing events in s3://bucket/tenants/{tenantId}/{region}/{date}/ as Parquet; use per-tenant dedupe in DynamoDB with deviceId+seq; create tenant-scoped IAM roles granting acces",
-            "isCorrect": false
+            "text": "Use a fixed 60-second watermark window stored in a DynamoDB table keyed by deviceId with a lastSeen timestamp. A validator Lambda attaches a qualityScore and routes records with missing required fields to the DLQ. For l…",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Central per-tenant schema registry (AVRO/JSON with optional fields) backed by Glue Catalog and DynamoDB; data written to S3 Parquet partitioned by tenant/date/region; Kinesis Data Streams feed Lambda/",
+            "text": "Use Kinesis Data Streams (2-3 shards) to ingest 10k events/min. A Lambda consumer validates records against Glue Schema Registry using the supplied schemaVersion. Valid records are written to S3 Parqu",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nAssesses ability to design privacy-first, policy-driven pipelines that preserve analytics usability while enforcing tenant isolation, retention, and immutable audit trails across regions.\n\n## Key Concepts\n\n- Per-tenant masking policies stored in DynamoDB\n- Ingress-level masking in Lambda/Fargate\n- Immutable audit trails in S3/DynamoDB with tracing via OpenTelemetry\n- Cross-region replication and per-tenant Glue partitions for analytics\n\n## Code Example\n\n```python\n# Pseudo policy-driven masking example\ndef apply_mask(record, policy):\n    field = policy[\"pii_field\"]\n    if field in record:\n        val = record[field]\n        return {**record, field: mask(val, policy.get(\"mask_type\", \"partial\"))}\n    return record\n```\n\n## Follow-up Questions\n\n- How would you handle policy changes retroactively without breaking data integrity?\n- What tests would verify analytics remain accurate after masking, and how would you measure cost impact?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests practical data-windowing with late-arrival handling—a common real-world requirement for IoT streams. Evaluates the ability to manage out-of-order events, deduplication, and end-to-end tracing in a beginner-friendly setup.\n\n## Key Concepts\n- Late-arrival windowing with watermarking\n- DynamoDB as a stateful window store\n- Lambda-based validation and scoring\n- Per-record deduplication keyed by deviceId+ts\n- Parquet writes to S3 with date partitioning\n- DLQ for invalid records and X-Ray tracing\n- LocalStack for end-to-end test planning\n\n## Code Example\n```python\n# Window state in DynamoDB\nwindow_key = {'deviceId': record['deviceId'], 'windowStart': window_start}\nwindow_state = dynamodb.get_item(Key=window_key)\n\n# Check watermark for late-arrival tolerance\nif record['ts'] < window_state['watermark']:\n    return  # Discard late event\n\n# Validate and score\nif not validate_required_fields(record):\n    sqs.send_to_dlq(record)\nelse:\n    record['qualityScore'] = calculate_score(record)\n```\n\n## LocalStack Test Plan\n1. Deploy Kinesis, Lambda, DynamoDB, SQS, and S3 to LocalStack\n2. Publish sample IoT events with varied timestamps\n3. Verify late-arrival handling via watermark checks\n4. Confirm invalid records route to DLQ\n5. Validate completed windows write Parquet to S3 with correct partitioning\n6. Enable X-Ray to verify full trace from producer to S3",
+        "difficulty": "beginner"
       },
       {
         "id": "aws-dva-q-4",
-        "questionId": "q-17901",
-        "question": "In a two-region telemetry pipeline, design an architecture that ingests 50k events/min per region via Kinesis Data Streams, with per-tenant isolation (tenantId). Implement a data-quality gate in Lambda: validate JSON, enforce required fields, simple statistical bounds, and deduplicate by (tenantId, deviceId, ts). Route anomalies to an audit SQS for human review; valid data writes to S3 Parquet and a per-tenant DynamoDB index. Add backfill handling for late data (24-48h), observability, and cost trade-offs. Provide testing strategy including LocalStack?",
+        "questionId": "q-3982",
+        "question": "In a Tesla-like fleet telemetry pipeline, implement end-to-end distributed tracing with OpenTelemetry from device to Kinesis, Lambda/Fargate, and central analytics. Describe trace propagation in records, sampling strategy, idempotent writes, tenant isolation, and failure observability, with concrete trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement per-tenant regional routing by tenantId, use a shard per tenant in Kinesis Data Streams, deduplicate with a composite key tenantId+deviceId+ts stored in DynamoDB, enrich in Lambda, write Par",
+            "text": "Mask PII per-tenant at ingestion using a policy store (DynamoDB) and a masking function in a Lambda/Fargate consumer; route redacted events to regional S3 Parquet (region/date); keep raw events in a s",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Instrument Lambda and Fargate with OpenTelemetry, propagate traceparent/Tracestate, and export OTLP to a central Collector on ECS. Apply a fixed sampling rate (e.g., 0.15–0.25) with per-service quotas",
-            "isCorrect": false
+            "text": "Instrument OpenTelemetry at the producer to emit traceparent in each Kinesis record, with adaptive sampling at 0.1–0.5% to reduce overhead. In Lambda/Fargate, bind spans from incoming trace context, p",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Use Glue Streaming or Spark on Glue to read from Kinesis, validate against Glue Schema Registry, and write per-tenant Parquet with Hudi for upserts. Maintain a dedup table in DynamoDB keyed by tenant+",
+            "text": "Store tenant data in S3 under /tenants/{tenantId} and enforce isolation with Lake Formation grants tied to per-tenant tables. Use per-tenant IAM roles mapped to a central admin for governance, apply S",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Architecture: Per-region Kinesis Data Streams with tenantId as the partition key ensures even distribution and tenant isolation. A Lambda consumer function serves as the data-quality gate, performing the following valid…",
-            "isCorrect": true
+            "text": "Construct three-region telemetry streams, isolating tenants with separate Kinesis shards, S3 prefixes, and DynamoDB offsets. Implement exactly-once at ingestion via deterministic sequence IDs in Lambda functions that va…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question tests the ability to design multi-tenant, cross-region data pipelines with quality gates, human-in-the-loop auditing, backfill handling, observability, and cost optimization. It requires knowledge of Kinesis Data Streams, Lambda, S3 Parquet, DynamoDB, SQS, Step Functions, and OpenTelemetry, plus a solid testing strategy.\n\n## Key Concepts\n- **Data Quality Gates**: Schema validation, required field enforcement, statistical bounds checking\n- **Per-Tenant Isolation**: tenantId as partition key, separate DynamoDB indexes\n- **Deduplication**: Composite key strategy (tenantId, deviceId, ts) with TTL\n- **Human-in-the-Loop**: SQS-based anomaly queue for manual review\n- **Late Data Handling**: Watermark tables, 24-48h window with Step Functions backfill\n- **Observability**: Distributed tracing, custom metrics, logging\n- **Cost Trade-offs**: S3 tiering, Lambda memory optimization, KDS enhanced fan-out\n\n## Code Example\n```javascript\nfunction dedupKey(tenantId, deviceId, ts) {\n  return `${tenantId}|${deviceId}|${ts}`;\n}\n\nasync function validateRecord(record) {\n  const errors = [];\n  \n  if (!record.tenantId || !record.deviceId || !record.ts) {\n    errors.push('Missing required fields');\n  }\n  \n  if (record.temperature < -50 || record.temperature > 150) {\n    errors.push('Temperature out of bounds');\n  }\n  \n  return { valid: errors.length === 0, errors };\n}\n```\n\n## Testing Strategy with LocalStack\n- **Unit Tests**: Lambda handler logic with mock events\n- **Integration Tests**: KDS → Lambda → S3/DynamoDB using LocalStack\n- **E2E Tests**: Full pipeline with sample telemetry data\n- **Chaos Testing**: Simulate Lambda timeouts, KDS throttling",
+        "explanation": "## Why This Is Asked\n\nInterviews test observability in streaming pipelines, pushing for end-to-end tracing, data formats, and tenancy considerations in AWS DVA.\n\n## Key Concepts\n\n- OpenTelemetry trace propagation across producers, Kinesis, and processors\n- End-to-end context in Lambda/Fargate with proper context binding\n- Idempotent writes and deduplication across regions\n- Tenant isolation via Lake Formation and per-tenant data stores\n- Sampling strategies and their impact on latency and cost\n- Failure handling: retries, DLQ, backpressure, and observability\n\n## Code Example\n\n```javascript\n// Pseudo-code: attach trace context to a Kinesis record\nconst span = tracer.startSpan('telemetry.ingest');\nconst { traceId, spanId } = span.context();\nconst traceparent = `00-${traceId}-${spanId}-01`;\nconst record = {\n  deviceId,\n  timestamp: Date.now(),\n  payload,\n  traceparent\n};\nrecords.push(record);\nspan.end();\n```\n\n## Follow-up Questions\n\n- How would you validate schema evolution for trace metadata without producers breaking?\n- How would you monitor trace latency and backlog across multiple regions and services?",
         "difficulty": "intermediate"
       },
       {
         "id": "aws-dva-q-5",
-        "questionId": "q-2856",
-        "question": "Design a multi-tenant telemetry ingestion pipeline where each tenant defines evolving JSON schemas. Propose an end-to-end AWS DVA solution that guarantees tenant isolation, supports per-tenant schema evolution, idempotent writes, PII masking, and a 24-hour late-arrival window. Include concrete services: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, Lake Formation, DynamoDB, and discuss trade-offs?",
+        "questionId": "q-2751",
+        "question": "In a beginner AWS DVA pipeline, implement end-to-end data lineage for regional telemetry. 2,000 devices emit JSON lines to Kinesis Data Streams. A Fargate task validates schema, enforces UTC timestamps, and writes Parquet to S3 partitioned by region/date. Preserve immutable raw JSON in S3 and create a DynamoDB audit table capturing event_id, shard_id, ingest_ts, process_ts, status, and a hash of applied transformations. How would you guarantee end-to-end lineage, idempotent writes, and observability, including failure handling and cost considerations?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design uses region-scoped streams and S3 buckets per tenant, with a tenancy table in DynamoDB and per-tenant IAM. EU data lands in EU buckets and is lineage-tracked in Glue; US data is replicated to a",
-            "isCorrect": false
+            "text": "Store immutable raw in S3 with event_id as key; create a DynamoDB audit row per event: event_id, shard_id, ingest_ts, process_ts, status, transformations_hash. Use idempotent writes via conditional Pu",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Do dedupe first with DynamoDB keyed by sha256(deviceId+ts); in a regional Lambda mask deviceId and customerId using HMAC-SHA256 with a per-region KMS key, replacing only the payload while leaving the",
+            "text": "Implement per-tenant data tiers in S3 with lifecycle rules keyed by tenant_id and data_age; route streaming via Kinesis to Lambda that writes to tenant-specific S3 prefixes; use Glue to crawl and partition metadata; cre…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Single Kinesis stream partitioned by tenantId; Lambda masks PII and validates against per-tenant schemaVersion stored in DynamoDB. Valid events route to S3 Parquet under tenant/year=ver; Glue Spark jo",
-            "isCorrect": true
+            "text": "Key approach: ingestion-time validation with per-tenant rules stored in DynamoDB; a dedicated validator (Lambda/Fargate) evaluates tenantId, deviceId, ts against the tenant's JSON schema (required fie",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Set up a Kinesis Data Stream in the region, a Node.js Lambda to validate each JSON line, assign a data quality score, and check for required fields. Use a single DynamoDB table with composite keys ten",
+            "text": "Route 5% of traffic to a new enrichment path using a feature flag stored in DynamoDB, while routing the remaining 95% through the existing pipeline. Deploy Kinesis Data Streams (KDS) in both regions (us-east-1 and eu-we…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design multi-tenant governance, dynamic schema handling, and privacy-preserving ingestion.\n\n## Key Concepts\n- Multi-tenant isolation with Lake Formation\n- Per-tenant schema registry in DynamoDB\n- Idempotent upserts in Glue Spark\n- PII masking strategies in Lambda\n- Late-arrival handling window and backfill plan\n\n## Code Example\n```python\n# Masking example (simplified)\ndef mask_pii(record):\n    if 'phone' in record:\n        record['phone'] = 'REDACTED'\n    if 'email' in record:\n        local, _, domain = record['email'].partition('@')\n        record['email'] = (local[:3] + '***@' + domain) if domain else 'REDACTED'\n    return record\n```\n\n## Follow-up Questions\n- How would you validate schema evolution without breaking existing tenants?\n- How would you monitor cost and data skew across tenants?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nThis question probes practical lineage, idempotence, and observability, not just throughput.\n\n## Key Concepts\n- Data lineage across KDS, Fargate, and S3\n- Immutable raw storage and audit tracking\n- Idempotent writes and failure handling\n- Observability via CloudWatch and Athena\n\n## Code Example\n```javascript\n// Minimal conditional put to DynamoDB to upsert audit records\nconst { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');\nconst client = new DynamoDBClient({region: 'us-east-1'});\nconst cmd = new PutItemCommand({\n  TableName: 'TelemetryAudit',\n  Item: {\n    event_id: { S: id },\n    shard_id: { S: shard },\n    ingest_ts: { N: String(ingest) },\n    process_ts: { N: String(now) },\n    status: { S: 'OK' },\n    transformations_hash: { S: hash }\n  },\n  ConditionExpression: 'attribute_not_exists(event_id)'\n});\nawait client.send(cmd);\n```\n\n## Follow-up Questions\n- How would you test end-to-end lineage in a sandbox? \n- How would you handle schema evolution while preserving lineage?",
+        "difficulty": "beginner"
       },
       {
         "id": "aws-dva-q-6",
-        "questionId": "q-14050",
-        "question": "Design a cross-region telemetry ingestion path for 50 tenants with strict per-tenant isolation, dynamic sampling, and per-tenant retention with purge within 7 days, while supporting zero-downtime deployments and exactly-once processing across 2 Regions using AWS DVA primitives. Explain tenant-scoped partitions in Kinesis, idempotent writes in DynamoDB, per-tenant backfill handling, purge validation within 48 hours, and cross-tenant audit trails and cost controls?",
+        "questionId": "q-15806",
+        "question": "Design a real-time cross-region telemetry pipeline for 50 tenants with per-tenant masking, retention, and strict isolation. Ingest 100k events/min from devices per region into region-scoped Kinesis streams, apply per-tenant masking at ingest using OpenTelemetry attributes and Glue DataMasks, store masked events in S3 Parquet, maintain per-tenant cost accounting in DynamoDB, and ensure exactly-once processing across regions with idempotent producers. Explain event schemas, partitioning, purge, auditability, testing strategy, and trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "I would implement a single-region KDS with a Lambda enrichment that caches device metadata in DynamoDB and uses a deterministic, idempotent S3 key (region/date/deviceId+ts). The Lambda retries API cal",
+            "text": "Design uses two-region Kinesis Data Streams with fan-out to Lambda/Fargate. A masking step uses KMS envelope encryption to redact PII fields before writing to a masked S3 Parquet dataset; raw events g",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Propose a single-region flow: KDS ingests 10k JSON events/min; a Lambda enriches with device owner and privacy prefs from DynamoDB, masks PII fields, then writes to S3 Parquet encrypted at rest with S",
-            "isCorrect": false
+            "text": "Architect a cross-region, multi-tenant pipeline with region-scoped Kinesis streams, masking stage keyed by tenantId, and per-tenant cost/retention ledger in DynamoDB. Use deterministic keys tenantId-d",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "To implement, provision a single region with 500–1000 events/min across two device families, map to a Kinesis Data Stream. Use a DynamoDB table SchemaVersion (version string, hash) as the registry, an",
+            "text": "Design an end-to-end multi-tenant pipeline: a single Kinesis Data Stream ingests JSON; a Lambda deduplicates by tenant_id + event_id and writes per-tenant Parquet to S3 with daily partitions; register",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Architect a cross-region ingestion using two Kinesis streams (one per region) with tenant-scoped partition keys, and per-tenant sampling rates stored in DynamoDB. Use Lambda/Fargate workers; apply ide",
-            "isCorrect": true
+            "text": "Per-tenant partition keys on Kinesis; idempotent Lambda handlers keyed by tenant+messageId; propagate OpenTelemetry trace context (W3C) across producers, Lambda, Fargate, and Glue; collector writes sp",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests cross-region telemetry design, tenant isolation, and governance under cost pressure with real primitives.\n\n## Key Concepts\n\n- Tenant isolation across streams and sinks\n- Dynamic per-tenant sampling and tunable retention\n- Exactly-once semantics via sequence numbers and idempotent writes\n- Purge strategies with tombstones and scheduled cleanups\n- Cross-tenant audits, cost controls, and robust failover\n\n## Code Example\n\n```javascript\n// Pseudo: idempotent write with conditional put\nasync function writeEvent(ddb, table, event){\n  await ddb.put({\n    TableName: table,\n    Item: { tenantId: event.tenantId, id: event.id, payload: event.payload, ts: event.ts },\n    ConditionExpression: \"attribute_not_exists(id)\"\n  });\n}\n```\n\n## Follow-up Questions\n\n- How to test exactly-once guarantees under burst traffic?\n- How would you calibrate per-tenant sampling and purge windows with SLAs?",
+        "explanation": "## Why This Is Asked\nThis angle tests governance, masking, and cross-region coordination under strict tenancy isolation with real-time SLAs.\n\n## Key Concepts\n- Per-tenant masking and retention\n- Cross-region consistency and idempotency\n- Region-scoped isolation and cost accounting\n- OpenTelemetry integration and data catalogs\n\n## Code Example\n```javascript\n// Idempotent key for writes\nfunction idempotentKey(tenantId, deviceId, ts) {\n  return `${tenantId}::${deviceId}::${ts}`;\n}\n```\n\n## Follow-up Questions\n- How would you test masking rules across tenants?\n- How handle late-arriving data and backfill?\n- What are the trade-offs for per-tenant retention granularity?",
         "difficulty": "advanced"
       },
       {
         "id": "aws-dva-q-7",
-        "questionId": "q-1801",
-        "question": "Ingest JSON events from multiple payment rails into a single streaming layer, partitioned by exchange, and store per-exchange Parquet data in an Iceberg-backed table on S3. Describe the end-to-end design focusing on idempotent writes, late-arriving data, schema evolution, and auditability with time travel. Include concrete steps and trade-offs between Iceberg vs Glue Catalog?",
+        "questionId": "q-1706",
+        "question": "Design a beginner-friendly, end-to-end data quality check for a daily Parquet dataset stored in S3: s3://telemetry/processed/YYYY/MM/DD/. The data is produced by a Glue job from JSON input. Propose a minimal workflow (using Lambda, Glue, or Athena) that validates schema conformance, computes a day-over-day row-count delta, and emits a quality score JSON to s3://telemetry/quality-reports/YYYY/MM/DD/. Include how you would trigger, idempotency, and basic monitoring?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Proposed tenancy-aware pipeline: a single Kinesis Data Stream partitioned by tenant_id; per-tenant prefixes in S3 for Parquet storage; DynamoDB for deduplication and metadata keyed by tenant_id+device_id+timestamp; Glue…",
-            "isCorrect": false
+            "text": "Leverage a daily Glue ETL to validate schema and output Parquet, plus an Athena-based delta check to compare day-over-day row counts. Emit a quality score JSON to s3://telemetry/quality-reports/YYYY/M",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Proposed approach: Ingest via Kinesis Data Streams; Lambda validates JSON and routes malformed payloads to a DLQ. Use DynamoDB to dedupe by deviceId+ts. Write valid events to S3 as Parquet, partitioned by region/date. I…",
+            "text": "Architect a cross-region ingestion using two Kinesis streams (one per region) with tenant-scoped partition keys, and per-tenant sampling rates stored in DynamoDB. Use Lambda/Fargate workers; apply ide",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Architecture: Per-region Kinesis Data Streams with tenantId as the partition key ensures even distribution and tenant isolation. A Lambda consumer function serves as the data-quality gate, performing the following valid…",
+            "text": "Validate each JSON record against a versioned schema stored in DynamoDB; compute a per-record risk score using recent historical data; route low-risk events to S3 in Parquet format (partitioned by region and date) and h…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Key ideas: use MERGE INTO Iceberg with event_id as PK for upserts; route late data with a bounded lateness window and a retry path; leverage Iceberg schema evolution with defaults for new cols; ensure",
-            "isCorrect": true
+            "text": "To solve, set up a Kinesis Data Stream as the entrypoint, an enrichment Lambda that increments a per-device counter in DynamoDB, validates required fields, and forwards valid records to Kinesis Fireho",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question probes streaming design with lakehouse patterns, idempotence, late data handling, schema evolution, and auditability—crucial for fintech data platforms at scale.\n\n## Key Concepts\n\n- Iceberg upserts and MERGE INTO\n- Late-arrival data handling with watermarks and bounded windows\n- Schema evolution with backward/forward compatibility\n- Auditability via immutable data and changelog tables\n- Catalog backend choices: Iceberg with Glue vs alternatives\n\n## Code Example\n\n```sql\nMERGE INTO iceberg_db.exchanges AS t\nUSING staged_exchanges AS s\nON t.exchange_id = s.exchange_id AND t.event_time = s.event_time\nWHEN MATCHED THEN UPDATE SET t.payload = s.payload\nWHEN NOT MATCHED THEN INSERT (exchange_id, event_time, payload) VALUES (s.exchange_id, s.event_time, s.payload)\n```\n\n## Follow-up Questions\n\n- How would you implement exactly-once semantics across multiple streams?\n- How would you monitor late-arrival data and alert on schema drift?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests practical ability to design a simple quality pipeline with AWS primitives, focusing on schema validation, drift detection, and observability.\n\n## Key Concepts\n- Glue ETL and Crawlers\n- Parquet partitioning\n- Athena for ad-hoc checks\n- Idempotent checkpoint (DynamoDB)\n- CloudWatch alerts and dashboards\n\n## Code Example\n```javascript\n// Lightweight Lambda skeleton for quality report write\nexports.handler = async () => {\n  // read latest processed parquet manifests from S3\n  // fetch previous day count from DynamoDB\n  // compute delta and schema conformance\n  // write quality JSON to quality-reports path\n};\n```\n\n## Follow-up Questions\n- How would you handle late-arriving data?\n- How would you scale checks for larger datasets?",
+        "difficulty": "beginner"
       },
       {
         "id": "aws-dva-q-8",
-        "questionId": "q-24371",
-        "question": "Edge-first telemetry: edge gateways buffer offline and batch-send to AWS IoT Core, which fans out to two regional Kinesis Data Streams. Design end-to-end processing with per-record validation, deduplication by deviceId+ts, cross-region replication, and a 7-day backfill. Include tracing from edge to S3, schema evolution handling, and cost-aware storage?",
+        "questionId": "q-29595",
+        "question": "Design an intermediate AWS DVA pipeline where devices in two regions publish 20k JSON telemetry events/min to region-specific Kinesis Streams. Build a cross-region analytics lake in a third region using S3, Glue, and Athena, while enforcing per-event privacy masking, idempotent writes, and late-data handling within 1 hour. Outline data validation, dedup, schema evolution with Glue Registry, and observability; provide concrete producer/consumer roles and failure plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use per-tenant CMEK in AWS KMS and per-tenant S3 prefixes for raw/processed data. Ingest via Kinesis Data Streams and route through tenant-scoped Lambda/Fargate workers with IAM isolation. Employ enve",
+            "text": "Propose a chaos-injection plan that randomly delays or drops 0.5-2% of records between Kinesis and the consumer. Use idempotent writes to DynamoDB and S3, enable OpenTelemetry traces across producer,",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Partition keys: tenantId+deviceId; KDS shards autoscale to avoid hotspots; guarantee exactly-once with a per-record sequence token in DynamoDB and idempotent sinks to S3/Parquet; Lambda/Fargate for pr",
+            "text": "Set up a Kinesis Data Stream in the region, a Node.js Lambda to validate each JSON line, assign a data quality score, and check for required fields. Use a single DynamoDB table with composite keys ten",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement per-tenant isolation using region-scoped S3 prefixes with dedicated DynamoDB policy stores; ingest telemetry through Kinesis Data Streams with Lambda processors, enforce retention and access controls via per-t…",
+            "text": "Design a Kinesis consumer Lambda that ingests IoT telemetry, validates records, and redacts PII. Generate a data key using AWS KMS, then encrypt the payload with the AWS Encryption SDK before writing to S3 as Parquet fi…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Edge-first telemetry: edge gateways buffer offline and batch-send to AWS IoT Core, which fans out to two regional Kinesis Data Streams. A Lambda consumer validates against Glue Schema Registry, comput",
+            "text": "In two regions, devices publish 20k JSON/min to region-specific Kinesis streams. Implement a cross-region analytics lake in a third region using S3, Glue, and Athena. Mask PII in Lambda before storage",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical edge-to-cloud ingestion, cross-region dataflow, and end-to-end observability for real-world telemetry workloads.\n\n## Key Concepts\n- Edge buffering, MQTT/TLS\n- AWS IoT Core and multi-region Kinesis Data Streams\n- Schema validation with Glue Schema Registry\n- Idempotent dedupe with DynamoDB\n- S3 Parquet storage with lifecycle\n\n## Code Example\n```javascript\n// Pseudo: Lambda dedupe flow\nasync function process(record){\n  const exists = await checkDedupe(record.deviceId, record.ts);\n  if(exists) return; // idempotent\n  await store(record);\n}\n```\n\n## Follow-up Questions\n- How would you ensure exactly-once semantics across regions? \n- How would you simulate and test edge offline buffering and reprojection to cloud?",
+        "explanation": "## Why This Is Asked\n\nTests ability to design cross-region data flows, enforce privacy masking at rest/in transit, and implement idempotent writes in a multi-region DVA with clear failure handling and observability.\n\n## Key Concepts\n\n- Cross-region data flows and latency implications\n- Per-event PII masking in Lambda\n- Idempotent writes using composite keys (deviceId+ts)\n- Glue Schema Registry for evolving schemas\n- Late data handling and windowed processing\n- Observability: metrics, traces, DLQs\n\n## Code Example\n\n```javascript\nfunction maskPii(record){\n  const r = { ...record };\n  if (r.userEmail) r.userEmail = r.userEmail.replace(/(.{1}).+(@.*)/, '$1***$2');\n  if (r.phone) r.phone = r.phone.replace(/\\d(?=\\d{4})\\d{3}-\\d{4}/, '***-****');\n  return r;\n}\n```\n\n## Follow-up Questions\n\n- How would you test idempotency across two shards and a DLQ?\n- How would you validate privacy masking compliance with data samples and audits?",
         "difficulty": "intermediate"
       },
       {
         "id": "aws-dva-q-9",
-        "questionId": "q-16881",
-        "question": "Design a cross-region telemetry pipeline with multi-tenant fidelity controls that can be adjusted on-the-fly (full, masked, or redacted) at ingestion. Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, and OpenTelemetry. Explain per-tenant isolation, exactly-once processing, schema evolution, and a dynamic fidelity policy enforced via OPA at ingestion; include testing strategy and failure modes?",
+        "questionId": "q-22161",
+        "question": "Design a cross-region, multi-tenant telemetry pipeline that ingests 1M events/min from 100+ tenants with per-tenant isolation, dynamic backpressure, and budget-based cost controls. Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, and OpenTelemetry. Explain tenant-scoped partitioning, quota enforcement, exactly-once enrichment, retention, and observability. What concrete architecture and failure modes would you implement?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement per-tenant privacy controls using a DynamoDB policy table keyed by tenantId. Ingest telemetry through regional Kinesis Data Streams, where Lambda functions apply tenant-specific masking policies—PII redaction,…",
+            "text": "Ingest into Kinesis with tenantId as the partition key; fan out to Lambda for streaming transforms and Fargate for heavy analytics. Use idempotent writes to DynamoDB and store raw/curated data in per-",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Architect a per-tenant SLA breach alerting flow: ingest traces from all tenants into a Kinesis Data Stream, enrich with Lambda/Fargate, and score latency per tenant using OpenTelemetry spans (baggage",
+            "text": "I would implement a single-region KDS with a Lambda enrichment that caches device metadata in DynamoDB and uses a deterministic, idempotent S3 key (region/date/deviceId+ts). The Lambda retries API cal",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Route 50k events/min per region to regional Kinesis streams and a global archival stream. Use a Lambda/Fargate consumer with idempotent writes; mask deviceId on write; deduplicate via DynamoDB (device",
-            "isCorrect": false
+            "text": "Architect a cross-region, multi-tenant telemetry pipeline ingesting 1M events/min from 100+ tenants using AWS primitives. Implement tenant-scoped Kinesis Data Streams partitioning with a central quota controller backed…",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Implement a fidelity gate at ingestion: tenants have a fidelity policy stored in DynamoDB; a Lambda pre-processor applies masking or redaction before producing to Kinesis. Ensure exactly-once with ide",
-            "isCorrect": true
+            "text": "Per-tenant sampling config is stored in DynamoDB; a Kinesis stream feeds Lambda that applies tenant-specific rate limits (scaling with traffic). High-fidelity data for critical tenants routes to a ded",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question probes real-world design trade-offs for multi-tenant telemetry at scale, focusing on data fidelity control, policy enforcement, and end-to-end observability.\n\n## Key Concepts\n\n- Multi-tenant fidelity at ingestion and dynamic policy enforcement with OPA\n- Exactly-once processing across Kinesis and Lambda/Fargate\n- Schema evolution with Glue and Athena integration\n- Immutable auditing in S3 and OpenTelemetry distributed traces\n- Cross-region reliability and failure-mode handling\n\n## Code Example\n\n```javascript\n// Pseudo ingestion gate\nasync function guard(record, policy) {\n  // apply masking/redaction per policy\n  // return transformed record or drop\n}\n```\n\n## Follow-up Questions\n\n- How would you test OPA policies in CI and simulate policy drift?\n- How do you handle late-arriving data when fidelity tiers differ across tenants?",
+        "explanation": "## Why This Is Asked\n\nThis question assesses advanced capabilities in designing multi-tenant, multi-region telemetry systems with strict isolation requirements. It tests understanding of cost controls, backpressure mechanisms, and exactly-once processing semantics—critical skills for building resilient, scalable observability platforms at enterprise scale.\n\n## Key Concepts\n\n- **Tenant Isolation**: Partition-based isolation with deterministic routing to prevent tenant noise\n- **Quota Enforcement**: Central quota controller with per-tenant budgets and dynamic throttling\n- **Dynamic Backpressure**: Auto-scaling compute layer with circuit breakers and queue depth monitoring\n- **Exactly-Once Enrichment**: Idempotent writes with deduplication keys stored in DynamoDB\n- **Retention & Archival**: Tiered storage with S3 lifecycle policies and cross-region replication\n- **Observability**: OpenTelemetry with tenant context propagation throughout the pipeline\n\n## Failure Modes\n\n- **Throttling**: Tenant exceeds quota → 429 response with retry-after header, events buffered in overflow queue\n- **Regional outage**: Failover to secondary region with Kinesis stream replication\n- **Enrichment failure**: Dead-letter queue with replay mechanism after fix\n- **Partition hotting**: Rebalance partitions based on tenant traffic patterns\n\n## Follow-up Questions\n\n- How would you validate per-tenant SLAs and detect SLA violations in real-time?\n- How would you handle tenant migration or data residency requirements?\n- What cost optimization strategies would you implement for idle tenants?",
         "difficulty": "advanced"
       },
       {
         "id": "aws-dva-q-10",
-        "questionId": "q-15631",
-        "question": "Design a real-time, per-tenant telemetry ingestion and analysis pipeline for 1M events/sec across two regions that enforces per-tenant quotas, ensures exactly‑once processing, supports cross-region replication, and purges data within 48 hours. Use Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, and OpenTelemetry; explain shard strategy, quota enforcement, deduplication, late data handling, and cost controls?",
+        "questionId": "q-8087",
+        "question": "Design a per-tenant encryption strategy for a cross-region telemetry pipeline (Kinesis -> Lambda/Fargate -> S3/Glue/Athena) using envelope encryption with tenant-scoped CMKs in AWS KMS. Explain how keys are generated, rotated every 90 days, how data keys are wrapped/unwrapped without downtime, and how access is restricted so only the tenant's services can decrypt their data. Include audit trails and performance considerations?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Single Kinesis stream partitioned by tenantId; Lambda masks PII and validates against per-tenant schemaVersion stored in DynamoDB. Valid events route to S3 Parquet under tenant/year=ver; Glue Spark jo",
-            "isCorrect": false
+            "text": "Tenant-scoped CMKs in KMS generate per-tenant data keys; envelope-encrypt data at ingestion; ciphertext stored in S3 with tenant prefix. Rotate CMKs every 90 days using versioned aliases and in-Lambda",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Partition keys: tenantId+deviceId; KDS shards autoscale to avoid hotspots; guarantee exactly-once with a per-record sequence token in DynamoDB and idempotent sinks to S3/Parquet; Lambda/Fargate for pr",
+            "text": "Design a beginner-level, single-region pipeline for ingesting 1k–2k JSON telemetry events per minute from devices across multiple tenants using AWS DVA tools. Leverage AWS Glue Schema Registry to enforce a runtime JSON…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Proposed approach: shard-per-tenant on Kinesis; per-tenant quotas tracked in DynamoDB; Lambda deduplicates on (tenantId, eventId); cross-region replication via mirrored streams and a fan-out Lambda to",
-            "isCorrect": true
+            "text": "Set up a single Kinesis Data Stream; a Lambda consumer with batch size 100 validates JSON against a schema (requires correlationId, deviceId, ts); masks user emails/phones in payload; computes a per-r",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "The architecture leverages a DynamoDB tenant registry that maps tenant_id to target region, with producers routing events to regional Kinesis Data Streams based on this mapping. Events are partitioned using tenant_id+ti…",
+            "text": "Design an end-to-end multi-tenant pipeline: a single Kinesis Data Stream ingests JSON; a Lambda deduplicates by tenant_id + event_id and writes per-tenant Parquet to S3 with daily partitions; register",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question probes design thinking for multi-tenant, high-volume observability pipelines with strict QoS and cost controls, requiring concrete usage of AWS DVA primitives.\n\n## Key Concepts\n\n- per-tenant partitioning and quotas via DynamoDB\n- exactly-once processing with idempotent writes\n- cross-region replication using Kinesis and Lambda\n- OpenTelemetry propagation across services\n- data retention, purge policies, and cost controls with KMS/Glue cataloging\n\n## Code Example\n\n```javascript\n// Pseudo-code for idempotent dedupe using tenantId + eventId in DynamoDB\nasync function handleEvent(event){\n  const key = `${event.tenantId}:${event.eventId}`;\n  const exists = await dynamo.get({Key: {id: key}}).promise();\n  if(exists.Item) return; // idempotent path\n  await dynamo.put({TableName:'TenantEvents',Item:{id:key, ...event}}).promise();\n  // forward to Kinesis for downstream processing\n}\n```\n\n## Follow-up Questions\n\n- How would you validate quota enforcement under burst traffic?\n- What are failure modes for cross-region replication and how would you mitigate them?",
+        "explanation": "## Why This Is Asked\nDesign focus: secure, scalable per-tenant encryption in a multi-region telemetry flow, with low drift on rotations and clear access boundaries.\n\n## Key Concepts\n- Envelope encryption with tenant CMKs\n- Per-tenant IAM and key policy scoping\n- Key rotation and in-process cache warm-up\n\n## Code Example\n\n```javascript\nconst kms = new AWS.KMS();\nasync function wrapDataKey(tenantId) {\n  const {CiphertextBlob} = await kms.generateDataKey({KeyId: `tenant-${tenantId}-cmk`, KeySpec: 'AES_256'}).promise();\n  return CiphertextBlob;\n}\n```\n\n## Follow-up Questions\n- How would you handle key revocation for a compromised tenant without downtime?\n- How does this affect rehydration/audit trails for retrospectives?",
         "difficulty": "advanced"
       },
       {
         "id": "aws-dva-q-11",
-        "questionId": "q-13847",
-        "question": "Design an advanced telemetry pipeline that ingests protobuf-encoded device events into Kinesis Data Streams, decrypts with per-tenant KMS CMKs, verifies digital signatures, and writes tenant-scoped data to S3 with per-tenant prefixes; maintain an immutable audit ledger in DynamoDB and a data-lineage table in Glue, with Lake Formation governance, and support schema evolution in Glue/Athena plus a 24h backfill. How would you implement it?",
+        "questionId": "q-12135",
+        "question": "Design a three-region telemetry ingestion pipeline that processes ~5k events/sec per region into AWS DVA primitives (Kinesis Data Streams, Lambda/Fargate, S3, Glue, DynamoDB, OpenTelemetry). Add a per-record data-quality score with a lightweight rule engine; route records below a threshold to a remediation S3 bucket, while valid ones go to regional Parquet in S3. Ensure idempotent writes, schema evolution, and detailed observability; discuss failure modes and cost controls?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Assign a UUID lineageId at ingestion in Lambda, add it to the event, redact PII, and write to S3 Parquet partitioned by region/date. Persist provenance in DynamoDB (lineageId, eventId, region, ingestT",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Edge routing at ingestion: DynamoDB stores per-tenant residency and replication rules; a policy check in Lambda validates event.region against policy and writes to the tenant’s regional Kinesis stream",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
             "text": "Implement with regional Kinesis Streams and a Lambda that validates JSON against a versioned schema, adds lineage fields (ingestRegion, ingestTime, schemaVersion), and computes a 0–100 data quality sc",
             "isCorrect": false
           },
           {
+            "id": "b",
+            "text": "Implement per-tenant catalog databases (tenant_<id>) with IAM/Lake Formation controls and tenant-prefixed S3 prefixes (tenant=<id>/region). Ingest via Kinesis to Lambda, inject tenant_id, store Parque",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a stable composite key from source object key and a per-record id, store seen IDs in DynamoDB, and upsert only when not seen to avoid duplicates. Route failures to an SQS DLQ for decoupled retries",
+            "isCorrect": false
+          },
+          {
             "id": "d",
-            "text": "Leverage per-tenant KMS CMKs to decrypt protobuf payloads after ingest on Kinesis. Verify signatures, enrich with tenant metadata, and route to S3 with tenant prefixes. Maintain an immutable audit led",
+            "text": "Use region-scoped Kinesis streams with a fan-out Lambda that computes a deterministic quality score from required fields, basic range checks, and timestamp sanity. If score >= threshold, write to regi",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question probes multi-tenant security, data governance, and real-time processing with AWS DVA, including encryption, provenance, and schema evolution.\n\n## Key Concepts\n- Tenant isolation and encryption\n- Event provenance and data lineage\n- Immutable audit trails\n- Schema evolution in Glue\n- Backfill and governance with Lake Formation\n\n## Code Example\n```javascript\n// Pseudo-handler outline\nexports.handler = async (event) => {\n  // decrypt, verify, enrich, write to S3 and update audit/lineage\n};\n```\n\n## Follow-up Questions\n- How would you rotate tenant keys without downtime?\n- How would you test cross-tenant access controls in Lake Formation?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\n\nThis tests practical integration of AWS DVA primitives with data-quality and multi-region concerns, pushing candidates to implement idempotency, remediation paths, and observability.\n\n## Key Concepts\n\n- Real-time data validation and quality scoring\n- Idempotent writes and deduplication\n- Regional partitioning and scalable throughput\n- Schema evolution with Glue Catalog\n- Observability with OpenTelemetry/CloudWatch\n\n## Code Example\n\n```python\ndef score(record):\n    score = 0\n    if 'deviceId' in record and isinstance(record['deviceId'], str): score += 25\n    if 'ts' in record:\n        try: int(record['ts']); score += 25\n        except: pass\n    if 'payload' in record and isinstance(record['payload'], dict): score += 25\n    if 'temperature' in record['payload'] and -40 <= record['payload']['temperature'] <= 100: score += 25\n    return min(100, score)\n```\n\n## Follow-up Questions\n\n- How would you handle schema evolution without breaking producers?\n- What are the trade-offs of DLQ vs remediation bucket for invalid records?",
+        "difficulty": "intermediate"
       },
       {
         "id": "aws-dva-q-12",
+        "questionId": "q-23879",
+        "question": "Design a single-region AWS DVA telemetry pipeline that ingests 5k JSON events/min, each containing customerId and deviceId. Implement strict multi-tenant isolation: per-tenant S3 prefixes, per-tenant Glue data catalog entries, and IAM policies that prevent cross-tenant access. Ensure dedupe by customerId+deviceId+ts with DynamoDB, write valid records to S3 Parquet, route invalids to a per-tenant DLQ, and provide end-to-end tracing. Discuss testing strategy, including cross-tenant leakage tests and LocalStack plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a Kinesis-driven pipeline: MQTT gateway publishes JSON to KDS; a Validation Lambda checks against Glue Schema Registry, computes a 0–1 quality score, and uses DynamoDB to deduplicate on (dev",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose a tenant-aware routing layer that reads tenant metadata from DynamoDB to decide the primary DR region; publish to Kinesis in that region; write to region-specific S3 prefixes (tenant/date); tr",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design an AWS data pipeline in a single region that ingests 5,000 JSON events per minute, each containing customerId and deviceId. Implement strict multi-tenant isolation using per-tenant S3 prefixes (e.g., s3://bucket/…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use region-scoped Kinesis streams with a fan-out Lambda that computes a deterministic quality score from required fields, basic range checks, and timestamp sanity. If score >= threshold, write to regi",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question evaluates your ability to design multi-tenant data pipelines with strong isolation guarantees, governance controls, and end-to-end observability—critical skills for building enterprise-grade data ingestion and processing solutions.\n\n## Key Concepts\n- **Tenant Isolation**: Per-tenant S3 prefixes, Glue Catalog databases and tables, and IAM policies scoped to individual tenant resources prevent cross-tenant data access.\n- **Deduplication**: Exactly-once processing semantics using DynamoDB with composite keys (customerId+deviceId+ts) ensures no duplicate records are written.\n- **Data Routing**: Valid records flow to S3 in Parquet format for analytics efficiency, while invalid records route to per-tenant DLQs for downstream investigation and reprocessing.\n- **Observability**: X-Ray provides end-to-end tracing to diagnose latency issues and monitor pipeline health across all components.\n\n## Testing Strategy\n- **Unit Testing**: Validate deduplication logic, schema validation rules, and data transformation functions in isolation.\n- **Integration Testing**: Verify end-to-end flow from Kinesis through Lambda/Glue to S3, including DLQ routing.\n- **Cross-Tenant Leakage Tests**: Deploy multiple simulated tenants and attempt cross-tenant access via IAM policy evaluation, S3 bucket policies, and Glue Catalog permissions to confirm isolation holds.\n- **Performance Testing**: Load test with 5k events/min to validate Kinesis shard provisioning, Lambda concurrency, and throughput.\n\n## LocalStack Plan\nLocalStack enables local testing without AWS costs. Provision Kinesis, S3, DynamoDB, Lambda, and Glue resources via Terraform or the LocalStack AWS CLI. Mock X-Ray for tracing validation. Use test data generators to simulate multi-tenant event streams and validate isolation, deduplication, and routing logic in a CI/CD pipeline.",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "aws-dva-q-13",
+        "questionId": "q-2906",
+        "question": "In a real-time telemetry pipeline for thousands of devices across regions, design a per-tenant dynamic data-correction flow: each event must be corrected according to a tenant-specific policy version stored in DynamoDB, applied deterministically in Lambda, and written to S3 as Parquet partitioned by tenant/date. Policies can change; ensure 24h replayability, idempotency, and auditable lineage using Glue/Athena. Include trade-offs?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Proposed approach: A Kinesis consumer Lambda validates per-device monotonicity by querying/updating DynamoDB lastTs for deviceId; if ts > lastTs, persist event to S3 Parquet date-partitioned and updat",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use Kinesis Data Streams to ingest telemetry from thousands of devices. A Lambda function reads each tenant's correction policy from DynamoDB, applies deterministic corrections using a composite idempotency key (deviceI…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Design a cross-tenant adaptive telemetry ingestion system for 100k–1M events/min across 3 tenants in multi-account AWS. Implement edge sampling using Kinesis Data Streams with Lambda/Fargate consumers. Use a determinist…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Architect a cross-region, multi-tenant telemetry pipeline that isolates tenants at the data plane while achieving exactly-once ingestion and supporting schema evolution. The solution leverages AWS DVA primitives with Op…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Design\nThis question tests your ability to combine four key requirements: dynamic rules per tenant, data isolation, replay capability, and auditability—all in a streaming system with thousands of devices.\n\n## Core Components\n\n**1. Ingestion Layer (Kinesis Data Streams)**\nKinesis handles high-throughput ingestion with built-in ordering, replication, and fan-out capabilities. Each shard processes events in order, enabling deterministic corrections.\n\n**2. Policy Storage (DynamoDB)**\n```python\n# DynamoDB Table: tenant_policies\n{\n    'tenant_id': 'tenant-123',      # Partition key\n    'policy_version': '2024-01-15v3', # Sort key\n    'rules': {\n        'outlier_threshold': 100,\n        'scaling_factor': 1.05,\n        'null_handling': 'interpolate',\n        'unit_conversion': {'celsius_to_fahrenheit': True}\n    },\n    'effective_from': '2024-01-15T00:00:00Z',\n    'created_at': '2024-01-15T10:30:00Z'\n}\n```\n\n**3. Lambda Processing**\n```python\nimport boto3\nimport json\nimport hashlib\nfrom datetime import datetime\nimport pyarrow as pa\nimport pyarrow.parquet as pq\nfrom dataclasses import dataclass\nfrom typing import Dict, Any\n\ndynamodb = boto3.resource('dynamodb')\ns3 = boto3.client('s3')\n\nPOLICY_TABLE = 'tenant_policies'\nPROCESSED_TABLE = 'processed_events'\nOUTPUT_BUCKET = 'telemetry-corrected'\n\n@dataclass\nclass TelemetryEvent:\n    device_id: str\n    tenant_id: str\n    sequence_num: int\n    timestamp: str\n    payload: Dict[str, Any]\n    raw_policy_version: str\n\ndef get_policy(tenant_id: str, effective_time: str = None) -> Dict:\n    \"\"\"Retrieve latest active policy for tenant.\"\"\"\n    table = dynamodb.Table(POLICY_TABLE)\n    \n    if effective_time:\n        response = table.query(\n            KeyConditionExpression='tenant_id = :tid AND effective_from <= :et',\n            ExpressionAttributeValues={\n                ':tid': tenant_id,\n                ':et': effective_time\n            },\n            ScanIndexForward=False,\n            Limit=1\n        )\n    else:\n        response = table.query(\n            KeyConditionExpression='tenant_id = :tid',\n            ExpressionAttributeValues={':tid': tenant_id},\n            ScanIndexForward=False,\n            Limit=1\n        )\n    \n    items = response.get('Items', [])\n    return items[0] if items else None\n\ndef compute_idempotency_key(event: TelemetryEvent, policy_version: str) -> str:\n    \"\"\"Deterministic composite key for idempotency.\"\"\"\n    composite = f\"{event.tenant_id}:{event.device_id}:{event.sequence_num}:{policy_version}\"\n    return hashlib.sha256(composite.encode()).hexdigest()\n\ndef is_already_processed(idempotency_key: str) -> bool:\n    \"\"\"Check if event was already processed.\"\"\"\n    table = dynamodb.Table(PROCESSED_TABLE)\n    try:\n        table.get_item(Key={'idempotency_key': idempotency_key})\n        return True\n    except table.meta.client.exceptionsConditionalCheckFailedException:\n        return False\n\ndef apply_corrections(event: TelemetryEvent, policy: Dict) -> Dict[str, Any]:\n    \"\"\"Apply deterministic corrections based on tenant policy.\"\"\"\n    rules = policy.get('rules', {})\n    corrected = event.payload.copy()\n    \n    # Outlier handling\n    if 'value' in corrected and corrected['value'] > rules.get('outlier_threshold', float('inf')):\n        corrected['value'] = rules.get('outlier_threshold')\n        corrected['corrected'] = True\n        corrected['correction_reason'] = 'outlier_capped'\n    \n    # Unit conversion\n    if rules.get('unit_conversion', {}).get('celsius_to_fahrenheit'):\n        if 'temperature' in corrected:\n            corrected['temperature'] = corrected['temperature'] * 9/5 + 32\n            corrected['unit'] = 'fahrenheit'\n    \n    # Null handling\n    if corrected.get('value') is None and rules.get('null_handling') == 'interpolate':\n        corrected['value'] = corrected.get('prev_value', 0)\n        corrected['corrected'] = True\n        corrected['correction_reason'] = 'null_interpolated'\n    \n    return corrected\n\ndef write_parquet_partition(tenant_id: str, dt: datetime, data: list):\n    \"\"\"Write Parquet file partitioned by tenant/date/hour.\"\"\"\n    table = pa.Table.from_pylist(data)\n    \n    partition_path = (\n        f\"tenant_id={tenant_id}/\"\n        f\"date={dt.strftime('%Y-%m-%d')}/\"\n        f\"hour={dt.strftime('%H')}/\"\n        f\"{dt.strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.parquet\"\n    )\n    \n    buffer = io.BytesIO()\n    pq.write_table(table, buffer, compression='snappy')\n    buffer.seek(0)\n    \n    s3.put_object(\n        Bucket=OUTPUT_BUCKET,\n        Key=partition_path,\n        Body=buffer.getvalue()\n    )\n    \n    return partition_path\n\ndef lambda_handler(event, context):\n    \"\"\"Main Lambda handler for telemetry correction.\"\"\"\n    for record in event['Records']:\n        raw_data = json.loads(base64.b64decode(record['kinesis']['data']))\n        \n        telemetry = TelemetryEvent(\n            device_id=raw_data['device_id'],\n            tenant_id=raw_data['tenant_id'],\n            sequence_num=raw_data['sequence_num'],\n            timestamp=raw_data['timestamp'],\n            payload=raw_data['payload'],\n            raw_policy_version=raw_data.get('policy_version', 'unknown')\n        )\n        \n        # Get applicable policy\n        policy = get_policy(telemetry.tenant_id, telemetry.timestamp)\n        if not policy:\n            continue\n        \n        policy_version = policy['policy_version']\n        idempotency_key = compute_idempotency_key(telemetry, policy_version)\n        \n        # Idempotency check\n        if is_already_processed(idempotency_key):\n            continue\n        \n        # Apply corrections\n        corrected = apply_corrections(telemetry, policy)\n        \n        # Prepare output record\n        output_record = {\n            'tenant_id': telemetry.tenant_id,\n            'device_id': telemetry.device_id,\n            'sequence_num': telemetry.sequence_num,\n            'timestamp': telemetry.timestamp,\n            'policy_version_applied': policy_version,\n            'raw_policy_version': telemetry.raw_policy_version,\n            'payload': corrected,\n            'lineage_id': idempotency_key,\n            'processed_at': datetime.utcnow().isoformat()\n        }\n        \n        # Write to S3\n        event_dt = datetime.fromisoformat(telemetry.timestamp)\n        s3_path = write_parquet_partition(telemetry.tenant_id, event_dt, [output_record])\n        \n        # Mark as processed (with TTL for 24h replay window)\n        table = dynamodb.Table(PROCESSED_TABLE)\n        table.put_item(\n            Item={\n                'idempotency_key': idempotency_key,\n                's3_path': s3_path,\n                'processed_at': int(datetime.utcnow().timestamp()),\n                'ttl': int((datetime.utcnow() + timedelta(hours=24)).timestamp())\n            },\n            ConditionExpression='attribute_not_exists(idempotency_key)'\n        )\n```\n\n**4. Parquet Partitioning Strategy**\n- **Path**: `s3://bucket/tenant_id=<tenant>/date=<YYYY-MM-DD>/hour=<HH>/<file>.parquet`\n- **Benefits**: Athena queries filter by tenant first (reduces scan), then date/hour (time-range pruning)\n- **File sizing**: Target 128-256MB files using Kinesis Aggregation or periodic buffering\n- **Schema**: Explicit columnar format enables predicate pushdown and efficient compression\n\n**5. 24-Hour Replay Architecture**\n- Raw events stored in: `s3://raw-events/tenant=<tenant>/year=<YYYY>/month=<MM>/day=<DD>/<event>.json`\n- Replay Lambda reads raw events + applies current policy\n- Idempotency keys include policy_version to detect changes\n- Reprocess only affected partitions based on policy effective dates\n\n**6. Audit Lineage (Glue/Athena)**\n```sql\n-- Athena table for lineage tracking\nCREATE TABLE lineage_audit (\n    lineage_id STRING,\n    tenant_id STRING,\n    device_id STRING,\n    sequence_num BIGINT,\n    raw_policy_version STRING,\n    applied_policy_version STRING,\n    corrections_applied MAP<STRING, STRING>,\n    s3_path STRING,\n    processed_at TIMESTAMP\n) PARTITIONED BY (tenant_id, date STRING)\nLOCATION 's3://telemetry-corrected/lineage/';\n\n-- Query for specific device lineage\nSELECT * FROM lineage_audit\nWHERE device_id = 'device-456'\n  AND tenant_id = 'tenant-123'\nORDER BY processed_at DESC;\n```\n\n## Trade-offs\n\n| Aspect | Choice | Trade-off |\n|--------|--------|----------|\n| **Idempotency** | DynamoDB composite key | Strong consistency but adds latency per event |\n| **Policy Storage** | DynamoDB | Fast reads but cost scales with tenant count |\n| **File Format** | Parquet | Excellent compression but requires schema evolution strategy |\n| **Replay** | S3 raw + reprocess | Simple but 2x storage cost; faster option: Kinesis Replay API |\n| **Partition Granularity** | tenant/date/hour | Balances query performance vs file size; too fine = too many files |\n\n## Common Pitfalls\n- **Missing TTL**: Processed events table grows unbounded without TTL cleanup\n- **Hot partitions**: Skewed tenant distribution causes Kinesis shard imbalance\n- **Policy version drift**: Not capturing policy_version at ingestion breaks replay\n- **Small files**: Writing one event per Parquet file overwhelms Athena with metadata overhead",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "aws-dva-q-14",
+        "questionId": "q-29377",
+        "question": "Design an advanced cross-region telemetry pipeline with per-tenant dynamic sampling quotas to cap ingest costs while preserving anomalies; enforce per-tenant exact-once processing, and implement retention purge after 30 days. Use AWS DVA primitives (Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB) and OpenTelemetry. Explain sampling interaction with idempotent writes, tenant isolation, audit trails, and testing?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "A token-bucket per-tenant quota stored in DynamoDB governs per-minute sampling rates. The ingesting Lambda atomically decrements tokens; events within quota publish to Kinesis Data Streams using tenant ID as the partiti…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement with regional Kinesis Streams and a Lambda that validates JSON against a versioned schema, adds lineage fields (ingestRegion, ingestTime, schemaVersion), and computes a 0–100 data quality sc",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose a two-region pipeline: regional KDS, Lambda detector, DynamoDB dedupe by deviceId+minute, valid events to S3 Parquet region/date, anomalies to an S3 anomaly bucket and a DLQ. The Lambda applie",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Approach: partition by tenant in Kinesis, use composite keys in DynamoDB with a dedup flag, persist raw and enriched records to S3 with tenant/date prefixes, register evolving schemas in Glue and appl",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests ability to design cost-aware telemetry pipelines with tenant isolation, real-time constraints, regulatory retention requirements, and distributed systems guarantees.\n\n## Key Concepts\n\n- **Per-tenant quotas**: Dynamic sampling via token-bucket algorithm, stored atomically in DynamoDB\n- **Exactly-once processing**: Idempotent writes using OpenTelemetry trace IDs as deduplication keys; conditional DynamoDB writes\n- **Tenant isolation**: Partition keys ensure data segregation in Kinesis; separate IAM roles per tenant\n- **Cross-region routing**: Multi-region Kinesis or DynamoDB global tables with conflict resolution\n- **Retention purge**: DynamoDB TTL for operational data; Glue catalog updates for S3 partitions post-expiry\n- **Audit trails**: S3 access logging, CloudTrail, Athena query history, DynamoDB streams to CloudWatch\n\n## Code Example\n\n```javascript\nasync function ingestEvent(event, tenantId) {\n  const token = await dynamodb.update({\n    TableName: 'sampling-quotas',\n    Key: { tenantId },\n    UpdateExpression: 'SET tokens = tokens - :dec, lastReset = :now',\n    ConditionExpression: 'tokens >= :dec',\n    ExpressionAttributeValues: { ':dec': 1, ':now': Date.now() }\n  });\n  await kinesis.putRecord({\n    Data: JSON.stringify({ ...event, traceId: event.traceContext.traceId }),\n    PartitionKey: tenantId\n  }).promise();\n}\n```\n\n## Follow-up Questions\n\n- How would you test exact-once guarantees under backpressure and late-arriving duplicate spans?\n- How would you validate audit trail integrity across regions without centralized logging?\n- What tradeoffs exist between token-bucket granularity (per-minute vs. per-second) and DynamoDB capacity costs?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "aws-dva-q-15",
+        "questionId": "q-2316",
+        "question": "Beginner AWS DVA task: 2,000 devices send telemetry as JSON lines to a Kinesis Data Stream, consumed by a Lambda that writes Parquet to S3 and uses a DynamoDB table for dedupe. A burst from one device creates hot shards and latency. Propose concrete steps to identify/mitigate shard hotspots, adjust partition keys, tune Lambda concurrency, implement idempotent writes, preserve schema evolution, and plan late-data backfill within 24 hours. Include basic monitoring?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement regional Kinesis Data Streams with per-tenant shard allocation using enhanced fan-out consumers. Each tenant receives dedicated streams in their primary region with cross-region replication through Kinesis Dat…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement per-tenant masking at ingress using a Lambda/Fargate policy evaluation engine that reads tenant config from DynamoDB; route masked data to a dedicated S3 prefix per region; keep raw PII in e",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Candidates should outline: (1) monitor shard metrics (GetRecords per shard) and set shard count/upscale; (2) implement partition key by device_type/date to distribute shards; (3) set Lambda reserved c",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Architect a dual-path ingest: high-priority data goes to a dedicated Kinesis stream with low-latency Lambda processing; low-priority data is funneled to a separate stream with probabilistic downsampli",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests practical debugging of shard hot spots, partitioning strategies, and idempotent writes in a beginner DVA context, with realistic latency and backfill constraints.\n\n## Key Concepts\n- Shard hot-spot detection in Kinesis Data Streams\n- Partition keys and data modeling for distribution\n- Lambda concurrency and fault tolerance\n- DynamoDB-based idempotent dedup\n- Glue catalog schema evolution and Parquet partitions\n- Late-data backfill with Glue jobs\n\n## Code Example\n```javascript\n// pseudo-code for dedupe in Lambda\nconst key = deviceId + ':' + eventTs;\nconst exists = await dynamo.get({Key: {id: key}});\nif (exists) return; // idempotent\nawait dynamo.put({Item: {id: key, ...record}});\n```\n\n```\n```\n\n## Follow-up Questions\n- How would you choose partition keys to balance shard utilization?\n- How would you detect late data and trigger a 24-hour backfill?\n- What alerts would you configure for latency and error rates?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "aws-dva-q-16",
+        "questionId": "q-12341",
+        "question": "Design a two-region IoT telemetry pipeline: ingest ~60k events/min; enforce per-tenant residency so raw data stays in the home region of each tenant; validate schemas in Lambda, route invalids to DLQ. Store validated events in regional S3 as Parquet; compute per-tenant aggregates in DynamoDB/S3 with idempotent writes for exactly-once delivery. Emit real-time anomaly alerts per tenant within 1 minute; trace with OpenTelemetry; test via LocalStack?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a resilient two-region IoT telemetry pipeline to ingest approximately 60,000 events per minute while maintaining strict per-tenant data residency requirements. The pipeline must route raw events to each tenant's…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement a two-region Kinesis Data Streams architecture with Lambda functions that validate JSON schemas, compute per-record quality scores, and deduplicate using DynamoDB composite keys (deviceId+timestamp). Route val…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose per-region Kinesis streams with Glue Schema Registry for validation and evolution (compatibility modes). Compute a per-record score (completeness, conformance, freshness) in a Lambda, route va",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Proposed approach: Ingest via a single-region Kinesis Data Stream; a Lambda consumer validates each JSON (optionally against Glue Schema Registry). If valid, upsert latest per-device (deviceId) in Dyn",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question evaluates a candidate's ability to design distributed systems that address multi-region data residency, streaming reliability, exactly-once processing, and observability requirements in a concrete IoT telemetry scenario.\n\n## Key Concepts\n\n- **Multi-region architecture**: Two-region deployment with intelligent routing based on tenant residency\n- **Data residency enforcement**: Ensuring raw telemetry data remains within the tenant's designated home region\n- **Exactly-once semantics**: Idempotent writes to prevent duplicate processing during retries\n- **Schema validation**: Real-time event validation with DLQ routing for malformed messages\n- **Real-time processing**: Sub-minute anomaly detection and alerting per tenant\n- **Observability**: End-to-end OpenTelemetry tracing for pipeline monitoring\n- **Local development**: LocalStack integration for comprehensive CI and local testing\n\n## Code Example\n\n```javascript\n// Lambda function to route events by tenant home region\nexports.handler = async (event) => {\n  const tenantHomeRegion = await getTenantHomeRegion(event.tenantId);\n  \n  if (tenantHomeRegion !== process.env.AWS_REGION) {\n    await forwardToRegion(event, tenantHomeRegion);\n    return { statusCode: 200, body: 'Routed to home region' };\n  }\n  \n  // Process in home region\n  await validateAndStore(event);\n  return { statusCode: 200, body: 'Processed successfully' };\n};\n```",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "aws-dva-q-17",
+        "questionId": "q-27670",
+        "question": "Design a cross-region, multi-tenant telemetry pipeline with per-tenant data residency, exactly-once processing, and SLA-driven alerts. Ingest 100k events/sec across 5 regions using Kinesis Data Streams; route by tenantID to region-local S3 prefixes; enable OpenTelemetry traces; implement idempotent writes with a DynamoDB dedup table keyed by tenantID+eventId; enrich in Fargate/Lambda, write Parquet to S3, catalog with Glue, query with Athena; include DLQ and CloudWatch alerts for SLA breaches; observability via OpenTelemetry?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement per-tenant Kinesis Data Streams shards with a quota management system stored in DynamoDB for real-time rate limiting. At the edge (API Gateway), apply adaptive sampling algorithms to under-loaded tenants while…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a multi-region Kinesis Data Streams with per-tenant access via Lake Formation, Glue Data Catalog for schema, and OpenTelemetry traces. Ingest 30k JSON/min, validate against a dynamic registry, ded",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Architect a cross-region, multi-tenant telemetry pipeline ingesting 1M events/min from 100+ tenants using AWS primitives. Implement tenant-scoped Kinesis Data Streams partitioning with a central quota controller backed…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a cross-region telemetry pipeline with per-tenant residency and exactly-once processing. Route by tenant to region-local S3 prefixes, use DynamoDB dedup (tenantID+eventId) to guarantee idempote",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question probes cross-region tenancy, data residency, idempotent ingestion, and observability within AWS DVA using Kinesis, Lambda/Fargate, S3, Glue, Athena, DynamoDB, and OpenTelemetry. It forces concrete partitioning, dedup strategy, and testing plans.\n\n## Key Concepts\n\n- Cross-region tenant isolation and routing\n- Per-tenant data residency in region-local S3\n- Exactly-once with DynamoDB dedup (tenantId+eventId)\n- OpenTelemetry integration for traces\n- Parquet storage, Glue catalog, Athena queries\n- DLQ and SLA alerting\n\n## Code Example\n\n```javascript\n// Pseudo idempotent write to dedup table\nconst put = await dyn.putItem({\n  TableName: 'Dedup',\n  Item: { tenantId, eventId, ts: Date.now() },\n  ConditionExpression: 'attribute_not_exists(eventId)'\n}).promise();\n```\n\n## Follow-up Questions\n\n- How would you test bursts and dedup guarantees?\n- How would you handle tenant onboarding/remediation events?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "aws-dva-q-18",
+        "questionId": "q-10567",
+        "question": "You're building a cross-region, multi-tenant telemetry pipeline with strict data residency and privacy requirements. Propose a concrete architecture (AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, plus OpenTelemetry) that ingests device events, enforces per-tenant isolation, supports late data and schema evolution, and enables on-demand replay for incidents. Include how you guarantee exactly-once processing, how you handle encryption with per-tenant keys, and the data-backfill strategy?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement regional Kinesis Data Streams with per-tenant shard allocation using enhanced fan-out consumers. Each tenant receives dedicated streams in their primary region with cross-region replication through Kinesis Dat…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a regional DVA pipeline: 1,500 devices -> Kinesis Data Stream; Lambda validates against Glue Schema Registry (versioned), redacts PII, writes Parquet to S3 partitioned by region/date; DynamoDB",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "In practice I’d architect per-tenant regional pipelines: ingest via Kinesis Data Streams, Lambda for dedupe writes to DynamoDB (tenant+ts) and emit to S3 Parquet partitioned by tenant/date. Enforce is",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Ingest data via Kinesis Data Streams in a single region, validate against a Glue Schema Registry (handling optional fields) in a Lambda function, mask PII such as emails and phone numbers before storage, deduplicate usi…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis angle tests privacy-conscious, cross-region data architecture under real-world tenant constraints.\n\n## Key Concepts\n- Data residency with per-tenant KMS and Lake Formation\n- Exactly-once processing with idempotent writes\n- Schema evolution via Glue Schema Registry\n- On-demand replay using immutable S3 snapshots\n\n## Code Example\n```javascript\n// Pseudo-idempotent write handler\nexports.handler = async (evt) => {\n  for (const rec of evt.Records) {\n    const key = rec.partitionKey; // tenant+ts\n    await dynamo.putItem({Key: key, ...rec.data}, {ConditionExpression: 'attribute_not_exists(Key)'});\n  }\n}\n```\n\n## Follow-up Questions\n- How would you model tenant isolation in the data catalog and access policies?\n- What failure modes could break exactly-once, and how would you mitigate?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "aws-dva-q-19",
         "questionId": "q-22341",
         "question": "Beginner AWS DVA task: design a one-region telemetry pipeline where devices publish JSON events to a Kinesis Data Stream via an MQTT gateway. Use AWS Glue Schema Registry to enforce an evolving schema (deviceId, ts, metric, value, firmwareVersion, correlationId). Validate required fields, compute a per-record quality score, deduplicate by deviceId+ts with DynamoDB, and store valid events to S3 Parquet partitioned by date. Route invalids to a DLQ and add end-to-end tracing with X-Ray. Include a LocalStack test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "I would deploy two region-specific Kinesis streams, a routing Lambda to fan out to a common processor and a separate firmwareUpgrade path. Deduplicate per region with DynamoDB using (deviceId, ts) as",
+            "text": "Mask PII per-tenant at ingestion using a policy store (DynamoDB) and a masking function in a Lambda/Fargate consumer; route redacted events to regional S3 Parquet (region/date); keep raw events in a s",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Ingest via Kinesis Data Streams, validate payloads against Glue Schema Registry, add ingestionTs in a Lambda, upsert latest device state in DynamoDB (tenantId+deviceId), store valid events to S3 Parqu",
+            "text": "To solve, set up a Kinesis Data Stream as the entrypoint, an enrichment Lambda that increments a per-device counter in DynamoDB, validates required fields, and forwards valid records to Kinesis Fireho",
             "isCorrect": false
           },
           {
@@ -389,7 +599,7 @@
           },
           {
             "id": "d",
-            "text": "Regional Kinesis Data Streams ingest approximately 2,000 JSON events per minute per region. Lambda functions validate each JSON record against the AWS Glue Schema Registry, attach the corresponding schema version, and c…",
+            "text": "Design a 3-region streaming pipeline where each region ingests telemetry to a local KDS, validates and schemas (via Glue Schema Registry), deduplicates in regional DynamoDB, and writes valid events to",
             "isCorrect": false
           }
         ],
@@ -397,368 +607,158 @@
         "difficulty": "beginner"
       },
       {
-        "id": "aws-dva-q-13",
-        "questionId": "q-8349",
-        "question": "Beginner AWS DVA task: Design a tenant-isolated telemetry pipeline. Two tenants share one Kinesis region: 500 devices/min each send JSON. Use tenantId for per-tenant isolation in the stream, validate JSON, deduplicate by deviceId+ts with DynamoDB, and write valid events to S3 Parquet partitioned by tenant/date/region. Route invalid JSON to per-tenant DLQs; provide 3-day backfill, basic observability and simple cost guardrails?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Trigger via S3 to Lambda; validate header exactly as [timestamp, tenant_id, metric], error otherwise. Convert CSV to Parquet and write to a partitioned path tenantId/date/file.parquet. Ensure idempote",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Leverage a single region Kinesis Stream with tenantId as the partition key. Validate JSON via a Lambda JSON Schema; dedupe by (tenantId, deviceId, ts) in DynamoDB; route valid events to S3 as Parquet",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Masked at the processor before write: add a runtime mask function that replaces customerId and email with deterministic tokens derived from a per-stream salt. Use Glue Schema Registry to evolve schema",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "To implement, provision a single region with 500–1000 events/min across two device families, map to a Kinesis Data Stream. Use a DynamoDB table SchemaVersion (version string, hash) as the registry, an",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical multi-tenant data isolation, deduping, and backfill in a beginner-friendly way.\n\n## Key Concepts\n- Multi-tenant isolation; partition keys; DynamoDB dedupe; Parquet on S3; DLQ; 3-day backfill; basic observability.\n\n## Code Example\n```javascript\n// Example: Lambda handler snippet for JSON validation\nconst Ajv = require('ajv');\nconst ajv = new Ajv();\nconst schema = {/* minimal schema */};\nexports.handler = async (e) => {\n  const record = JSON.parse(Buffer.from(e.data, 'base64').toString());\n  const valid = ajv.validate(schema, record);\n  return { valid };\n};\n```\n\n## Follow-up Questions\n- How would you handle schema evolution for optional fields?\n- How would you scale beyond 1k devices/min while keeping per-tenant isolation?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "aws-dva-q-14",
-        "questionId": "q-3603",
-        "question": "**Multi-Tenancy Telemetry Isolation**: You’re ingesting telemetry from 100 tenants in two regions via a Kinesis Data Stream. Each event contains tenant_id, device_id, and metrics. Design a tenancy-aware pipeline using AWS DVA primitives (Kinesis, Lambda/Fargate, S3, Glue, Athena, DynamoDB) to isolate tenants, enforce access control, and handle schema drift. Address partitioning by tenant_id, per-tenant retention, idempotent writes, schema evolution, late data up to 48 hours, and robust monitoring. What concrete architecture would you implement?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Leverage IoT Core → 3 regional Kinesis streams. Validate with Glue Schema Registry in a Lambda, compute a per-record quality score, and deduplicate by deviceId+ts in DynamoDB. Write valid events to S3",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use per-region Kinesis streams ingested by Lambda/Fargate, store raw events in S3 and catalog Parquet in Glue/Athena, manage schema evolution with Glue Schema Registry and backward/forward compatibili",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Proposed tenancy-aware pipeline: a single Kinesis Data Stream partitioned by tenant_id; per-tenant prefixes in S3 for Parquet storage; DynamoDB for deduplication and metadata keyed by tenant_id+device_id+timestamp; Glue…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a one-region streaming pipeline using Amazon MSK (Kafka) to ingest 10,000 JSON telemetry events per minute from edge devices into an MSK topic. Each event must include a required correlationId field. Build a Lamb…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests the ability to design multi-tenant isolation, schema evolution, late data handling, and per-tenant governance within a DVA stack.\n\n## Key Concepts\n\n- Tenancy isolation and governance\n- Schema evolution with Glue Schema Registry\n- Idempotent writes and deduplication with DynamoDB\n- Partitioning by tenant_id and per-tenant S3 prefixes\n- Late data handling with a defined backfill window\n- Monitoring and alerting in CloudWatch\n\n## Code Example\n\n```javascript\n// Pseudo-code for a dedupe write (conceptual)\nfunction upsertRecord(record){\n  const key = `${record.tenant_id}#${record.device_id}#${record.timestamp}`;\n  // Check DynamoDB for existing record\n  // If not exists, write to S3 and update DynamoDB\n  // Handle schema validation with Glue Schema Registry\n}\n```",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "aws-dva-q-15",
-        "questionId": "q-10670",
-        "question": "Design an advanced cross-region telemetry ingestion and governance pipeline for a multi-tenant SaaS app that must export per-tenant data to an external analytics lake (e.g., Databricks) while preserving lineage and enabling legal-hold across regions. Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, plus OpenTelemetry. Explain per-tenant isolation, idempotent processing, cross-region replication, data lineage capture, and a compliant data-retention/hold policy with automated purge triggers. Provide deployment steps and anticipated failure modes?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Ingestion-time validators run as Lambda/Fargate tasks validating per-tenant schema (mandatory fields, types, drift) before routing. Use tenant_id as the partition key; write valid events to the primar",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Architect a cross-region telemetry ingestion and governance pipeline for a multi-tenant SaaS with per-tenant isolation, idempotent processing, lineage, and hold-based purges. Use Kinesis Data Streams,",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Architect a multi-tenant data mesh that ingests telemetry from Kinesis Data Streams, materializes per-tenant data marts in S3 via Glue jobs, and serves via Athena. Implement Lake Formation for fine-gr",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement per-tenant regional routing by tenantId, use a shard per tenant in Kinesis Data Streams, deduplicate with a composite key tenantId+deviceId+ts stored in DynamoDB, enrich in Lambda, write Par",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nAssess ability to design end-to-end data governance at scale, including lineage, retention holds, cross-region resiliency, and external analytics integration.\n\n## Key Concepts\n- Tenant isolation, idempotent writes, data lineage, legal-hold policy\n- Cross-region replication, OpenTelemetry, Glue Catalog, Athena\n- External export (Databricks) with governed retention\n\n## Code Example\n```python\n# Pseudo dedupe using DynamoDB for idempotent writes\ndef should_write(event_id):\n  seen = dynamodb.get_item(Key={\"event_id\": event_id})\n  if seen: return False\n  dynamodb.put_item(Item={\"event_id\": event_id, \"ts\": now})\n  return True\n```\n\n## Follow-up Questions\n- How would you test cross-region failover and DR consistency?\n- How would you verify lineage accuracy across stores and during schema evolution?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "aws-dva-q-16",
-        "questionId": "q-13226",
-        "question": "Design a two-region, multi-tenant pipeline where each tenant stores a JSON schema and rules in DynamoDB. Regional Kinesis streams feed a Lambda validator that applies tenant rules, computes a per-record quality score, and deduplicates by tenant+recordId. Valid events go to S3 Parquet (tenant/date); invalids to a DLQ. Use versioned schemas, backfill, and per-tenant Glue/Athena catalogs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Producer writes to SQS; Consumer Lambda validates against a DynamoDB-stored schema (versions v1/v2), deduplicates by deviceId+ts, and writes valid events to S3 Parquet with daily partitioning. Invalid",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Route each event by tenantId to a per-tenant consumer path. In latency-sensitivity mode, batch events into 1s windows through a micro-batching sink; otherwise stream directly to Lambda/Fargate. Ensure",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a cross-region telemetry pipeline using dedicated Kinesis Streams per region, partitioned by tenantId and date for data residency compliance. Implement exactly-once processing via a DynamoDB dedupe table keyed on…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement tenant-aware validation with per-tenant JSON schemas, validation rules, and schema versions stored in DynamoDB. Regional Kinesis Data Streams invoke Lambda validators that apply tenant-specific rules, compute…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design tenant-aware schema versioning, dynamic validation, and cross-region data governance with minimal operational overhead.\n\n## Key Concepts\n- Tenant isolation and dynamic validation\n- Schema versioning and backward compatibility\n- Data quality scoring and deduplication\n- DLQ routing and backfill strategies\n- Glue cataloging and Athena queries per tenant\n\n## Code Example\n```javascript\n// pseudo-validator sketch\n```\n\n## Follow-up Questions\n- How would you migrate tenants to a new validation rule without downtime?\n- How do you test schema evolution across tenants?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "aws-dva-q-17",
-        "questionId": "q-8582",
-        "question": "Beginner AWS DVA task: 2,000 devices emit JSON telemetry to a regional Kinesis Data Stream. Build a minimal pipeline that validates the JSON schema, deduplicates by deviceId+ts in DynamoDB, enriches each event with metadata from a DynamoDB table, and writes valid enriched events to S3 as Parquet partitioned by region/date. Route invalid JSON to a DLQ. Include 7-day backfill, basic observability, and a rough cost estimate?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Proposed: per-tenant Kinesis streams feed a Lambda validator that checks types and required fields against Glue Schema Registry; valid events deduplicate with a DynamoDB idempotency table keyed by dev",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Architect a cross-region telemetry ingestion and governance pipeline for a multi-tenant SaaS with per-tenant isolation, idempotent processing, lineage, and hold-based purges. Use Kinesis Data Streams,",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Ingest via regional KDS; Lambda1 validates JSON; on success, record flows to a staging path. Deduplicate with DynamoDB using deviceId+ts. Lambda2 enriches with device_meta from DynamoDB, then writes e",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Edge throttling at ingress enforces per-tenant quotas via a token bucket in DynamoDB; events go to region A Kinesis with tenant-scoped shards; a cross-region mirror forwards to region B. Exactly-once",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical, end-to-end data flow with enrichment, deduplication, and storage in Parquet, plus handling of bad data via DLQ. Introduces a new angle: enrichment from a metadata store before sink.\n\n## Key Concepts\n- Kinesis Data Streams ingestion\n- DynamoDB dedupe with composite key (deviceId+ts)\n- DynamoDB-backed enrichment (device_meta)\n- Parquet on S3 with region/date partitioning\n- Open/invalid data handling via DLQ\n- 7-day backfill strategy\n- Basic observability (CloudWatch)\n- Cost considerations (Lambdas, KDS shards, Glue writes)\n\n## Code Example\n```javascript\n// Pseudo: Lambda1 validates JSON; on success, write to downstream stream\n// Pseudo: Lambda2 reads, enriches from device_meta, writes to S3 Parquet\n```\n\n## Follow-up Questions\n- How would you handle schema evolution for device_meta fields?\n- How would you test idempotency and replay safety across Lambda steps?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "aws-dva-q-18",
-        "questionId": "q-29196",
-        "question": "Beginner AWS DVA: In one region, ingest 2k JSON telemetry events/min from IoT devices into a Kinesis Data Stream. Implement per-record encryption using AWS KMS inside a Lambda before writing valid records to S3 Parquet (partitioned by date), redact PII, and route invalid records to a DLQ. Include tracing across producer → validator → sink and provide a LocalStack test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Propose a cross-account, multi-tenant pipeline where each tenant has a dedicated Kinesis Stream in their account/region; a hub aggregator fan-ins to tenant-specific S3 buckets, with per-tenant quotas",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a Kinesis consumer Lambda that ingests IoT telemetry, validates records, and redacts PII. Generate a data key using AWS KMS, then encrypt the payload with the AWS Encryption SDK before writing to S3 as Parquet fi…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Attach a durable lineageId to every event; emit a parallel lineage event to a dedicated Kinesis stream and store provenance in a DynamoDB table keyed by lineageId and region. Propagate lineageId throu",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Route each tenant's events to its home region's Kinesis Data Streams and S3, using a per-tenant KMS key for encryption. Enforce exactly-once processing with a DynamoDB deduplication table (tenantId, eventId) checked bef…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question tests the ability to design a secure, end-to-end streaming pipeline with encryption, data redaction, and reliable error handling.\n\n## Key Concepts\n- AWS KMS and the AWS Encryption SDK for per-record encryption\n- PII data redaction techniques\n- Parquet format in S3 with date-based partitioning\n- Dead Letter Queue (DLQ) design and routing patterns\n- X-Ray distributed tracing across producer, validator, and sink services\n- LocalStack for local testing and development\n\n## Code Example\n```javascript\n// Decrypt and process Kinesis record\nconst decrypted = encryptionClient.decrypt(encryptedPayload, dataKey);\n\n// Validate telemetry schema\nif (!schemaValidator.validate(decrypted)) {\n  await dlqClient.send(JSON.stringify(decrypted));\n  return;\n}\n\n// Redact PII fields\nconst redacted = piiRedactor.redact(decrypted);\n\n// Write to S3 as partitioned Parquet\nawait s3Client.putObject({\n  Bucket: 'telemetry-bucket',\n  Key: `year=${date.getFullYear()}/month=${date.getMonth()}/day=${date.getDate()}/${uuid()}.parquet`,\n  Body: await parquetWriter.write(redacted)\n});\n```\n\n## LocalStack Test Plan\n1. Start LocalStack and create Kinesis, S3, KMS, and SQS resources\n2. Deploy Lambda with sample telemetry records\n3. Verify encrypted Parquet files appear in S3 with correct partitioning\n4. Inject malformed records and confirm DLQ routing\n5. Enable X-Ray tracing and validate trace segments in LocalStack",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "aws-dva-q-19",
-        "questionId": "q-20711",
-        "question": "Design a single-region AWS DVA pipeline that ingests 40k JSON telemetry events per minute from 5 tenants, but before storage applies tenant-specific data masking policies (PII redaction, partial masking) via a pluggable policy engine in Lambda. The policy must live in DynamoDB, audit decisions to a separate stream, and masked records stored to S3 Parquet partitioned by tenant/date. Explain testing strategy, late arrivals, and cost trade-offs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Routing: per-tenant shard in KDS or tenant-keyed stream; validate with Glue Schema Registry; redact PII fields in a pre-processing step; compute risk score in Lambda; deduplicate by deviceId+ts using",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Two regional Kinesis streams; Lambda maintains per-device rolling stats (mean and std) in DynamoDB for a 5-minute window and computes a z-score per event. If |z|>3, emit an alert to an SNS topic; writ",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a Lambda masking layer triggered after ingestion into Kinesis Data Streams. Policy per tenant stored in DynamoDB with versioned function references. Masked payloads go to S3 Parquet; an audit even",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Implement per-tenant admission control using DynamoDB to throttle ingress traffic based on tenant-specific quotas. Map tenant tokens to Kinesis shards with dynamic reallocation to handle bursty workloads, and propagate…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nMasks and audits must be tenant-aware and auditable, with policies pluggable at runtime to accommodate diverse privacy requirements. Realistic data volume and late-arrival handling test end-to-end reliability.\n\n## Key Concepts\n\n- Tenant-scoped masking policy engine\n- Policy versioning in DynamoDB\n- Audit stream for masking decisions\n- Parquet storage with tenant/date partitioning\n- Late-arrival data handling and backfill\n\n## Code Example\n\n```javascript\nfunction mask(record, policy) {\n  // Placeholder: apply tenant-specific rules; real logic vary by policy\n  return Object.assign({}, record, { masked: true });\n}\n```\n\n## Follow-up Questions\n\n- How would you test masking policy changes with zero downtime?\n- How would you monitor masking latency and error rates under burst traffic?",
-        "difficulty": "intermediate"
-      },
-      {
         "id": "aws-dva-q-20",
-        "questionId": "q-9906",
-        "question": "Design a per-tenant data quality and governance pipeline for a high-volume telemetry stream (500 tenants, 1M events/sec) using AWS DVA primitives. Implement ingestion-time validation: mandatory fields, types, and optional field drift; route invalid records to a quarantine S3 with a DLQ; valid events to the primary Kinesis stream. Maintain per-tenant audit in DynamoDB; Glue catalog evolves; Athena queries; OpenTelemetry traces; per-tenant alerts on SLAs. How would you implement it?",
+        "questionId": "q-10194",
+        "question": "Design a per-tenant, low-latency anomaly-detection pipeline for a multi-region telemetry system that must operate within ~150 ms end-to-end under peak load. Use AWS DVA primitives (Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB) and OpenTelemetry. Include schema evolution with optional fields, a 24-hour backfill for missed windows, per-tenant isolation, and cost/latency trade-offs. What would you implement and why?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Two tenants publish JSON telemetry to separate Kinesis Streams in their own accounts. A central analytics lake in a third account uses Lake Formation catalog and a shared S3 bucket, partitioned by ten",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Ingestion-time validators run as Lambda/Fargate tasks validating per-tenant schema (mandatory fields, types, drift) before routing. Use tenant_id as the partition key; write valid events to the primar",
+            "text": "Per-tenant, low-latency path: Kinesis Data Streams with tenant_id as the partition key and Enhanced Fan-Out; real-time inference in Lambda/Fargate; emit anomalies to DynamoDB and store results in S3 P",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "An autonomous tenant-aware observability and self-healing pipeline with per-tenant SLAs mapped to Kinesis shard pools, OpenTelemetry traces across Lambda/Fargate and S3, and an idempotent writer to Dy",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "Use Kinesis Data Streams with auto-scaling shards to ingest 10k JSON/min; a Lambda validates and computes a data-quality score (0-1) per record, deduplicates via DynamoDB (deviceId+ts), writes valid e",
+            "text": "Implement a producer Lambda that publishes telemetry events to a Kinesis Data Stream. Create a data-masking Lambda that redacts PII fields (userId, email, phone, ip) from the payload before a Parquet writer writes the d…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Lineage-first design: emit lineage events to a dedicated Kinesis stream, enrich with tenant/source/ts in Lambda, persist lineage metadata in DynamoDB and Glue Catalog, store transformed data in S3 wit",
+            "text": "Route data by tenantId, storing events in s3://bucket/tenants/{tenantId}/{region}/{date}/ as Parquet; use per-tenant dedupe in DynamoDB with deviceId+seq; create tenant-scoped IAM roles granting acces",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design ingestion-time data quality with multi-tenant constraints and governance, including quarantine handling, catalog evolution, and observability.\n\n## Key Concepts\n- Ingestion-time validation\n- Per-tenant schema drift handling\n- Quarantine DLQ and audit trails\n- Glue catalog evolution and Athena access\n- OpenTelemetry tracing and SLA alerts\n\n## Code Example\n```javascript\n// Pseudo validator sketch\nexports.handler = async (evt) => {\n  const record = JSON.parse(Buffer.from(evt.data, 'base64').toString());\n  const valid = record.tenant_id && typeof record.tenant_id === 'string' && record.fields;\n  if (!valid) throw new Error('Invalid');\n  return { validity: 'ok' };\n}\n```\n\n## Follow-up Questions\n- How would you scale the validator for 1M events/sec?\n- How would you model per-tenant schema drift and auto-remediation?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\n\nAssesses ability to design a scalable, low-latency streaming solution with multi-tenant isolation, schema evolution, and recoverability, using AWS DVA primitives and observability.\n\n## Key Concepts\n\n- Per-tenant sharding on Kinesis and Enhanced Fan-Out for latency\n- Real-time inference in Lambda or Fargate\n- Idempotent writes via stable dedupe keys\n- Schema evolution with optional fields and backward compatibility\n- 24h backfill via replay path\n- Observability with OpenTelemetry across services\n- DLQ and backpressure handling; cost vs latency trade-offs\n\n## Code Example\n\n```javascript\n// Deduplicate by tenant+ts\nfunction dedupeKey(evt){ return evt.tenant_id+\":\"+evt.ts; }\n```\n\n## Follow-up Questions\n\n- How would you validate end-to-end latency under burst traffic?\n- How would you test replay correctness and idempotence across regions?",
+        "difficulty": "intermediate"
       },
       {
         "id": "aws-dva-q-21",
-        "questionId": "q-3982",
-        "question": "In a Tesla-like fleet telemetry pipeline, implement end-to-end distributed tracing with OpenTelemetry from device to Kinesis, Lambda/Fargate, and central analytics. Describe trace propagation in records, sampling strategy, idempotent writes, tenant isolation, and failure observability, with concrete trade-offs?",
+        "questionId": "q-5806",
+        "question": "Design a cross-region, multi-tenant telemetry ingestion pipeline that guarantees per-tenant data residency, exactly-once processing, and 48-hour purge windows. Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, and OpenTelemetry. Explain how tenant-scoped keys, idempotent writes, late-arriving data handling, and audit trails would be implemented; describe testing and failure modes?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Instrument OpenTelemetry at the producer to emit traceparent in each Kinesis record, with adaptive sampling at 0.1–0.5% to reduce overhead. In Lambda/Fargate, bind spans from incoming trace context, p",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement per-tenant isolation using Lake Formation LF-tags with policy-based grants, expose only non-sensitive columns through masked views, and enforce row-level security filters in Athena queries. Leverage CloudTrail…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a per-tenant Kinesis partitioning with a DynamoDB dedupe keyed by tenant+sequence to guarantee exactly-once ingestion. Audit trails land in S3 with Object Lock Governance; replicate immutabilit",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Adapter path: MQTT and HTTPS feed a single Kinesis stream. Normalize to {deviceId, ts, metric, correlationId}. Validate required fields and numeric ranges, dedupe by deviceId+ts with DynamoDB, and sto",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nInterviews test observability in streaming pipelines, pushing for end-to-end tracing, data formats, and tenancy considerations in AWS DVA.\n\n## Key Concepts\n\n- OpenTelemetry trace propagation across producers, Kinesis, and processors\n- End-to-end context in Lambda/Fargate with proper context binding\n- Idempotent writes and deduplication across regions\n- Tenant isolation via Lake Formation and per-tenant data stores\n- Sampling strategies and their impact on latency and cost\n- Failure handling: retries, DLQ, backpressure, and observability\n\n## Code Example\n\n```javascript\n// Pseudo-code: attach trace context to a Kinesis record\nconst span = tracer.startSpan('telemetry.ingest');\nconst { traceId, spanId } = span.context();\nconst traceparent = `00-${traceId}-${spanId}-01`;\nconst record = {\n  deviceId,\n  timestamp: Date.now(),\n  payload,\n  traceparent\n};\nrecords.push(record);\nspan.end();\n```\n\n## Follow-up Questions\n\n- How would you validate schema evolution for trace metadata without producers breaking?\n- How would you monitor trace latency and backlog across multiple regions and services?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "aws-dva-q-22",
-        "questionId": "q-25404",
-        "question": "In a three-region deployment, design a streaming telemetry pipeline where each region ingests device data into a local Kinesis Data Stream, validates schema evolution via Glue Schema Registry, deduplicates per region with DynamoDB, and stores validated events in S3 Parquet partitioned by region/date. Simultaneously, ship cross-region aggregates to OpenSearch with replication. Address data residency, encryption, observability, and test strategy (including LocalStack)?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a 3-region streaming pipeline where each region ingests telemetry to a local KDS, validates and schemas (via Glue Schema Registry), deduplicates in regional DynamoDB, and writes valid events to",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Design a cross-region telemetry pipeline ingesting 30k JSON events/min from devices across three regions, enforcing PII masking in flight and at rest with per-record privacy policies. Route masked dat",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement at ingestion a per-tenant schema in Glue, validate JSON against Avro, enforce ranges, and assign anomaly score; valid events land in per-tenant Parquet in S3; invalids go to quarantine with",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "I would build a two-region Kinesis-driven pipeline where regional steady streams feed a Lambda validator. It uses a DynamoDB rules table keyed by deviceModel for dynamic checks, assigns a per-record q",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes real-world multi-region data pipelines, schema evolution, idempotency, cross-region analytics, and testing.\n\n## Key Concepts\n- Multi-region streaming\n- Glue Schema Registry and schema evolution\n- Per-region deduplication and S3 Parquet partitioning\n- Cross-region OpenSearch analytics and residency constraints\n\n## Code Example\n\n```javascript\n// Placeholder example showing a Lambda schema validation stub\n```\n\n## Follow-up Questions\n- How would you model failure modes and retries for cross-region writes?\n- What cost optimizations and SLAs would you specify for latency and durability?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "aws-dva-q-23",
-        "questionId": "q-25703",
-        "question": "Design an advanced cross-region telemetry pipeline with per-tenant isolation and precisely-once processing that ingests 1M events/min from 5 device families across two AWS regions. Implement end-to-end tracing with OpenTelemetry across producers, Lambda, Fargate, and a Glue batch job that materializes Parquet in S3. Detail trace propagation, backplane storage (without raw data), per-tenant quotas, SLA verification, and a testing plan. Include configuration snippets and a high-level data flow?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a cross-region telemetry pipeline ingesting 30k JSON events/min from devices across three regions, enforcing PII masking in flight and at rest with per-record privacy policies. Route masked dat",
+            "text": "Deploy three regional Kinesis Data Streams (one per tenant per region) with strict IAM isolation and per-tenant KMS keys for encryption at rest. Embed provenance metadata—tenantId, lineageId, source, and ingestTs—direct…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement a cross-region telemetry pipeline using Kinesis Data Streams as the ingestion backbone with per-region Fargate consumers. Store raw events in S3 with partitioned Parquet files organized by date/hour for effici…",
+            "text": "Use per-tenant prefixes in S3 and dedicated Kinesis streams per region; implement idempotence with a DynamoDB dedupe table keyed by tenantId+recordId+ts and store only once; emit OpenTelemetry traces",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Proposed approach: shard-per-tenant on Kinesis; per-tenant quotas tracked in DynamoDB; Lambda deduplicates on (tenantId, eventId); cross-region replication via mirrored streams and a fan-out Lambda to",
-            "isCorrect": false
+            "text": "Partition data by tenant in Kinesis and a DynamoDB-based dedupe store keyed by (tenant, eventId) to enforce exactly-once processing; Lambda processors write to per-tenant S3 prefixes and register Glue",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Per-tenant partition keys on Kinesis; idempotent Lambda handlers keyed by tenant+messageId; propagate OpenTelemetry trace context (W3C) across producers, Lambda, Fargate, and Glue; collector writes sp",
-            "isCorrect": true
+            "text": "Ingest from two regional KDS streams into a Lambda-based mask stage. Mask sensitive fields (phone, email, deviceId) using per-tenant KMS keys, emitting masked events to S3 Parquet under tenant/date pr",
+            "isCorrect": false
           }
         ],
-        "explanation": "Why This Is Asked\n Assesses ability to design a cross-region, tenant-isolated telemetry path with tracing across all stages, enforcing exactly-once semantics, SLA verification, and late data handling.\n\nKey Concepts\n - OpenTelemetry trace propagation across producers, compute, and batch jobs\n - Exactly-once processing and idempotence per tenant\n - Cross-region data flow and a DynamoDB backplane for traces\n - Tenant isolation via partition keys and quotas\n - Late data handling and robust testing strategy\n\nCode Example\n ```javascript\n// Producer: attach trace context to Kinesis record\nconst span = tracer.startSpan('telemetry.produce', { attributes: { tenant }});\nconst payload = { ...event, traceId: span.context().traceId, spanId: span.context().spanId };\nconst data = JSON.stringify(payload);\nkinesis.putRecord({ StreamName: 'telemetry-1', Data: data, PartitionKey: tenant });\nspan.end();\n ```\n\nFollow-up Questions\n - How would you scale the OpenTelemetry collector across regions?\n - How would you validate end-to-end trace completeness and SLA adherence?",
+        "explanation": "## Why This Is Asked\n\nAssess expertise in designing cross-region, multi-tenant telemetry systems with data residency, exactly-once semantics, and purge policies using AWS DVA resources and OpenTelemetry; also tests reliability, scaling, and cost.\n\n## Key Concepts\n\n- Tenant isolation via partition keys and per-tenant prefixes\n- Exactly-once processing with dedupe using DynamoDB and idempotent writes\n- Data residency with cross-region replication and retention purge\n- Auditability and OpenTelemetry instrumentation\n- Glue catalog, Athena queries, and cost controls\n\n## Code Example\n\n```javascript\n// Pseudo deduplication check (illustrative)\nasync function isDuplicate(tenant, id) {\n  const key = `${tenant}:${id}`;\n  // read/write to DynamoDB to determine if seen\n}\n```\n\n## Follow-up Questions\n\n- How would you test exactly-once guarantees under shard rebalancing or network partitions?\n- What are the cost implications of per-tenant prefixes and cross-region replication, and how would you optimize?",
         "difficulty": "advanced"
       },
       {
-        "id": "aws-dva-q-24",
-        "questionId": "q-9412",
-        "question": "Beginner AWS DVA task: 1,200 devices publish JSON telemetry to a regional Kinesis Data Stream. Design a minimal, cost-conscious pipeline that validates JSON, computes a data quality score, deduplicates by deviceId+ts, writes valid events to S3 Parquet partitioned by region/date/tenantId, and streams a copy to OpenSearch for near real-time search by deviceId. Invalid records go to a DLQ. Include a 7-day backfill and basic observability?",
+        "id": "aws-dva-q-22",
+        "questionId": "q-18097",
+        "question": "Design an advanced cross-region telemetry pipeline with per-tenant data locality and cross-region event ordering. Tenants can specify dataLocality: regional or global pool, with purge within 48 hours unless retention applies. Use AWS DVA primitives: Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB, and OpenTelemetry. Explain tenant placement policy, idempotent writes, late data handling, audit trails, and failure modes with testing strategy?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a cross-region telemetry pipeline using dedicated Kinesis Streams per region, partitioned by tenantId and date for data residency compliance. Implement exactly-once processing via a DynamoDB dedupe table keyed on…",
+            "text": "Utilize per-tenant PartitionKey in Kinesis streams; implement idempotent writes to DynamoDB and S3 (parquet) keyed by tenantId+ts; fan-out through a cross-region stream to minimize latency; Glue catal",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Ingest telemetry through a regional Kinesis Data Stream. A Lambda function validates JSON structure and computes a data quality score from 0-100. Implement deduplication using DynamoDB with a composite key of (deviceId,…",
-            "isCorrect": true
+            "text": "Ingest data via Kinesis Data Streams in a single region, validate against a Glue Schema Registry (handling optional fields) in a Lambda function, mask PII such as emails and phone numbers before storage, deduplicate usi…",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Design a cross-region telemetry pipeline ingesting 30k JSON events/min from devices across three regions, enforcing PII masking in flight and at rest with per-record privacy policies. Route masked dat",
+            "text": "Proposed approach: use per-region Kinesis streams; Lambda validates/redacts; DynamoDB as device registry for enrichment and a dedupe store keyed by deviceId+seq; Parquet in S3 with region/date partiti",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Leverage a two-region Kinesis per-tenant feed with Lambda/Fargate shims that deduplicate by tenant+recordId, writing idempotent records into S3 Parquet under tenant/date/region and updating a DynamoDB",
+            "text": "Place tenant policy in DynamoDB: tenantId → region, locality, retention. Ingest into tenant-scoped Kinesis streams; implement idempotent writes with sequence numbers and a dedupe store. Use OpenTeleme",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to reason about multi-region data locality, strong guarantees, and operational realism in a telemetry pipeline.\n\n## Key Concepts\n- Data locality policy storage and dynamic routing\n- Exactly-once semantics across regions\n- OpenTelemetry tracing across producers, processors, and stores\n- Retention, purge, and regulatory holds with immutable audit trails\n- Cost controls via storage tiering and read/write sharding\n\n## Code Example\n```javascript\n// Pseudo routing: select stream by tenant policy\nfunction routeEvent(evt, policy){ /* ... */ }\n```\n\n## Follow-up Questions\n- How would you test cross-region ordering under outages?\n- What metrics and alarms ensure policy violations are detected quickly?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "aws-dva-q-23",
+        "questionId": "q-3242",
+        "question": "Beginner AWS DVA task: 1,500 devices emit JSON events to a regional Kinesis Data Stream. Build a pipeline using Lambda to validate against a versioned Glue Schema Registry, redact PII, and write Parquet to S3 partitioned by region/date. Use DynamoDB for dedupe (deviceId+seq). Introduce schema versioning for backward compatibility and plan a 7-day backfill. Include monitoring, cost considerations, and test scenarios (invalid schema, duplicates, late data)?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a DynamoDB dedup table keyed by recordId to guard a per-record idempotent path in Lambda; write valid records to Parquet with date-based partitions in S3, and store re-ingested late data via date",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Split ingestion by tenant-region to meet residency; per-region Kinesis streams feed a processing layer (Lambda/Fargate) that upserts into DynamoDB and writes to S3 as Parquet with tenant-scoped partit",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Architect a cross-region telemetry pipeline with per-tenant isolation and SageMaker-based anomaly scoring. Use Kinesis streams per region, Lambda/Fargate enrichment, and S3 Parquet storage with tenant",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a regional DVA pipeline: 1,500 devices -> Kinesis Data Stream; Lambda validates against Glue Schema Registry (versioned), redacts PII, writes Parquet to S3 partitioned by region/date; DynamoDB",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests practical ability to design end-to-end DVA pipelines with schema evolution, dedupe, and backfill in a beginner-friendly context, including error handling and cost awareness.\n\n## Key Concepts\n- Glue Schema Registry versioning and runtime validation\n- Idempotent writes and DynamoDB-based dedupe\n- Parquet storage with partition pruning\n- Backfill strategies and monitoring\n\n## Code Example\n```javascript\n// Pseudo-Lambda outline for validation and write\n```\n\n## Follow-up Questions\n- How would you test schema evolution without breaking existing data?\n- What metrics would you monitor to detect backfill lag and dedupe misses?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "aws-dva-q-24",
+        "questionId": "q-16371",
+        "question": "Design an end-to-end observability plan for a cross-region, multi-tenant telemetry pipeline using AWS DVA primitives (Kinesis Data Streams, Lambda/Fargate, S3, Glue, Athena, DynamoDB). Implement OpenTelemetry tracing that propagates per-tenant context across ingestion, processing, and analytics layers, with tenant-aware sampling and a unified collector. Outline instrumentation points, propagation strategy, and validation under burst traffic?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design an end-to-end observability plan using AWS DVA primitives with OpenTelemetry for cross-region, multi-tenant telemetry pipelines. Implement a unified collector that receives OTLP data from all layers, with tenant-…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Validate each JSON record against a versioned schema stored in DynamoDB; compute a per-record risk score using recent historical data; route low-risk events to S3 in Parquet format (partitioned by region and date) and h…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a beginner-level, single-region pipeline for ingesting 1k–2k JSON telemetry events per minute from devices across multiple tenants using AWS DVA tools. Leverage AWS Glue Schema Registry to enforce a runtime JSON…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use Glue Schema Registry with versioned Avro for backward/forward compatibility; route events through Kinesis with partition key tenant|deviceId|ts; implement idempotent writes via a DynamoDB dedupe t",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design end-to-end streaming architecture with multiple data sinks, tenant isolation strategies, and data quality validation at beginner scale.\n\n## Key Concepts\n- Kinesis Data Streams for high-throughput ingestion\n- JSON schema validation and automated quality scoring\n- DynamoDB deduplication using composite keys\n- Parquet columnar storage in S3 with strategic partitioning\n- OpenSearch for near real-time search capabilities\n- Dead-letter queue implementation for error handling\n- 7-day historical data backfill approaches\n- Cost-effective observability and monitoring",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\n\nThis question validates your ability to design distributed tracing systems that span multiple AWS services while handling multi-tenant complexity. It tests understanding of OpenTelemetry primitives, performance considerations under load, and cross-region architecture patterns.\n\n## Key Concepts\n\n- Distributed tracing across Kinesis Data Streams, Lambda, Fargate, Glue, and Athena\n- OpenTelemetry SDK integration with OTLP exporters and context propagation\n- Tenant-scoped sampling strategies (head-based and tail-based)\n- Centralized collector deployment patterns and latency budgets\n- Trace context injection into event payloads and metadata\n\n## Code Example\n\n```javascript\n// Ingestion Lambda with OpenTelemetry\nconst { trace } = require('@opentelemetry/api');\nconst tracer = trace.getTracer('ingestion-service');\n\nexports.handler = async (event) => {\n  const span = tracer.startSpan('kinesis-ingest', {\n    attributes: {\n      'tenant.id': event.tenantId,\n      'region': process.env.AWS_REGION\n    }\n  });\n  \n  try {\n    const enrichedPayload = {\n      ...event.data,\n      traceId: span.spanContext().traceId,\n      spanId: span.spanContext().spanId,\n      tenantId: event.tenantId\n    };\n    \n    await nextProcessor(enrichedPayload);\n    span.setStatus({ code: SpanStatusCode.OK });\n  } catch (err) {\n    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });\n    throw err;\n  } finally {\n    span.end();\n  }\n};\n```\n\n## Follow-up Questions\n\n- How would you handle trace continuity during Kinesis shard resplitting?\n- What's your strategy for managing collector costs at high throughput?\n- How do you ensure trace sampling doesn't lose error spans for low-traffic tenants?",
+        "difficulty": "advanced"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-06-01T11:46:34.840Z",
+    "createdAt": "2026-06-02T05:43:02.187Z",
     "version": 1
   }
 ]
