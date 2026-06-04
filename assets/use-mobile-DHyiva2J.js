@@ -1,0 +1,1 @@
+import{r as o}from"./vendor-radix-D-g2ZA6z.js";const s=768,e=()=>typeof window>"u"?!1:window.innerWidth<s,a=e();function d(){const[r,t]=o.useState(a);return o.useEffect(()=>{const n=window.matchMedia(`(max-width: ${s-1}px)`),i=()=>{t(e())};return n.addEventListener("change",i),t(e()),()=>n.removeEventListener("change",i)},[]),r}export{d as u};
