@@ -1,0 +1,1 @@
+import{j as o}from"./vendor-radix-CF4JLO-s.js";import{a}from"./EmptyState-DthPhM5m.js";function e({post:r,variant:t="grid"}){return o.jsx(a,{article:r,href:`/blog/${r.slug}`,variant:t})}export{e as P};
