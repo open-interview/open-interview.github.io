@@ -8,743 +8,53 @@
     "questions": [
       {
         "id": "dbt-analytics-engineer-q-0",
-        "questionId": "q-29418",
-        "question": "In a Snowflake/dbt environment with per-tenant schemas analytics_{{tenant}} and a shared analytics_base, design a per-tenant data quality gate driven by a macro analytics_base.qc_aggregate(tenant) that ingests manifest.json and run_results.json to populate analytics_base.quality_{{tenant}} with fields: tenant, model, test_name, status, score. Propose per-tenant tests (e.g., not_null(id), referential checks), and wire a CI gate to fail deploy if any tenant's quality score falls below 0.95 in the latest two runs?",
+        "questionId": "q-16763",
+        "question": "Design a per-tenant anomaly detection pipeline in Snowflake/dbt. From staging.tenant_events to analytics_{{tenant}}.anomalies_daily, compute per-tenant event_rate and a z-score-based anomaly flag using a per-tenant config stored in analytics_{{tenant}}.config (window_size, threshold). Implement a macro to auto-create the per-tenant schema and a global analytics.lineage entry. Include 1-day late data, schema drift guards, tests: not_null on keys, unique on (tenant_id, day), and CI checks that per-tenant config exists and anomalies are isolated by tenant?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement an incremental model with unique_key=['day','product_id','region']; reprocess the last 2 days during incremental runs to absorb late data; use MERGE/upsert where supported, else a two-phase",
+            "text": "Use an incremental model keyed by day, category, and customer_segment. Compute revenue as sum(price*quantity) from staging.events_raw. Upsert into analytics.daily_sales via MERGE on (day, category, cu",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Propose a per-tenant identity unification using a dbt macro hash_user_id that applies HMAC-SHA256 with a per-tenant salt from analytics_{{tenant}}.salts to staging_tenant_events.user_id, materialize a",
-            "isCorrect": false
+            "text": "Build an incremental per-tenant anomaly detection pipeline: compute a daily event_rate per tenant from staging.tenant_events, fetch per-tenant thresholds from analytics_{{tenant}}.config via a macro, calculate z-scores…",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "A tenancy-aware dbt run parameterizes the target schema per tenant, isolates seeds and sources with tenant prefixes, and uses a tenancy-aware test macro to scope checks. In CI, create ephemeral tenant",
+            "text": "Build analytics.daily_metrics as an incremental Snowflake model that counts distinct user_id by day and event_type from staging.event_logs, enriched via a join to dimensions.countries on country. Upse",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Implement analytics_base.qc_aggregate(tenant) as a macro that parses manifest.json and run_results.json to populate analytics_base.quality_{{tenant}} with fields: tenant, model, test_name, status, and score. Define per-…",
-            "isCorrect": true
+            "text": "Use a macro to auto-generate per-tenant tests: not_null on key columns, unique on (tenant_id, day), and referential checks against analytics_base.contracts. Build analytics_{{tenant}}.data_health from",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nAssess practical data quality orchestration across multi-tenant dbt projects. Requires a reusable macro, per-tenant quality artifacts, targeted tests, and an automated deployment guard.\n\n## Key Concepts\n\n- dbt macros and cross-tenant artifact parsing\n- manifest.json and run_results.json consumption\n- Per-model quality scoring and aggregation\n- Tests: not_null, referential integrity\n- CI gates tied to run history\n\n## Code Example\n\n```sql\n-- analytics_base/macros/qc_aggregate.sql\n{% macro qc_aggregate(tenant) %}\n  {% set manifest = fromjson(var('manifest_path', 'target/manifest.json')) %}\n  {% set run_results = fromjson(var('run_results_path', 'target/run_results.json')) %}\n  \n  {% set quality_table = ref('quality_' + tenant) %}\n  \n  {% set quality_records = [] %}\n  \n  {% for node in manifest.nodes.values() %}\n    {% if node.resource_type == 'test' and tenant in node.alias %}\n      {% set test_result = run_results.results | selectattr('unique_id', 'equalto', node.unique_id) | first %}\n      {% set status = 'passed' if test_result.status == 'pass' else 'failed' %}\n      {% set score = 1.0 if test_result.status == 'pass' else 0.0 %}\n      \n      {% do quality_records.append({\n        'tenant': tenant,\n        'model': node.alias,\n        'test_name': node.test_metadata.name if node.test_metadata else node.alias,\n        'status': status,\n        'score': score\n      }) %}\n    {% endif %}\n  {% endfor %}\n  \n  {{ return(quality_records) }}\n{% endmacro %}\n\n-- models/quality_{{tenant}}.sql\n{{ config(materialized='table') }}\n\nWITH aggregated AS (\n  SELECT\n    '{{ tenant }}' AS tenant,\n    model,\n    test_name,\n    MAX(status) AS status,\n    AVG(score) AS score\n  FROM {{ source('quality_' + tenant, 'quality_events') }}\n  GROUP BY model, test_name\n)\n\nSELECT * FROM aggregated\n```\n\n## Per-Tenant Test Examples\n\n```yaml\n# models/schema.yml\nversion: 2\n\nmodels:\n  - name: orders_{{ tenant }}\n    tests:\n      - not_null:\n          column_name: id\n      - relationships:\n          to: ref('customers_{{ tenant }}')\n          column: customer_id\n          config:\n            severity: error\n\n  - name: customers_{{ tenant }}\n    tests:\n      - not_null:\n          column_name: id\n      - unique:\n          column_name: email\n```\n\n## CI Gate Implementation\n\n```yaml\n# .github/workflows/dbt-quality-gate.yml\nname: Per-Tenant Quality Gate\n\non:\n  push:\n    branches: [main]\n\njobs:\n  quality-gate:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      \n      - name: Run dbt tests\n        run: |\n          for tenant in {% raw %}{{% endraw %} secrets.TENANTS {% raw %}}{% endraw %}; do\n            dbt run --target $tenant\n            dbt test --target $tenant\n          done\n      \n      - name: Evaluate quality scores\n        id: quality-check\n        run: |\n          FAIL_COUNT=0\n          for tenant in {% raw %}{{% endraw %} secrets.TENANTS {% raw %}}{% endraw %}; do\n            SCORE=$(sql -d warehouse -c \"SELECT AVG(score) FROM analytics_base.quality_$tenant WHERE run_date >= CURRENT_DATE - INTERVAL '14 days' ORDER BY run_date DESC LIMIT 2\")\n            if (( $(echo \"$SCORE < 0.95\" | bc -l) )); then\n              echo \"Tenant $tenant quality score ($SCORE) below threshold\"\n              FAIL_COUNT=$((FAIL_COUNT + 1))\n            fi\n          done\n          exit $FAIL_COUNT\n      \n      - name: Block deployment on quality failure\n        if: steps.quality-check.outputs.outcome == 'failure'\n        run: exit 1\n```",
+        "explanation": "## Why This Is Asked\nThis question tests end-to-end implementation of per-tenant anomaly detection, macro-driven schema creation, config-driven thresholds, 1-day late data handling, schema drift guards, lineage tracking, and CI quality gates.\n\n## Key Concepts\n- **Per-tenant config**: Table analytics_{{tenant}}.config storing window_size and threshold\n- **Z-score anomaly detection**: Statistical approach using per-tenant rolling statistics\n- **Incremental models**: Efficient processing of new data per tenant\n- **Macro-driven schema creation**: Automated per-tenant schema generation for isolation\n- **Data quality**: Drift guards and CI validation\n\n## Code Example\n```sql\n-- Per-tenant anomaly detection with config-driven thresholds\nWITH tenant_stats AS (\n    SELECT \n        tenant_id,\n        event_day,\n        COUNT(*) AS event_count,\n        AVG(COUNT(*)) OVER (\n            PARTITION BY tenant_id \n            ORDER BY event_day \n            ROWS BETWEEN {{ window_size }} PRECEDING AND 1 PRECEDING\n        ) AS rolling_avg,\n        STDDEV(COUNT(*)) OVER (\n            PARTITION BY tenant_id \n            ORDER BY event_day \n            ROWS BETWEEN {{ window_size }} PRECEDING AND 1 PRECEDING\n        ) AS rolling_stddev\n    FROM {{ ref('staging_tenant_events') }}\n    WHERE event_day < CURRENT_DATE() - 1\n    GROUP BY tenant_id, event_day\n)\nSELECT \n    s.tenant_id,\n    s.event_day,\n    s.event_count AS event_rate,\n    CASE \n        WHEN s.rolling_stddev > 0 \n        THEN (s.event_count - s.rolling_avg) / s.rolling_stddev \n    END AS z_score,\n    CASE \n        WHEN s.rolling_stddev > 0 \n             AND ABS((s.event_count - s.rolling_avg) / s.rolling_stddev) > c.threshold\n        THEN TRUE \n    END AS anomaly_flag\nFROM tenant_stats s\nJOIN {{ ref('config') }} c ON s.tenant_id = c.tenant_id\n```",
         "difficulty": "advanced"
       },
       {
         "id": "dbt-analytics-engineer-q-1",
-        "questionId": "q-21083",
-        "question": "Design a per-tenant rollback workflow in dbt/Snowflake: introduce a rollback_control table analytics_{{tenant}}.control with a rollback_needed flag and a target_date. When flagged, implement a per-tenant rollback macro that clones analytics_{{tenant}}.facts to a rollback snapshot as of target_date, swaps the active table safely, and re-runs incremental builds for affected days. Include 1-day late data, per-tenant isolation via RLS, and CI gating that fails if any tenant has rollback_needed=true?",
+        "questionId": "q-15212",
+        "question": "Design a per-tenant sanitized session summary pipeline in Snowflake/dbt: from staging.tenant_sessions to analytics_{{tenant}}.sanitized_session_summary daily; use a macro to mask user_id and session_ip for tenants without FULL_ACCESS; include 1-day late data, schema drift guards, tests (not_null on keys, unique on (tenant_id, day_start, sanitized_session_id)); a global analytics.lineage; and CI validating per-tenant models exist and cross-tenant isolation, with automatic tenant registry-driven creation?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement analytics_base.redact_email(tenant, email) using sha256(email||tenant_salt) and return a fixed-length hex; build analytics_{{tenant}}.cohort_retention as an incremental model from staging.te",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement analytics.sales.daily_user_spend as an incremental model keyed by (user_id, order_date), joining staging.orders with staging.users as needed. Compute total_spend = sum(amount) and order_count = count(*). Confi…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "To implement, define a macro that, given tenant_id and region, creates analytics_{tenant} schema and configures dbt to target a per-tenant warehouse from a regional map. Use an incremental model for a",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "To implement per-tenant rollback, create analytics_{{tenant}}.control with rollback_needed, target_date; a macro perform_rollback() that clones analytics_{{tenant}}.facts to a rollback variant as of t",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nReal-world incidents require safe, per-tenant recovery without affecting others. This tests dbt macro design, Snowflake cloning, and governance controls.\n\n## Key Concepts\n- Snowflake CLONE and zero-copy rollback\n- dbt macros for per-tenant orchestration\n- RLS-based isolation and CI gates for safety\n- Tests for rollback flags and target_date validity\n\n## Code Example\n```javascript\n-- dbt macro sketch: macros/rollback.sql\n{% macro rollback_to_target(tenant, target_date) -%}\n  {% set src = 'analytics_' ~ tenant ~ '.facts' %}\n  {% set dst = 'analytics_' ~ tenant ~ '.facts_rollback_' ~ target_date | replace('-', '') %}\n  {% do run_query('CREATE OR REPLACE TABLE ' ~ dst ~ ' CLONE ' ~ src) %}\n  {% do run_query('ALTER TABLE ' ~ dst ~ ' ADD CONSTRAINT _target_date CHECK (event_date <= DATE ' ~ target_date ~ ')') %}\n  {% do run_query('ALTER MATERIALIZED VIEW ' ~ src ~ ' REFRESH') %}\n  {{ return(dst) }}\n{%- endmacro %}\n```\n\n## Follow-up Questions\n- How would you test for partial failures during rollback and ensure idempotence?\n- How would you extend to multi-region deployments with cross-tenant rollbacks?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-2",
-        "questionId": "q-11752",
-        "question": "Design a per-tenant data quality framework in Snowflake/dbt: from staging.tenant_events and staging.tenant_quality to analytics_{{tenant}}.quality_summary. Implement a macro that loads per-tenant JSON rules from tenants(tenant_id, quality_rules_json) and enforces them at load time. Support 1-day late data, schema-drift guards, and tests: not_null on (tenant_id, day_start, metric); unique on (tenant_id, day_start, metric). Include analytics.lineage and CI to verify all tenants have quality_summary and auto-create rules?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a tenant_context var and a tenant_filter(ctx) macro that appends tenant_id = {{ var('TENANT') }} to every model, expose analytics.public.engagement_<tenant> views, apply Snowflake masking on",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a dbt macro that reads per-tenant JSON quality_rules from tenants and applies them during the load into analytics_{{tenant}}.quality_summary, validating tenant_id, day_start, and metric not",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use an incremental model analytics.daily_finance that upserts sum(amount) and transaction_count by day, currency, country_code, and status; allow late data within a 2-day window via a MERGE-based upse",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "JSON-driven data quality: rules.json defines per-tenant required_fields and max_null_pct; the dq_rules macro auto-generates not_null tests and a null-rate test for each tenant/table/field. Create anal",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests a) dynamic per-tenant rule loading from a registry, b) robust data quality checks with drift and late data, c) end-to-end lineage and CI for multi-tenant isolation.\n\n## Key Concepts\n- dbt macros reading per-tenant JSON rules\n- Snowflake JSON parsing and validation\n- Incremental quality loads with late data\n- Data isolation via per-tenant schemas and lineage tracking\n\n## Code Example\n```\n-- Pseudo dbt macro sketch (macro/load_quality_rules.sql)\nselect * from tenants t, lateral flatten(input => t.quality_rules_json) r\n```\n\n## Follow-up Questions\n- How would you test rule evolution across tenants without breaking existing data?\n- How would you handle conflicting rules between tenants during CI checks?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-3",
-        "questionId": "q-13880",
-        "question": "In Snowflake with dbt, implement a per-tenant data quality pipeline: from staging.tenant_events to analytics_{{tenant}}.quality_summary; use a macro to compute daily metrics for completeness, validity, and duplicates; allow 1-day late data; add schema drift guards; tests: not_null on keys, unique on (tenant_id, day_start); include a global analytics.lineage; CI to verify per-tenant tables exist and that new tenants from a tenants registry auto-provision analytics_{{tenant}}.quality_summary; explain how to enforce cross-tenant isolation and monitor drift?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a macro-driven per-tenant daily rollup from staging.tenant_events to analytics_{{tenant}}.daily_summary, using day_start = date_trunc('day', occurred_at). The pipeline accepts 1-day late data to handle event d…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Architect a per-tenant data quality pipeline that materializes analytics_{{tenant}}.quality_summary from staging.tenant_events using a macro to compute daily completeness, validity, and duplicates, wi",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Proposed approach: build a per-tenant data-quality framework on analytics_base.quality. The macro validate_freshness(tenant, upstream, downstream) compares max(event_ts) per tenant across staging and",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a dbt macro that reads per-tenant JSON quality_rules from tenants and applies them during the load into analytics_{{tenant}}.quality_summary, validating tenant_id, day_start, and metric not",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design scalable, automated data quality for multi-tenant dbt pipelines, including dynamic object creation, drift guarding, and CI orchestration.\n\n## Key Concepts\n\n- dbt macros for per-tenant objects\n- schema drift guards and data quality tests\n- per-tenant lineage tracking\n- automated tenant provisioning via a registry\n\n## Code Example\n\n```javascript\n// pseudo-macro example to derive per-tenant table name\nfunction qualityTable(tenant){ return `analytics_${tenant}.quality_summary`; }\n```\n\n## Follow-up Questions\n\n- How would you adjust tolerance for late data per tenant?\n- How would you alert on quality metric thresholds per tenant?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-4",
-        "questionId": "q-11293",
-        "question": "Design a beginner dbt workflow in Snowflake that computes per-tenant daily_active_users from staging.users (tenant_id, user_id, last_login). Create a macro that auto-generates analytics_{{tenant}}.daily_active_users and its 1-day-late data window as an incremental model. Include tests not_null on keys and unique on (tenant_id, day, user_id); maintain a global analytics.lineage table; implement a CI check that analytics_{{tenant}}.daily_active_users exists for every tenant in seeds.tenants and that tenant_id filters prevent cross-tenant bleed. Explain how you'd validate lineage in CI?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a macro to generate per-tenant incremental models: analytics_{{tenant}}.daily_active_users from staging.users (tenant_id, user_id, last_login). Day = date_trunc('day', last_login); 1-day late data",
+            "text": "Design a per-tenant sanitized session summary pipeline in Snowflake/dbt: from staging.tenant_sessions to analytics_{{tenant}}.sanitized_session_summary daily; use a macro to mask user_id and session_i",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Approach: implement a per-tenant dbt macro that creates analytics_{{tenant}}.daily_anomalies from staging.tenant_events, computing a 7-day moving average of events per tenant/day and flags days where the rate diverges b…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a dbt macro that reads a central tenants table, iterates over active tenants to create analytics_{{tenant}} schemas with appropriate grants, and drops schemas and all associated objects when tenant status chan…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a macro `analytics_base.detect_schema_drift(tenant)` that loads the analytics_{{tenant}}.schema definitions, queries information_schema.columns for analytics_{{tenant}}.facts and analytics_{{tenant}}.events, a…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests macro-based per-tenant model creation, incremental logic, and CI validation for data isolation in a realistic Snowflake/dbt setup.\n\n## Key Concepts\n\n- dbt macros and per-tenant objects\n- incremental models with 1-day late data\n- data lineage and CI validation\n- cross-tenant isolation via tenant_id filters\n\n## Code Example\n\n```javascript\n{% macro per_tenant_daily_active(tenant) %}\n  {{ config(materialized='incremental') }}\n  select\n    {{ tenant }} as tenant_id,\n    user_id,\n    date_trunc('day', last_login) as day\n  from staging.users\n  where tenant_id = '{{ tenant }}'\n  {% if is_incremental() %}\n  and last_login > (select max(day) from analytics_{{tenant}}.daily_active_users)\n  {% endif %}\n{% endmacro %}\n```\n\n## Follow-up Questions\n\n- How would you extend this to handle 1-day late data for already loaded days?\n- How would you implement a simple row-level security policy to enforce tenant isolation?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-5",
-        "questionId": "q-1523",
-        "question": "Design an incremental dbt model analytics.daily_engagement for a global multi-tenant app. Raw events sit in staging.user_events with tenant_id, user_id, email, event_type, occurred_at, privacy_flag. Build per-tenant daily distinct-user counts by event_type, redacting emails when privacy_flag is true. Describe incremental strategy, late data window, schema-drift guards, tests and snapshots, and how to expose lineage for dashboards?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a (tenant_id, date( occurred_at ), event_type) keyed incremental model. Compute distinct user_id from staging.user_events, redact email via a macro: if privacy_flag then 'REDACTED' else email. Lat",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement a per-tenant incremental model that ingests staging.clicks into analytics_{tenant}.hourly_conversion_funnel via a macro that creates analytics_{tenant} schema, plus a global analytics.lineage registry for depe…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Approach: implement a macro analytics_base.compute_skew(tenant, table) that returns max_rows_per_partition, p95_rows_per_partition, and skew_flag (max>2x median). Build per-tenant analytics_{{tenant}}",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a tenant_context var and a tenant_filter(ctx) macro that appends tenant_id = {{ var('TENANT') }} to every model, expose analytics.public.engagement_<tenant> views, apply Snowflake masking on",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design privacy-aware, tenant-scoped analytics with late-arriving data. Emphasizes incremental logic, governance, and lineage.\n\n## Key Concepts\n- Incremental models with composite keys (tenant_id, date, event_type)\n- Field-level redaction controlled by privacy_flag via a macro\n- Late-arriving data handled through a short lookback MERGE\n- Schema drift guards using sources, tests, and snapshots\n- Exposures to reflect lineage in dashboards\n\n## Code Example\n```sql\n-- macros/redact_email.sql\n{% macro redact_email(email, privacy_flag) -%}\n  {% if privacy_flag -%}\n    {{ return('REDACTED') }}\n  {% else -%}\n    {{ return(email) }}\n  {% endif -%}\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you test the redact_email macro across combinations of privacy_flag and null emails?\n- How would you scale this approach to thousands of tenants with varying data freshness SLAs?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-6",
-        "questionId": "q-1361",
-        "question": "Design a beginner-friendly incremental dbt model in Snowflake for a SaaS analytics pipeline: raw events live at staging.event_logs with user_id, event_type (signup, login, purchase), country, occurred_at. Build analytics.daily_metrics that counts distinct active users by day and event_type, enriched by dimensions.countries. Explain incremental logic, late data handling (7 days), schema drift guards, and validation with tests and a snapshot. Also outline an Exposure for the dashboard with lineage?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Build analytics.daily_metrics as an incremental Snowflake model that counts distinct user_id by day and event_type from staging.event_logs, enriched via a join to dimensions.countries on country. Upse",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use an incremental model with is_incremental(). Join staging events to pricing.exchange_rates on date and currency, then aggregate revenue in USD by date, city, ride_type. Implement a 2-day late-data",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Outline a per-tenant incremental model analytics_{{tenant}}.normalized_events from staging.tenant_events using map_event() to resolve canonical_event_id from analytics_base.events_lookup. Allow 1-day",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Approach: Implement a two-model incremental dbt flow in Snowflake. First, analytics.first_session computes min(occurred_at) per user as first_session_at and seeds analytics.users with user_id, first_session_at, country_…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes practical dbt incremental modeling, enrichment, and the linkage to dashboards via exposures.\n\n## Key Concepts\n- Incremental models with upserts in Snowflake\n- Late-arriving data handling with a 7-day window\n- Dimensional enrichment via dimensions.countries\n- Schema-drift guards and tests\n- Snapshots for user cohorts\n- Exposures and lineage visualization\n\n## Code Example\n```sql\nwith src as (\n  select distinct user_id, date(occurred_at) as day, event_type, country\n  from {{ ref('staging.event_logs') }}\n  where occurred_at >= current_timestamp() - interval '7 day'\n)\nselect day, event_type, country, count(distinct user_id) as active_users\nfrom src\ngroup by 1,2,3\n```\n\n## Follow-up Questions\n- How would you test referential integrity between analytics.daily_metrics and dimensions.countries?\n- How would you expose this model in a dashboard and ensure lineage is accurate?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-7",
-        "questionId": "q-17462",
-        "question": "In a Snowflake/dbt setup onboarding tenants dynamically, design a beginner incremental pipeline that creates analytics_{{tenant}}.daily_user_signals from staging.tenant_events. Use a macro tenant_enabled() that checks seeds.tenants (tenant_id, enabled) and only materializes for enabled tenants. Include 1-day late data, tests not_null(tenant_id, day_start) and unique(tenant_id, day_start). Explain CI validation for new tenants and how to prevent cross-tenant data leakage?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Create an incremental model analytics_{{tenant}}.daily_user_signals from staging.tenant_events gated by a macro tenant_enabled() that reads seeds.tenants and only runs for enabled tenants. Handle 1-da",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement an incremental model analytics.{tenant}.daily_user_activity using staging.events per tenant, UTC-normalize occurred_at to date, and aggregate distinct user_id by action. Add tests: not_null",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement analytics_{{tenant}}.user_features via incremental upserts from analytics_{{tenant}}.raw_events using a macro that sources from analytics_base.features_base and targets the tenant schema. Co",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a tenant-scoped daily_summary as an incremental analytics.{tenant}.daily_summary built from staging.events (tenant_id, user_id, event_type, occurred_at) joined to dimensions.countries, with",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests practical, zero-drag onboarding of tenants using dbt macros and seeds; checks incremental logic and data governance.\n\n## Key Concepts\n\n- dbt macros and seeds\n- per-tenant incremental materializations\n- tenant registry validation in CI\n- data isolation to prevent cross-tenant leakage\n\n## Code Example\n\n```javascript\n// Pseudo macro example (not production code)\nfunction tenant_enabled(tenant_id) {\n  // read seeds.tenants and return true if enabled\n  return true;\n}\n```\n\n## Follow-up Questions\n\n- How would you unit-test the tenant_enabled macro?\n- How would you detect and fix a misconfigured tenant in CI?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-8",
-        "questionId": "q-20738",
-        "question": "Design a beginner dbt per-tenant data-quality scoring pipeline in Snowflake: ingest from staging.tenant_events into analytics_{{tenant}}.quality_score daily. Use a macro based on analytics_base.quality_model to compute a 0–100 score per tenant/day, with 1-day late data. Implement per-tenant RLS on the final table; include not_null(tenant_id, day, score) and unique(tenant_id, day). Add a CI gate that fails if any tenant’s score drifts more than 10% WoW?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
             "text": "Incremental model analytics_{{tenant}}.quality_score from staging.tenant_events; macro quality_score() consumes analytics_base.quality_model to produce 0–100 per tenant/day; supports 1-day late data v",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Per-tenant anomaly detection: build incremental model analytics_{tenant}.anomaly_flags from staging.{tenant}.events by daily tenant counts, compute rolling mean/stddev per tenant, and flag yesterday i",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "I would add a macro normalize_day(ts) returning date_trunc('day', ts AT TIME ZONE 'UTC'). Build analytics_user_daily_summary as incremental by day from staging.web_events joined to staging.users, grou",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a macro-driven per-tenant dbt flow that reads staging.events (tenant_id, user_id, event_type, email, ip_address, occurred_at) and loads analytics_{{tenant}}.hourly_events. Enforce privacy: if p",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design a practical, beginner-friendly data quality workflow with tenant isolation and CI checks, focusing on implementable dbt patterns.\n\n## Key Concepts\n- dbt macros and contracts\n- Per-tenant modeling with Jinja\n- Late data handling and quality scoring\n- Row-level security (RLS) considerations\n- CI drift detection and test coverage\n\n## Code Example\n```sql\n-- skeleton model\nwith e as (select tenant_id, event_time, * from {{ source('staging','tenant_events') }})\nselect\n  tenant_id,\n  date_trunc('day', event_time) as day,\n  quality_score(tenant_id, date(event_time)) as score\nfrom e\n```\n\n## Follow-up Questions\n- How would you test contract drift in analytics_base.quality_model?\n- How would you handle tenants with frequent missing fields in the quality scores?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-9",
-        "questionId": "q-25065",
-        "question": "In a multitenant dbt analytics setup with per-tenant schemas analytics_{{tenant}} and a shared analytics_base, design a cross-tenant data quality and access framework focusing on per-tenant data freshness, masking of PII, and governance scoring. Requirements: (1) a macro analytics_base.freshness_by_tenant(tenant) that ingests staging.{{tenant}}_events and returns max event_ts, (2) an incremental model analytics_{{tenant}}.quality_score that aggregates freshness, row_counts, and errors into a per-tenant score, (3) a macro analytics_base.mask_pii(field) to redact PII in views exposed to non-admin tenants, (4) CI gates block prod if any tenant lag > 1 day in last 7 days, (5) per-tenant RLS on shared views. Provide macro names, a minimal schema outline, and discuss trade-offs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I would implement an incremental analytics.transactions model with unique_key txn_id, deduplicating across sources, handling late events within a 2-day watermark window, validating currency via a custom macro per source…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Define analytics_base.dq_gate(tenant) that returns: customer_id IS NOT NULL AND order_total >= 0 AND currency_code IN (SELECT code FROM analytics_base.currency_dim). Create a dbt test on analytics_{{t",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "I would implement a macro `analytics_base.validate_schema(tenant)` that reads `information_schema` for both `analytics_{{tenant}}.fct` and `analytics_base.fct`, computes a JSON diff of columns, data types, and nullabili…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a comprehensive cross-tenant data quality and governance framework: **1. Freshness Macro** ```jinja {% macro freshness_by_tenant(tenant) %} SELECT MAX(event_ts) AS max_event_ts, CURRENT_TIMESTAMP() AS evaluate…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question evaluates end-to-end multi-tenant data quality, privacy, and governance skills in dbt + Snowflake/Databricks environments. It tests practical knowledge of:\n\n- **Cross-tenant freshness monitoring**: Tracking data lag per tenant to ensure SLA compliance\n- **dbt macros for tenant-specific SQL generation**: Dynamic Jinja templates for reusable tenant logic\n- **PII masking and RLS patterns**: Protecting sensitive data while maintaining query flexibility\n- **Per-tenant isolation vs. centralized governance**: Balancing data autonomy with organizational oversight\n\nCandidates should demonstrate familiarity with multi-tenant architecture patterns, including schema segregation strategies, row-level security implementation, and governance scoring mechanisms. Strong answers also address operational considerations such as monitoring, alerting, and the trade-offs between centralized control and tenant-level autonomy.",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-10",
-        "questionId": "q-8888",
-        "question": "Design a beginner dbt + Snowflake flow that consumes staging.tenant_metrics(tenant_id, metric, value, recorded_at) with up to 7 days of late data. Create analytics_{{tenant}}.daily_quality_metrics via incremental materialization and a macro that auto-creates analytics_{{tenant}} schemas plus a central analytics.lineage. Add tests not_null on (tenant_id, recorded_at, metric) and unique on (tenant_id, day_start, metric), plus a CI check ensuring analytics_{{tenant}}.daily_quality_metrics exists for all tenants and per-tenant isolation. Explain latency watermarking and cross-tenant guard rails?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Proposed approach: implement analytics_{{tenant}}.live_flags as an incremental model from staging.tenant_activity joined to analytics_base.base_flags; create macro analytics_base.compute_live_flag(ts,",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "I would implement a macro to auto-create analytics_{{tenant}} schemas and a central analytics.lineage table, plus an incremental daily_quality_metrics per tenant with a 7-day late-data watermark on recorded_at to handle…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Implement a dbt macro that materializes per-tenant analytics_{{tenant}}.enriched_events views by joining staging.tenant_events to analytics.enrichment_policies on tenant_id and field, applying dynamic masking/redaction…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a per-tenant incremental pipeline using a dbt macro that produces analytics_{{tenant}}.anomaly_scores. The macro joins staging.tenant_events to analytics.tenant_config to retrieve per-tenant thresholds, then comp…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical dbt patterns for per-tenant isolation, late data handling, and lineage tracking, with a beginner-friendly incremental setup.\n\n## Key Concepts\n- dbt macros to dynamically create tenant-specific schemas\n- incremental models with watermark for late-arriving data\n- data lineage tracking across tenants\n- CI checks for per-tenant existence and isolation\n\n## Code Example\n```sql\n-- sketch of daily_quality_metrics model\nwith src as (\n  select tenant_id, metric, value, recorded_at\n  from {{ source('staging', 'tenant_metrics') }}\n), refined as (\n  select tenant_id,\n    date_trunc('day', recorded_at) as day_start,\n    metric,\n    value\n  from src\n  where recorded_at >= dateadd('day', -7, current_date())\n)\nselect * from refined\n```\n\n## Latency Watermarking\nA 7-day watermark on recorded_at ensures we process late-arriving data while maintaining reasonable latency. The watermark acts as a cutoff - data older than 7 days is excluded to balance completeness with freshness.\n\n## Cross-Tenant Guard Rails\n- Schema isolation: analytics_{{tenant}} prevents cross-tenant data access\n- CI validation: ensures all tenants have their daily_quality_metrics table\n- Lineage tracking: analytics.lineage provides visibility into data dependencies\n- Unique constraints: prevent duplicate metrics across tenant/day combinations",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-11",
-        "questionId": "q-20795",
-        "question": "Design a multi-tenant data-quality and governance pipeline in Snowflake/dbt that computes analytics_{{tenant}}.data_health from staging.tenant_events, using a macro to auto-generate per-tenant tests (not_null, unique, referential checks) and enforce 1-day data latency. Include per-tenant RLS isolation, lineage checks, and a CI gate that blocks production if any tenant's tests fail or data_freshness drifts beyond 1 day?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a per-tenant retention macro that materializes analytics_{{tenant}}.retained_events by filtering staging.events with event_ts >= dateadd(day, -retention_days, current_date()). Enforce 1-day",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a per-tenant macro-driven schema analytics_{tenant} with an hourly_session_summary model incremental by hour_start; source from staging.session_events. Support 1-day late data, include schem",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a macro to auto-generate per-tenant tests: not_null on key columns, unique on (tenant_id, day), and referential checks against analytics_base.contracts. Build analytics_{{tenant}}.data_health from",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Implement a per-tenant incremental model analytics_{{tenant}}.daily_metrics built from staging.tenant_events, with a 1-day late-data window and idempotent upserts using (tenant_id, event_date, event_i",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nMulti-tenant data quality is critical; this checks automated per-tenant test generation, strict isolation, and CI enforcement at scale.\n\n## Key Concepts\n- dbt macros for per-tenant test generation\n- data freshness SLAs and late data handling\n- row-level security for isolation\n- data lineage checks and CI gates\n\n## Code Example\n```jinja\n{% macro per_tenant_tests(table) %}\n  tests = [\n    { type: 'not_null', columns: ['tenant_id','day'] },\n    { type: 'unique', columns: ['tenant_id','day'] },\n    { type: 'referential', ref_table: 'analytics_base.contracts' }\n  ]\n  {% for t in tests %}\n {{ t.type }} ({{ t.columns | join(', ') }})\n  {% endfor %}\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you handle tenants with late data differently (e.g., SLA tiers)?\n- How would you visualize per-tenant data_health and SI indicators for proactive alerts?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-12",
-        "questionId": "q-972",
-        "question": "In a dbt analytics project deployed to Snowflake, three tenants share a common model but data is isolated by schema prefixes (tenant_a_, tenant_b_, tenant_c_). Describe how you would structure tenancy-aware tests and a test runner to prevent cross-tenant data leakage during PR runs. Include how you configure sources, seeds, and per-tenant test filtering, and how you verify isolation in CI without touching production data?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "A tenancy-aware dbt run parameterizes the target schema per tenant, isolates seeds and sources with tenant prefixes, and uses a tenancy-aware test macro to scope checks. In CI, create ephemeral tenant",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use a macro create_analytics_schema(tenant) to generate analytics_{{tenant}}.quality_issues and analytics_{{tenant}}.hourly_gap_summary. hourly_gap_summary computes, for each day×hour, a gap flag by l",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "To implement, use an idempotent SCD2 pattern: end_date on changed rows, insert a new row with current event_ts as effective_date; rely on analytics_base.scd2_merge(tenant, staging.users, analytics_{{t",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Outline a macro-driven approach: a per-tenant flag revenue_enabled in dimensions.tenants, read by a macro revenue_included(tenant) to conditionally include revenue in analytics.{tenant}.daily_metrics.",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes how a candidate ensures strict data isolation in a multi-tenant dbt setup during CI, a common real-world issue.\n\n## Key Concepts\n- Tenancy-aware testing across schemas\n- Per-tenant seeds/sources isolation\n- Test filtering macros and CI ephemeral environments\n- Cross-tenant leakage detection without touching prod\n\n## Code Example\n```javascript\n-- macros/tenancy_filters.sql\n{% macro tenant_test_filter(tenant) -%}\n  tenant_id = '{{ tenant }}'\n{%- endmacro %}\n```\n\n```javascript\n-- tests/tenancy_isolation_test.sql\nselect * from {{ ref('customers') }}\nwhere {{ tenant_test_filter('tenant_a') }}\n```\n\n## Follow-up Questions\n- How would you extend this for dynamic tenant onboarding?\n- How do you validate that physical storage quotas per tenant are respected?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-13",
-        "questionId": "q-24747",
-        "question": "Design a per-tenant data-quality scoring pipeline in Snowflake/dbt: analytics_{{tenant}}.quality_metrics derived from staging.tenant_events and shared analytics_base.dq_rules. Implement a 2-day late data policy, a macro analytics_base.dq_score(tenant_id, day) that computes a composite score from null_rate, duplicates_rate, and out_of_range_rate; enforce per-tenant RLS isolation; create a CI gate that blocks production if any tenant's data-quality score drops below 0.8 for two consecutive days. Include tests not_null on keys, unique(tenant_id, day), and a minimal schema outline. Include macro names and a schema sketch?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Define analytics_base.dq_gate(tenant) that returns: customer_id IS NOT NULL AND order_total >= 0 AND currency_code IN (SELECT code FROM analytics_base.currency_dim). Create a dbt test on analytics_{{t",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose an incremental dbt flow: MERGE upsert from staging.raw_events (...) into analytics.{tenant}.daily_user_state, with day derived from occurred_at and 1-day late data. Use a macro to create analy",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design an incremental per-tenant data-quality pipeline in Snowflake/dbt that derives analytics_{{tenant}}.quality_score from staging.tenant_logs using analytics_base.quality_model and analytics_{{tenant}}.thresholds. Th…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Propose a per-tenant data quality scoring pipeline where analytics_{{tenant}}.quality_metrics is built from staging.tenant_events using analytics_base.dq_rules. Implement a 2-day late-data policy, a m",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests data quality in multi-tenant dbt pipelines, focusing on cross-tenant governance, late data handling, and automated gates.\n\n## Key Concepts\n- dbt macro design for per-tenant scoring\n- Composite metrics (nulls, duplicates, out_of_range)\n- Late data windows and RLS isolation\n- CI gates tied to data-quality thresholds\n\n## Code Example\n```sql\n-- macro: analytics_base.dq_score(tenant_id, day)\nWITH m AS (\n  SELECT tenant_id, day,\n         NULLIF(nulls,0) / NULLIF(total,0) AS null_rate,\n         NULLIF(dups,0) / NULLIF(total,0) AS dup_rate,\n         NULLIF(out_of_range,0) / NULLIF(total,0) AS or_rate\n  FROM analytics_base.dq_metrics_source\n)\nSELECT tenant_id, day,\n       (0.4 * null_rate + 0.3 * dup_rate + 0.3 * or_rate) AS score\nFROM m;\n```\n\n## Follow-up Questions\n- How would you backfill and revalidate quality scores after schema changes?\n- How would you expose scores to stakeholders and alert on dips?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-14",
-        "questionId": "q-29801",
-        "question": "In a Snowflake/dbt environment with per-tenant schemas analytics_{{tenant}} and a shared analytics_base, design a beginner-friendly per-tenant deduplicated events pipeline. Build an incremental model analytics_{{tenant}}.events_dedup from staging.tenant_events(event_ts, user_id, event_id, event_type, country_code) that deduplicates on event_id and keeps the latest per day. Partition by date(event_ts). Use analytics_base.hash_event(event_id) to redact internal identifiers in outputs. Add not_null(user_id) and unique(tenant, date(event_ts), event_id). Propose a macro analytics_base.deduplicate_merge to perform merge and a minimal schema outline. Include a CI gate: fail prod if daily_dedup_count for any tenant on a day drops by more than 5% WoW?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a per-tenant lineage governance with: (a) analytics_base.lineage_filter(tenant) to constrain sources to the tenant, (b) analytics_base.lineage_audit(tenant, model, sources, last_seen) popula",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design an incremental per-tenant events_dedup model from staging tenant_events, deduplicating by event_id and keeping the latest per day. Partition by date(event_ts). Redact event_id using analytics_b",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use a macro to generate per-tenant incremental models: analytics_{{tenant}}.daily_active_users from staging.users (tenant_id, user_id, last_login). Day = date_trunc('day', last_login); 1-day late data",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a tenant registry-driven per-tenant onboarding_daily in Snowflake/dbt. Use a macro to loop over seeds.tenants and emit analytics_{{tenant}}.onboarding_daily from staging.tenant_events with 1-day late data hand…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to implement a simple, robust per-tenant deduplication flow using dbt incremental models, with explicit redaction, per-day partitioning, and minimal schema/tests. It also evaluates macro design for a reusable merge operation and a practical CI gate for data quality.\n\n## Key Concepts\n- dbt incremental models across tenants\n- de-duplication by event_id with latest per day\n- data redaction via analytics_base.hash_event\n- per-tenant constraints: not_null, unique\n- macro design for deduplicate_merge\n- basic CI gating on data quality metrics\n\n## Code Example\n```sql\n-- Skeleton macro: analytics_base.deduplicate_merge(source, target)\n{% macro analytics_base.deduplicate_merge(source, target) -%}\n-- Implementation goes here\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you test idempotence of the incremental run?\n- How would you handle late-arriving events that belong to a previous day?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-15",
-        "questionId": "q-10542",
-        "question": "In a Snowflake/dbt project with multiple tenants, implement a beginner-friendly per-tenant daily anomaly score pipeline from staging.tenant_events to analytics_{{tenant}}.daily_anomaly_score. Use a 7-day window to compute a z-score of daily event counts per tenant, allow 1-day late data, guard against schema drift, and include tests (not_null on keys, unique on (tenant_id, day_start)); a global analytics.lineage and CI that per-tenant tables exist and data is isolated. How would you validate cross-tenant isolation?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a per-tenant macro to create analytics_{{tenant}} schemas. Build analytics_{{tenant}}.daily_metrics by tenant_id/day from staging.tenant_users/engagement; compute DAU and a z-score anomaly flag in",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Create a dbt macro that generates analytics_{{tenant}}.daily_anomaly_score, using a CTE to count daily events by tenant, then compute z = (count - avg(count) over 7 days for tenant) / stddev(...) over",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Design a tenant-scoped lineage system: add analytics_base.lineage_impact(source_table, column) to compute downstream models across analytics_{{tenant}}; materialize per-tenant analytics_{{tenant}}.lin",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Architect a per-tenant data quality pipeline that materializes analytics_{{tenant}}.quality_summary from staging.tenant_events using a macro to compute daily completeness, validity, and duplicates, wi",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis angle tests per-tenant analytics pipelines with simple anomaly scoring and proper isolation, a common real-world need.\n\n## Key Concepts\n- dbt macros, Snowflake window functions, 7-day rolling stats, 1-day late data\n- per-tenant schemas, global lineage, CI checks, schema drift guards\n\n## Code Example\n```javascript\n-- SQL-like macro sketch\nwith daily as (\n  select tenant_id, date_trunc('day', occurred_at) as day_start, count(*) as cnt\n  from {{ source('staging','tenant_events') }}\n  where occurred_at <= dateadd(day, -1, current_timestamp())\n  group by 1,2\n)\nselect tenant_id, day_start,\n  (cnt - avg(cnt) over (partition by tenant_id order by day_start rows between 6 preceding and current row)) /\n  NULLIF(stddev(cnt) over (partition by tenant_id order by day_start rows between 6 preceding and current row), 0) as anomaly_score\nfrom daily\norder by tenant_id, day_start;\n```\n\n## Follow-up Questions\n- How would you extend this for changing tenants or different rolling windows?\n- What CI checks would you add to verify lineage and isolation across tenants?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-16",
-        "questionId": "q-27192",
-        "question": "In a Snowflake/dbt environment with per-tenant schemas analytics_{{tenant}} and a shared analytics_base, design a data-quality framework driven by a central JSON rules config to enforce per-tenant NOT NULL constraints and max null percentages for critical fields. Implement a macro analytics_base.dq_rules(tenant, table, fields_config) that auto-generates tests, add a per-tenant incremental model analytics_{{tenant}}.dq_metrics to store daily null_rate by field, and create a CI gate to block production if any tenant's null_rate > 5% on any field. Include a minimal sample rules.json and test outline?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a per-tenant drift observability macro analytics_base.ensure_schema_consistency to compare analytics_{{tenant}}.staging against analytics_{{tenant}}.facts after the nightly load. Measure drift on",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "JSON-driven data quality: rules.json defines per-tenant required_fields and max_null_pct; the dq_rules macro auto-generates not_null tests and a null-rate test for each tenant/table/field. Create anal",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Build an incremental model analytics_{{tenant}}.daily_campaign_performance from staging.tenant_campaign_events, allowing 1-day late data. Create freshness_check() to compute per-tenant days_late; CI f",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a dbt snapshot on analytics_{{tenant}}.dims to manage slowly changing dimensions, backed by analytics_base.dim_versions. Enable a 1-day late data window, and route pii fields through analytics_bas",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nAssesses ability to design scalable, tenant-aware data quality with minimal maintenance via config-driven tests and macros.\n\n## Key Concepts\n- JSON-configured per-tenant rules\n- dbt macro that generates tests dynamically\n- per-tenant incremental metrics table\n- CI gate blocking production on quality regressions\n\n## Code Example\n```json\n{\n  \"tenants\": {\n    \"tenantA\": {\"required_fields\": [\"user_id\",\"event_ts\"], \"max_null_pct\": {\"user_id\": 0, \"event_ts\": 0.02}}\n  }\n}\n```\n\n## Follow-up Questions\n- How would you handle evolving required_fields across tenants without breaking historical tests?\n- What are potential performance implications of per-tenant test generation in large catalogs, and how would you mitigate them?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-17",
-        "questionId": "q-3432",
-        "question": "Describe an automated, tenant-aware dbt workflow that discovers tenants from a tenants table, creates per-tenant schemas, and materializes analytics.{tenant}.interactions incrementally from staging.events (tenant_id, user_id, interaction_type, occurred_at). Include late data tolerance of 2 days, per-tenant lineage via a global analytics.lineage table, and macro-driven schema-drift guards plus tests (not_null on occurred_at and user_id; unique on (tenant_id, occurred_at, user_id, interaction_type)); explain how isolation is enforced and how you would validate changes across tenants?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Leverage a tenants registry to auto-generate per-tenant analytics schemas and an incremental model analytics.{tenant}.interactions from staging.events. Late data tolerance: 2 days. Use a tenant-aware",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement an incremental per-tenant model that writes to analytics.{tenant}.daily_event_engagement using staging.events, joined to dimensions.regions by country_code to group by region_name. Aggregate",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "An incremental per-tenant model analytics_{{tenant}}.daily_engagement should union staging.tenant_events and staging.app_usage by (tenant_id, day_start), backfill 1 day for late data, and apply a data",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "I would implement analytics_{{tenant}}.cohort_by_day as an incremental model from staging.user_events, applying analytics_base.cohort_core to compute day-0 and day-7 retention per tenant. Enforce 3-da",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to architect an automated, tenant-aware dbt workflow that generates per-tenant models, ensures data isolation, and enforces governance via lineage.\n\n## Key Concepts\n\n- tenant registry-driven model generation with dbt macros\n- per-tenant schemas for isolation\n- late-data handling and drift guards\n- dynamic tests tied to tenant flags\n- global analytics.lineage for provenance\n\n```javascript\n// Pseudocode sketch of a tenant-scaffold macro\nfunction generateTenantModel(tenant){\n  const schema = `analytics_${tenant}`;\n  return `create schema if not exists ${schema}; create table ${schema}.interactions ...`;\n}\n```\n\n## Follow-up Questions\n\n- How would you detect cross-tenant data leakage?\n- How would you monitor drift and automatically regen models per new tenant?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-18",
-        "questionId": "q-28334",
-        "question": "Design a per-tenant calibration gate in Snowflake/dbt: analytics_{{tenant}}.calibrated_metrics derived from analytics_{{tenant}}.raw_metrics using a shared analytics_base.calibration_model and per-tenant analytics_{{tenant}}.calibration_params (slope and intercept). Support 1-day late data; implement macro analytics_base.apply_calibration(metric, value, tenant); enforce per-tenant RLS isolation; CI gate blocks production if any tenant's calibration_error > 0.08; include tests not_null on keys and unique(metric_id, day) and a minimal schema outline?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Create a macro that materializes analytics_{{tenant}}.consent_audit from staging.consent_events, rounded to day_start with daily counts per consent_type. Use an incremental load with a 1-day late window to capture delay…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "I would implement a per-tenant incremental model with a run_id and an idempotent MERGE into analytics_{{tenant}}.hourly_engagement from staging.tenant_events, keyed by (tenant_id, hour_start, user_id)",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement per-tenant data freshness: analytics_{{tenant}}.freshness_raw aggregates per day max(event_ts) from staging.tenant_events; analytics_base.age_in_days(date_col) returns DATEDIFF(day, date_col",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "## Approach Implement a per-tenant calibration pipeline using a shared base model with tenant-specific parameters. ### 1. Shared Calibration Model (`analytics_base.calibration_model`) ```sql SELECT raw.tenant_id, raw.me…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question evaluates a candidate's ability to design multi-tenant analytics infrastructure with governance safeguards, code reuse patterns, late-data handling, and production-quality testing.\n\n## Key Concepts\n\n- **Per-tenant isolation**: Separate schemas (`analytics_{{tenant}}`) with RLS enforcement ensure data isolation\n- **Shared vs. tenant-specific**: Shared `calibration_model` promotes DRY; per-tenant `calibration_params` allows business customization\n- **Macro abstraction**: `apply_calibration(metric, value, tenant)` enables consistent calibration logic across all metrics and tenants\n- **Late data handling**: The 1-day buffer accommodates reporting delays common in analytics pipelines\n- **CI gate**: Blocking deployments when `calibration_error > 0.08` prevents drift from propagating to production",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-19",
-        "questionId": "q-13498",
-        "question": "Design a per-tenant data-governance audit flow in Snowflake/dbt that detects unauthorized cross-tenant access by nightly comparisons between staging.tenant_access and analytics_{{tenant}}.audit_access, using a macro to generate per-tenant audit tables, masking PII for restricted roles, allowing 1-day late data, and enforcing schema drift guards; include tests (not_null on keys, unique on (tenant_id, audit_date)), a global analytics.lineage, and CI checks that every tenant has an audit table and no cross-tenant rows?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a per-tenant drift observability macro analytics_base.ensure_schema_consistency to compare analytics_{{tenant}}.staging against analytics_{{tenant}}.facts after the nightly load. Measure drift on",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a per-tenant incremental model: analytics_{{tenant}}.daily_engagement from staging.tenant_events with a 1-day lag. Add a contract macro to validate columns against analytics_base.contract, p",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Propose a per-tenant governance audit flow: nightly macro-generated analytics_{{tenant}}.audit_access tables compare staging.tenant_access to detect any cross-tenant exposures, mask PII for restricted",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Per-tenant external share uses analytics_contract_{{tenant}} to enforce exact column names/types and a macro to materialize analytics_{{tenant}}.shared_view from staging.tenant_events. Implement a 2-d",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to architect tenant-scoped governance with automatic per-tenant artifacts, robust masking, and end-to-end validation from staging to analytics layers.\n\n## Key Concepts\n\n- dbt macros for per-tenant artifact generation\n- Snowflake masking policies and RLS for restricted roles\n- nightly data comparisons for governance anomalies\n- tests: not_null on keys, unique on (tenant_id, audit_date)\n- global lineage table analytics.lineage and CI coverage per tenant\n\n## Code Example\n\n```javascript\n-- dbt macro skeleton (language: javascript per guidelines)\n{% macro per_tenant_audit(tenant_id) %}\n-- generate analytics_{{tenant_id}}.audit_access from staging.tenant_access\n{% endmacro %}\n```\n\n## Follow-up Questions\n\n- How would you rollback a misconfigured tenant audit? \n- How would you scale governance as tenants grow to many thousands?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-20",
-        "questionId": "q-11370",
-        "question": "NEW ANGLE: multi-tenant data quality SLA verifier in Snowflake/dbt. From staging.tenant_events to analytics_{{tenant}}.quality_summary, build a macro that computes per-tenant daily freshness (max(event_time)) and a late_data flag for data >1 day late, plus an anomaly_score from a simple z-score of daily counts. Include 1-day late data, schema drift guards, tests (not_null on keys, unique on (tenant_id, day, check_type)), a global analytics.lineage, and CI that ensures every tenant has a daily quality row and flags SLA breaches?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a dbt macro `cost_guard` that reads a per-tenant budgets table and estimates credits per query using warehouse size, runtime duration, and bytes scanned; fail builds when usage would exceed the tenant's alloca…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose a macro-driven per-tenant weekly forecast that merges staging.tenant_events with analytics_base.forecast_base and analytics_{{tenant}}.calibration to produce analytics_{{tenant}}.weekly_foreca",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a dbt macro that materializes analytics_{{tenant}}.quality_summary per day. For each tenant, compute freshness = max(event_time) and late_data = datediff('day', freshness, current_timestamp(",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Ingest per-tenant events, dedupe by tenant_id/event_id, aggregate daily counts by action_type and total_duration, and map action_type to category via a macro and analytics_base.event_definitions. Impl",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests macro-driven per-tenant aggregation, data freshness, simple anomaly scoring, and CI gates for SLA enforcement. It also exercises lineage tracking and drift guards.\n\n## Key Concepts\n- dbt macros for per-tenant materializations\n- Snowflake date/time functions (max, datediff, date_trunc)\n- basic z-score anomalyScore across tenants\n- tests: not_null, unique\n- global lineage table analytics.lineage\n- CI gates for daily tenant coverage and SLA violations\n\n## Code Example\n```sql\n-- simplified macro sketch\n{% macro build_quality_summary(tenant) -%}\nwith e as (\n  select event_time\n  from {{ ref('staging__tenant_events') }}\n  where tenant_id = '{{ tenant }}'\n)\nselect\n  '{{ tenant }}' as tenant_id,\n  date_trunc('day', max(event_time)) as day,\n  max(event_time) as freshness,\n  (datediff('day', max(event_time), current_timestamp()) > 1) as late_data,\n  count(*) as daily_count\nfrom e\ngroup by 1\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you scale anomaly_score computation as tenants scale?\n- How would you integrate this with alerting for SLA breaches?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-21",
-        "questionId": "q-7269",
-        "question": "Your team runs a multi-tenant dbt project in Snowflake. Propose an intermediate, macro-driven workflow to produce per-tenant hourly_engagement from staging.tenant_events, with 1-day late data, dynamic schema-drift guards, and a global analytics_lineage. Include auto-provisioning when a new tenant appears in a central tenants registry, and per-tenant data masking for analytics_{tenant}.user_profiles. Outline tests and CI checks for isolation?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Build a macro that on a new tenant creates analytics_{tenant} schemas and hourly_engagement incremental models, plus a Snowflake stream for staging.tenant_events. Use a global analytics_lineage table",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Approach: implement a macro analytics_base.compute_skew(tenant, table) that returns max_rows_per_partition, p95_rows_per_partition, and skew_flag (max>2x median). Build per-tenant analytics_{{tenant}}",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "I would implement a tenant-aware macro to render analytics.{tenant}.daily_user_event_count from staging.events, with an incremental key (tenant_id, date(occurred_at), event_type). Late data 1 day via",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Macro-driven per-tenant schemas and hourly_engagement from staging; per-tenant ROW ACCESS POLICIES tied to a tenants registry enforce isolation; 1-day late data with a Snowflake TASK; tests cover not_",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design scalable, tenant-isolated dbt workflows with dynamic provisioning, data masking, and lineage tracking.\n\n## Key Concepts\n- Macro-driven per-tenant schema provisioning\n- Incremental hourly metrics with late data handling\n- Snowflake streams for near-real-time ingestion\n- Global lineage and tenant registry-driven auto-provisioning\n- Data masking for PII and robust isolation tests\n\n## Code Example\n```javascript\n// Example macro sketch (non-functional placeholder for concept)\nmacro analytics_tenant_setup(tenant) {\n  create schema analytics_#{tenant}\n  create table analytics_#{tenant}.hourly_engagement as select * from staging.tenant_events where tenant_id = #{tenant}\n}\n```\n\n## Follow-up Questions\n- How would you test cross-tenant data leakage risk in CI?\n- What are the trade-offs of masking at DB vs. at query layer for analytics?\n- How would you handle schema drift auto-remediation across tenants?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-22",
-        "questionId": "q-2442",
-        "question": "In a dbt project, given staging.events(user_id, event_type, occurred_at, country_code) and staging.users(user_id, created_at, country_code), implement an incremental model analytics.daily_engagement that counts distinct users per day by event_type and country_code, enriched by dimensions.countries. Include 1-day late data tolerance, schema-drift guards, tests (not_null, unique), and a snapshot on analytics.users to track country changes. Describe lineage and isolation notes?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Create an incremental analytics.daily_engagement that counts distinct user_id per day, grouped by event_type and country_code, joining staging.events with staging.users and dimensions.countries. Allow",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "I would implement an incremental analytics.transactions model with unique_key txn_id, deduplicating across sources, handling late events within a 2-day watermark window, validating currency via a custom macro per source…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a per-tenant data-quality module: a macro that builds analytics_{{tenant}}.dq_summary and analytics_{{tenant}}.dq_checks from staging.tenant_events via a 1-day-late incremental MERGE; comput",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a per-tenant schema-drift detector in Snowflake/dbt. Create analytics_base.schema_drift(tenant, upstream_table, downstream_model) to diff INFORMATION_SCHEMA.COLUMNS for added/removed columns",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nAssess ability to design a beginner-friendly incremental model, enforce data quality, and capture slowly changing dimensions with snapshots.\n\n## Key Concepts\n\n- Incremental modeling in dbt for daily aggregates\n- Data quality tests: not_null and unique\n- Late-arriving data handling (1-day tolerance)\n- Snapshot usage for slowly changing dimensions\n- Referential integrity with dimensions.countries and cross-model lineage\n\n## Code Example\n\n```sql\nwith src as (\n  select\n    e.user_id,\n    date( e.occurred_at ) as day,\n    e.event_type,\n    e.country_code\n  from {{ ref('staging_events') }} e\n)\nselect\n  day,\n  event_type,\n  country_code,\n  count(distinct user_id) as user_cnt\nfrom src\ngroup by 1,2,3\n```\n\n## Follow-up Questions\n\n- How would you test that country_code exists in dimensions.countries?\n- How would you incorporate a 1-day late data window into your model without double-counting users?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-23",
-        "questionId": "q-19939",
-        "question": "Design a beginner dbt flow activated by seeds.tenants (tenant_id, status) that creates analytics_{{tenant}}.daily_usage_summary with a 7-day rolling total of sessions from staging.tenant_events, 1-day lag, for active tenants only. Add a macro enforce_contract() validating against analytics_base.contract (tenant_id,end_date,rolling_sessions) and tests not_null(tenant_id,end_date,rolling_sessions), unique(tenant_id,end_date). Include backfill_days=7 and discuss cross-tenant isolation and CI checks for new tenants?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I would implement a per-tenant drift-aware daily pipeline. A dbt incremental analytics_{{tenant}}.daily_engagement from staging.tenant_events into per-tenant schemas via a macro, plus analytics_{{tena",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Build per-tenant analytics_{{tenant}}.daily_usage_summary with a 7-day rolling sum of sessions from staging.tenant_events, using a 1-day lag. Implement a macro enforce_contract() to compare with analy",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "This interview question evaluates a candidate's ability to architect a scalable, compliant data masking framework in a multi-tenant dbt/Snowflake environment. The solution requires: (1) a dbt macro `analytics_base.apply…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Propose a macro-driven per-tenant weekly forecast that merges staging.tenant_events with analytics_base.forecast_base and analytics_{{tenant}}.calibration to produce analytics_{{tenant}}.weekly_foreca",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests data freshness and contract adherence in a multi-tenant dbt setup, reinforcing per-tenant isolation and a deterministic backfill window.\n\n## Key Concepts\n- Per-tenant incremental models\n- Data contracts and tests\n- Multi-tenant isolation via separate schemas\n- Backfill window control and CI checks\n\n## Code Example\n```sql\n-- macro signature example\n{% macro enforce_contract() %}\n  -- validate columns/types against analytics_base.contract\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you detect and remediate schema drift per tenant?\n- How would you scale tests when tenants exceed N?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "dbt-analytics-engineer-q-24",
-        "questionId": "q-15572",
-        "question": "In Snowflake with dbt, design a per-tenant incremental analytics flow that supports tenant-specific retention windows and privacy levels defined in a central policy table. Build a macro to generate analytics_{{tenant}} schemas and analytics_{{tenant}}.retention_summary buckets (7/14/30d). Include 1-day late data, schema drift guards, tests (not_null on keys, unique on (tenant_id, bucket, day)), a global analytics.lineage, and CI checks that verify each tenant enforces its policy and preserves data isolation. Explain your approach and trade-offs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Outline a per-tenant incremental model analytics_{{tenant}}.normalized_events from staging.tenant_events using map_event() to resolve canonical_event_id from analytics_base.events_lookup. Allow 1-day",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Read tenant policy from a central table, generate per-tenant schemas via a macro, and build incremental retention_summary views with 7/14/30 day buckets. Use a 1-day late data watermark; enforce isola",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Per-tenant schemas in Snowflake: implement analytics.daily_metrics as an incremental model scoped to analytics.${tenant}. daily by (day, tenant_id, event_type). Late data window: 2 days; use MERGE int",
+            "text": "Implement a dbt macro invoked by on-run-end to insert into analytics_{{tenant}}.audit_log; use an AFTER_RUN hook that creates the per-tenant log table if missing; include run_id, model_name, status, duration_ms, execute…",
             "isCorrect": false
           },
           {
@@ -753,12 +63,702 @@
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nEvaluates ability to design multi-tenant retention and privacy with dbt+Snowflake, macro-driven schema generation, and robust CI checks.\n\n## Key Concepts\n- Per-tenant schema generation\n- Central policy-driven retention and privacy\n- Incremental modeling and late-arriving data\n- Data isolation, RLS, and lineage\n\n## Code Example\n```sql\n-- Example macro outline (not full code)\n{% macro tenant_retention_schema(tenant) %}\n  create schema analytics_{{tenant}};\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you test cross-tenant leakage in CI?\n- How to handle policy changes mid-cycle without recomputing all tenants?",
+        "explanation": "## Why This Is Asked\n\nTests ability to design registry-driven per-tenant masking, consistent lineage, and CI across tenants, while handling late data and schema drift.\n\n## Key Concepts\n\n- Macro-based per-tenant masking\n- Dynamic per-tenant schemas from a registry\n- Schema drift guards and late data handling\n- Global lineage tracking and cross-tenant isolation in CI\n\n## Code Example\n\n```javascript\n// simplified macro skeleton\n{% macro mask_for_tenant(field, tenant) -%}\n  {% if tenant in var('full_access_tenants') -%}\n    {{ field }}\n  {% else -%}\n    sha256({{ field }})\n  {% endif -%}\n{%- endmacro %}\n```\n\n## Follow-up Questions\n\n- How would you test masking correctness across tenants in CI?\n- How would you handle a tenant revocation of access mid-cycle?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-2",
+        "questionId": "q-12457",
+        "question": "Design a per-tenant daily churn_score model in Snowflake with dbt: from staging.tenant_events and analytics_common.customer_dim to analytics_{{tenant}}.churn_score (incremental, 1-day late data). Use a macro to materialize per-tenant schemas and a global analytics.lineage table, apply masking policies to PII, and implement tests (not_null on keys, unique on (tenant_id, day, user_id), cross-tenant isolation). Explain how you validate privacy, CI checks, and lineage observability?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Create a dbt macro that generates analytics_{{tenant}}.churn_score incrementally from staging.tenant_events and analytics_common.customer_dim, with 1-day late data. Enforce masking policies on PII, an",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Propose a per-tenant quality score calculated from data_freshness, null_ratio, and FK_consistency. Implement a shared macro analytics_base.score_quality(tenant) returning 0-100. Add per-tenant tests f",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement an incremental model that materializes analytics_{{tenant}}.hourly_anomalies from staging.tenant_events, joining analytics_{{tenant}}.thresholds refreshed nightly from analytics_base.global_",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Build per-tenant analytics_{{tenant}}.daily_usage_summary with a 7-day rolling sum of sessions from staging.tenant_events, using a 1-day lag. Implement a macro enforce_contract() to compare with analy",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design tenant-isolated, privacy-conscious analytics with incremental models and robust lineage.\n\n## Key Concepts\n- Per-tenant schema generation via macros\n- Snowflake masking policies and role-based access\n- Incremental models with late-arriving data\n- Global lineage tracking and CI validation for isolation\n\n## Code Example\n```sql\n-- dbt model sketch\n{{ config(materialized='incremental') }}\nwith s as (\n  select tenant_id, user_id, occurred_at::date as day, ...\n  from {{ ref('staging__tenant_events') }}\n)\nselect tenant_id, user_id, day, churn_score\nfrom s\n{% if is_incremental() %}\n  where day >= (select max(day) from {{ this }} )\n{% endif %}\n```\n\n## Follow-up Questions\n- How would you monitor drift between staging_events and churn_score over time?\n- How would you adapt masking to support both full-access and restricted-access tenants without duplicating logic?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-3",
+        "questionId": "q-10266",
+        "question": "Design a per-tenant quartile metric in Snowflake/dbt (Discord, Hugging Face, PayPal). From staging.tenant_events to analytics_{{tenant}}.user_engagement_quartiles, build a macro that buckets daily active users into quartiles per tenant, supports 1-day late data, enforces schema drift guards, and includes tests (not_null on keys, unique on (tenant_id, day_start, quartile, user_id)), plus a global analytics.lineage and CI checks that per-tenant views exist and data is isolated. Explain approach to incremental materialization and lineage?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a dbt macro that reads cadence from a tenants seed and emits analytics_{{tenant}}.summary_hourly or analytics_{{tenant}}.summary_daily. Build incrementally, allow 1-day late data, guard against dr",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design and implement a comprehensive three-region multi-tenant analytics architecture in Snowflake using dbt. Develop a dynamic macro that systematically generates analytics_{{tenant}} tables across us_east, eu_west, an…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Outline a multi-tenant dbt/Snowflake approach for schema evolution: tenants drop new fields into staging_{{tenant}}.events; use analytics_base.mappings to drive per-tenant analytics_{{tenant}}.facts c",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a per-tenant quartile metric by ingesting daily active users per tenant from staging.tenant_events, then via a dbt macro create analytics_{{tenant}}.user_engagement_quartiles that assigns quartile rankings usi…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis assesses expertise in macro design, per-tenant architecture patterns, and incremental modeling strategies. It evaluates handling of real-world data challenges like late arrivals, maintaining data integrity across multiple tenants, and implementing robust governance controls.\n\n## Key Concepts\n- dbt macros for dynamic multi-tenant object generation\n- Per-tenant schemas using analytics_{{tenant}} naming convention\n- Incremental materialization with time-based windowing strategies\n- Quantile bucketing using NTILE() and percentile functions\n- Schema drift protection and automated data quality testing\n- Cross-tenant data isolation and CI validation pipelines\n- Global lineage tracking for dependency management\n\n## Code Example\n```sql\n-- Pseudo dbt macro to compute per-tenant quartiles\n{% macro per_tenant_quartile_transform(source) -%}\nwith daily as (\n  select \n    tenant_id, \n    date_trunc('day', event_timestamp) as day_start,\n    user_id,\n    count(*) as engagement_events\n  from {{ source }}\n  where event_timestamp >= '{{ var('start_date') }}'\n  group by tenant_id, date_trunc('day', event_timestamp), user_id\n),\nquartiles as (\n  select \n    tenant_id,\n    day_start,\n    user_id,\n    NTILE(4) OVER (\n      PARTITION BY tenant_id, day_start \n      ORDER BY engagement_events DESC\n    ) as quartile\n  from daily\n)\nselect * from quartiles\n{%- endmacro %}\n```\n\n## Implementation Approach\n- Use incremental materialization with `+incremental_strategy` for efficient updates\n- Implement late data handling with configurable lookback windows\n- Create schema tests for not_null constraints on key fields\n- Add unique constraints on (tenant_id, day_start, quartile, user_id) combinations\n- Build CI pipeline that validates per-tenant view existence and data isolation\n- Generate global lineage manifest for dependency tracking and impact analysis",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-4",
+        "questionId": "q-20760",
+        "question": "Design a beginner dbt per-tenant freshness monitor: from staging.tenant_events, build analytics_{{tenant}}.freshness that reports latest_event_date and days_since_last_event per tenant. Add a macro freshness_threshold() that flags tenant as stale when days_since_last_event > 2. Create not_null(tenant_id, latest_event_date) and unique(tenant_id) tests. CI gate fails if any tenant is stale. Document lineage via dbt docs and a simple exposures table?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a tenant registry-driven per-tenant onboarding_daily in Snowflake/dbt. Use a macro to loop over seeds.tenants and emit analytics_{{tenant}}.onboarding_daily from staging.tenant_events with 1-day late data hand…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose a per-tenant data quality scoring pipeline where analytics_{{tenant}}.quality_metrics is built from staging.tenant_events using analytics_base.dq_rules. Implement a 2-day late-data policy, a m",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "I’d implement analytics_{{tenant}}.freshness by deriving latest_event_date per tenant from staging.tenant_events. Compute days_since_last_event = datediff(CURRENT_DATE, latest_event_date, DAY). Use a",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Propose a macro `tenant_summary()` that reads from `registry.tenants`, dynamically builds per-tenant `analytics_{{tenant}}.daily_summary` tables from `staging.tenant_events` with a 1-day data lag, and registers lineage…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests a candidate's ability to add tenant-scoped freshness checks, a reusable macro, and CI gating. It introduces a measurable, auditable metric with lineage.\n\n## Key Concepts\n- Per-tenant aggregation in dbt\n- Macros and tests in dbt\n- Incremental vs. non-incremental freshness models\n- CI gates and lineage documentation\n\n## Code Example\n```sql\n-- freshness model sketch in SQL\nselect\n  tenant_id,\n  max(event_date) as latest_event_date,\n  datediff(current_date, max(event_date), 'day') as days_since_last_event\nfrom {{ source('staging','tenant_events') }}\ngroup by tenant_id\n```\n\n## Follow-up Questions\n- How would you handle late data and time zones?\n- How to scale this for hundreds of tenants without slowing CI?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-5",
+        "questionId": "q-8032",
+        "question": "Design a beginner dbt exercise to compute per-tenant weekly retention by cohort. With staging.signups(tenant_id, user_id, signed_up_at) and staging.active_days(tenant_id, user_id, day, active), build analytics_{{tenant}}.weekly_cohort_retention that groups cohorts by week_start(signed_up_at) and measures retention by days_since_signup (0-6, 7-13). Use a macro to create per-tenant schemas analytics_{{tenant}} and a global analytics.lineage. Include 1-day late data, not_null tests, and CI ensuring per-tenant tables exist and data stays isolated?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Approach: implement a single incremental model that builds analytics_{{tenant}}.daily_summary by joining staging.tenant_events on tenant_id. A macro drives per-tenant materialization from seeds.tenant",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "A multi-tenant, privacy-preserving daily cohort retention model in Snowflake/dbt. Ingest staging.tenant_signups and staging.tenant_events, hash user_id with a tenant salt to form user_hash, compute co",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a dbt macro that materializes analytics_{{tenant}}.weekly_cohort_retention as an incremental table from staging.signups and staging.active_days, computing week_start and days_since_signup, a",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement an incremental per-tenant model that computes a 14-day rolling median and MAD from staging.tenant_events, flags days with |z|>3, and writes analytics_{{tenant}}.daily_anomalies. Allow 1-day",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests per-tenant cohort retention design, macro scaffolding, and CI for isolation, a realistic starter for multi-tenant analytics.\n\n## Key Concepts\n- dbt macros for per-tenant objects\n- incremental models and late-arriving data\n- cohort retention calculations\n- cross-tenant isolation and lineage\n\n## Code Example\n```sql\n-- macro example (pseudo)\n{% macro analytics_tenant_weekly_retention() %}\n  SELECT\n    tenant_id,\n    week_start(signed_up_at) AS week_start,\n    COUNT(DISTINCT user_id) AS retained_users\n  FROM {{ ref('staging_signups') }} s\n  JOIN {{ ref('staging_active_days') }} a USING (tenant_id, user_id)\n  WHERE a.active = TRUE\n  GROUP BY tenant_id, week_start\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you adjust for tenants with sparse data?\n- How would you test cross-tenant bleed in CI?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-6",
+        "questionId": "q-17746",
+        "question": "Design a per-tenant anomaly-detection pipeline in Snowflake/dbt: from staging.tenant_events to analytics_{{tenant}}.anomaly_alerts. Ingest via Snowpipe with 1-hour late data, compute per-tenant rolling z-scores for metrics (events_per_minute, error_rate, latency_ms), and write alerts when any score exceeds 3 into analytics_{{tenant}}.anomaly_alerts. Include tests (not_null keys, unique on (tenant_id, time_bucket)), a global analytics.lineage, and CI checks that per-tenant alert tables exist and data is isolated. Explain how you would handle schema drift and incremental refresh?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a per-tenant incremental model that ingests staging.tenant_events through a Snowpipe stream, batches by tenant_id and hourly window, and computes three metrics: events_per_minute, error_rate, late",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement a per-tenant governance check by introducing a macro analytics_base.validate_lineage that parses dbt manifest and ensures no unapproved cross-tenant dependencies are added. Build analytics_{",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a per-tenant anomaly flow with a macro generating analytics_{{tenant}}.anomaly_flags and a global lineage table. From staging.tenant_events, compute daily counts per tenant, apply a simple z-sc",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Build an incremental per-tenant anomaly detection pipeline: compute a daily event_rate per tenant from staging.tenant_events, fetch per-tenant thresholds from analytics_{{tenant}}.config via a macro, calculate z-scores…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis probes end-to-end dbt + Snowflake skills for tenant isolation and production-grade anomaly detection.\n\n## Key Concepts\n- Incremental per-tenant models, Snowpipe streams, streaming windows\n- Rolling statistics (z-scores), alerting thresholds\n- Data lineage, CI for per-tenant tables, row-level access\n- Schema drift guards and data-contract checks\n\n## Code Example\n```sql\n-- dbt incremental model sketch (simplified)\nwith src as (\n  select\n    tenant_id,\n    date_trunc('hour', event_ts) as time_bucket,\n    count(*) as events_per_minute,\n    avg(case when status = 'error' then 1 else 0 end) as error_rate,\n    avg(latency_ms) as latency_ms\n  from {{ ref('staging_tenant_events') }}\n  group by 1,2\n)\nselect *,\n       (events_per_minute - mean_events) / stddev_events as z_events,\n       (error_rate - mean_error) / stddev_error as z_error,\n       (latency_ms - mean_lat) / stddev_lat as z_latency\nfrom src\n```\n\n## Follow-up Questions\n- How would you validate and revert drift in CI?\n- How would you tune the rolling window and alert thresholds for noise?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-7",
+        "questionId": "q-12315",
+        "question": "Design a per-tenant Snowflake/dbt feature store: automatically generate analytics_{{tenant}}.features_{{feature}} tables from staging.tenant_events and staging.tenant_events_v2. Use a macro to create tenant-specific feature tables, support incremental loads with 1-day late data, and enforce strict isolation via Snowflake RLS and per-tenant masking. Build a global analytics.lineage. Include tests not_null on keys and unique on (tenant_id, feature, as_of), plus CI checks that every per-tenant feature view exists and is isolated. Include a simple schema evolution strategy?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Provide a dbt macro `generate_features(tenant_id, feature_name, ...)` that creates `analytics_{{tenant}}.features_{{feature_name}}` as an incremental model sourced from staging events, applying per-tenant hash-based row…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "JSON-driven data quality: rules.json defines per-tenant required_fields and max_null_pct; the dq_rules macro auto-generates not_null tests and a null-rate test for each tenant/table/field. Create anal",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Read tenant policy from a central table, generate per-tenant schemas via a macro, and build incremental retention_summary views with 7/14/30 day buckets. Use a 1-day late data watermark; enforce isola",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I would add a macro normalize_day(ts) returning date_trunc('day', ts AT TIME ZONE 'UTC'). Build analytics_user_daily_summary as incremental by day from staging.web_events joined to staging.users, grou",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nReal-world ML feature stores require multi-tenant architecture with strict data isolation, reliable incremental processing, comprehensive governance, and automated quality validation.\n\n## Key Concepts\n- dbt macro-driven per-tenant feature table generation\n- Incremental processing with 1-day late-arriving data tolerance\n- Snowflake Row-Level Security (RLS) and dynamic data masking for isolation\n- Global lineage tracking via `analytics.lineage`\n- Automated CI validation for feature view existence and tenant isolation\n- Controlled schema evolution with backward compatibility\n\n## Code Example\n```sql\n-- Pseudo dbt macro for per-tenant feature generation\n{% macro generate_features(tenant_id, feature_name, source_tables) %}\n  -- Creates analytics_{tenant}.features_{feature_name}\n  -- Applies RLS policies and incremental logic\n  -- Handles late-arriving data with appropriate windowing\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you implement feature schema versioning across heterogeneous tenant requirements?\n- What strategies would you use for coordinated feature rollbacks across the entire tenant landscape?\n- How do you handle feature dependencies and ordering in a multi-tenant environment?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-8",
+        "questionId": "q-2901",
+        "question": "Design a multi-tenant dbt pipeline that creates per-tenant-per-region analytics schemas (analytics.{tenant}_{region}). From staging.events (tenant_id, region_id, user_id, event_type, occurred_at, ingestion_id), implement an incremental analytics.{tenant}_{region}.hourly_metrics counting distinct users by event_type per hour, with late data handling of 1 day. Add a tenant-region users snapshot for cohort changes and a tenancy-isolation macro to block cross-region joins. Include tests (not_null, unique) and cross-tenant lineage validation?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Create a macro tenant_model(tenant_id) that generates analytics_{{tenant_id}}.daily_engagement for each active tenant. Build an incremental model from staging.events with day_start = date(event_time)",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Describe a per-tenant-per-region dbt flow creating schemas analytics.{tenant}_{region} with an incremental hourly_metrics model over staging.events(tenant_id, region_id, user_id, event_type, occurred_",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Approach: implement a macro analytics_base.compute_skew(tenant, table) that returns max_rows_per_partition, p95_rows_per_partition, and skew_flag (max>2x median). Build per-tenant analytics_{{tenant}}",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose an idempotent incremental MERGE via analytics_base.tenant_upsert to align analytics_{{tenant}}.sales_fact with staging.tenant_sales_events, joining on tenant_id and sale_id to tolerate 2-day l",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to enforce tenancy boundaries in a dynamic multi-tenant, multi-region dbt setup, including late-arriving data and per-tenant snapshots.\n\n## Key Concepts\n- Dynamic per-tenant-per-region schemas analytics.{tenant}_{region}\n- Incremental hourly_metrics from staging.events\n- Deduplication via ingestion_id with ROW_NUMBER windowing\n- Late data window of 1 day; schema-drift guards via tests\n- Tenancy isolation macro preventing cross-region joins\n- Snapshots for analytics.{tenant}_{region}.users and lineage checks\n\n## Code Example\n```sql\n-- models/analytics/{{tenant}}_{{region}}/hourly_metrics.sql\nwith src as (\n  select * from {{ ref('staging_events') }}\n  where tenant_id = '{{ tenant }}' and region_id = '{{ region }}'\n),\ndedup as (\n  select *,\n         row_number() over (partition by ingestion_id order by occurred_at desc) as rn\n  from src\n)\nselect\n  date_trunc('hour', occurred_at) as hour,\n  event_type,\n  count(distinct user_id) as active_users\nfrom dedup\nwhere rn = 1\ngroup by 1,2\n```\n\n## Follow-up Questions\n- How would you validate cross-region lineage in the catalog?\n- What strategies ensure resilience if a region is degraded?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-9",
+        "questionId": "q-22874",
+        "question": "Design a beginner dbt workflow for a single-tenant daily_action_metric: from staging.events, create analytics_{{tenant}}.daily_actions_incremental using an incremental model that sums actions per user per day with a 1-day data lateness. Use a shared analytics_base.mask_pii macro for restricted roles, enforce dedup with a unique(tenant_id, day, event_id) seed, and add tests not_null(user_id, day, event_id) and a simple comparison to a seed. Explain handling of late data and how you would scale to multi-tenant?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a per-tenant schema-drift detector in Snowflake/dbt. Create analytics_base.schema_drift(tenant, upstream_table, downstream_model) to diff INFORMATION_SCHEMA.COLUMNS for added/removed columns",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a per-tenant data enrichment and de-identification pipeline in dbt/Snowflake for analytics_{{tenant}} events. Begin with staging.tenant_events, join analytics_{{tenant}}.mapping_user to enrich records, apply dete…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement analytics_{{tenant}}.daily_actions_incremental from staging.events. Use an incremental model that aggregates actions by tenant, user, and day with a 1-day lateness window. Deduplicate by (te",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "To implement this, describe a macro that emits analytics_{{tenant}}.daily_engagement from staging.tenant_events, converting occurred_at to the tenant's time zone via tenants.time_zone and truncating t",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nA practical intro to dbt incremental logic, late data handling, and basic data quality checks for multi-tenant analytics.\n\n## Key Concepts\n\n- dbt incremental models\n- late data windows\n- dedup with composite key\n- PII masking macro\n- basic tests (not_null, unique)\n\n## Code Example\n\n```javascript\n-- dbt incremental example (SQL-like)\nselect\n  tenant_id,\n  date(created_at) as day,\n  event_id,\n  count(*) as actions\nfrom {{ ref('staging_events') }}\nwhere created_at < current_timestamp - interval '1 day'\ngroup by tenant_id, day, event_id\n```\n\n## Follow-up Questions\n\n- How would you adapt this for multi-tenant with per-tenant schemas?\n- How would you extend tests for late-arriving data?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-10",
+        "questionId": "q-26094",
+        "question": "Design a tenant-aware data-skew detector for per-tenant facts. Implement a macro analytics_base.compute_skew(tenant, table) returning max_rows_per_partition, p95_rows_per_partition, and skew_flag (max>2x median). Add per-tenant analytics_{{tenant}}.skew_report (incremental) and analytics_base.skew_dashboard (global). CI gate blocks prod if skew_flag is true for any tenant on two consecutive runs. Include tests and a minimal schema?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose a dbt macro that iterates all tenants to materialize analytics_{{tenant}}.anomaly_daily, deriving day_start from occurred_at and computing a 7-day moving average per tenant/event_type. Flag is",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Approach: implement a macro analytics_base.compute_skew(tenant, table) that returns max_rows_per_partition, p95_rows_per_partition, and skew_flag (max>2x median). Build per-tenant analytics_{{tenant}}",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "I'll design a tenant-aware dbt flow that builds per-tenant analytics with proper time zone conversion and isolation safeguards. The solution uses a macro that loops through active tenants, creates dedicated analytics_{{…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I would implement a macro `analytics_base.validate_schema(tenant)` that reads `information_schema` for both `analytics_{{tenant}}.fct` and `analytics_base.fct`, computes a JSON diff of columns, data types, and nullabili…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes how to detect uneven data distribution across tenants, scale analytics with per-tenant models, and enforce governance via CI gates. It combines macro design, incremental modeling, and cross-tenant dashboards, plus RBAC considerations.\n\n## Key Concepts\n- Tenant-aware macros\n- Skew detection metrics (max, median, percentile)\n- Incremental per-tenant models and global summaries\n- CI gates and testing strategies\n\n## Code Example\n```sql\n-- analytics_base.compute_skew(tenant, table)\nwith s as (\n  select partition_key, count(*) as cnt\n  from {{ source('analytics', tenant, table) }}\n  group by partition_key\n)\nselect max(cnt) as max_rows_per_partition,\n       percentile_cont(0.95) within group (order by cnt) as p95_rows_per_partition\nfrom s\n```\n\n## Follow-up Questions\n- How would you adapt for changing partition keys?\n- How to visualize skew dashboards across tenants?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-11",
+        "questionId": "q-10771",
+        "question": "Design an autonomous onboarding/offboarding workflow in Snowflake + dbt for multi-tenant analytics. With a master table tenants(id, status) and per-tenant schemas analytics_{{tenant}}, implement a macro that creates analytics_{{tenant}} when a new tenant is enabled and drops all analytics artifacts when disabled. Include 1-day late data, schema-drift guards, tests for cross-tenant isolation, and CI that asserts per-tenant artifacts exist only for active tenants. How would you enforce isolation and audit changes?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement an incremental analytics.transactions model with unique_key txn_id, deduplicating across sources, handling late events within a 2-day watermark window, validating currency via a custom macro per source…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement an incremental model analytics.{tenant}.daily_user_activity using staging.events per tenant, UTC-normalize occurred_at to date, and aggregate distinct user_id by action. Add tests: not_null",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a dbt macro that reads a central tenants table, iterates over active tenants to create analytics_{{tenant}} schemas with appropriate grants, and drops schemas and all associated objects when tenant status chan…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement a per-tenant daily quality score using a simple macro-driven approach. Compute score as 40% completeness (not_null on tenant_id, event_type, occurred_at), 40% timeliness (max occurred_at wit",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests end-to-end lifecycle management, macro-driven multi-tenant infrastructure, governance capabilities, and auditability. It evaluates proficiency in dynamic object creation, safe removal procedures, data lag handling, and implementing isolation checks.\n\n## Key Concepts\n- dbt macros and dynamic SQL generation\n- Snowflake object lifecycle management (schemas, grants, drops)\n- Tenant lifecycle governance (onboarding/offboarding)\n- Row-level security policies and audit trails\n- CI validation for per-tenant artifacts and isolation enforcement\n\n## Code Example\n```sql\n{% macro create_tenant_schema(tenant) %}\n  EXECUTE IMMEDIATE 'CREATE SCHEMA IF NOT EXISTS analytics_' ~ tenant;\n  {% set grant_stmt %}\n    GRANT USAGE ON SCHEMA analytics_{{ tenant }} TO ROLE analytics_user;\n    GRANT SELECT ON ALL TABLES IN SCHEMA analytics_{{ tenant }} TO ROLE analytics_user;\n  {% endset %}\n  {% do run_query(grant_stmt) %}\n{% endmacro %}\n```\n\n## Implementation Considerations\n- Schema-drift detection using information_schema comparisons\n- 1-day data lag handling with window functions and watermark checks\n- Cross-tenant isolation tests using query result validation\n- CI pipeline steps to validate tenant status alignment with object existence\n- Comprehensive audit logging for all schema changes",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-12",
+        "questionId": "q-2797",
+        "question": "In a multi-tenant dbt analytics stack on Snowflake, raw events sit in staging.events with tenant_id, user_id, event_type, occurred_at. Propose a per-tenant drift-guard plan: a canary analytics.canary_{tenant} surfacing current schema, fields, and max_version; staged per-tenant views; and an incremental analytics.tenant.daily_metrics by day, event_type, tenant_id using MERGE for upserts. Include tests (not_null, unique, foreign_key), a snapshot analytics.tenants_cohort, and isolation/lineage via dbt sources and Snowflake row-level policies. Provide skeleton SQL and tradeoffs?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement an incremental MERGE into analytics_{{tenant}}.snapshot_costs from analytics_tenant_cost_events, keyed by (tenant_id, cost_id, snapshot_date). The macro analytics_base.snapshot_refre",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a per-tenant reconciliation and drift-detection pipeline in Snowflake/dbt that compares `analytics_{{tenant}}.user_history` (tenant_id, user_id, event, occurred_at) against `staging.users` (user_id, last_seen, st…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a per-tenant drift-guard canary: analytics.canary_{tenant} surfaces current schema, fields, and max_version. Use staged per-tenant views, incrementally build daily_metrics with MERGE by (tenant_id, date, event_ty…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Architect a per-tenant incremental flow in Snowflake using a macro to create analytics_{{tenant}} schemas and analytics_{{tenant}}.daily_engagement plus analytics.lineage. Compute analytics_{{tenant}}",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssesses ability to design robust, multi-tenant dbt pipelines with schema drift guards, data quality tests, and clear data lineage in Snowflake. It also evaluates how you model per-tenant snapshots and maintain isolation for BI dashboards.\n\n## Key Concepts\n- Incremental daily metrics per tenant\n- Canary drift guard per-tenant\n- Snapshots for tenant cohorts\n- Data quality tests: not_null, unique, foreign_key\n- Cross-tenant lineage and isolation via dbt sources and row-level policies\n\n## Tradeoffs\n- **Pros**: Strong data quality, clear tenant isolation, incremental processing\n- **Cons**: Increased model complexity, maintenance overhead per tenant\n- **Alternative**: Single-tenant model with partitioning for smaller deployments\n\n## Follow-up Questions\n- How would you detect drift progress across tenants?\n- What's your approach to backfilling historical data?\n- How do you handle tenant schema evolution?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-13",
+        "questionId": "q-12847",
+        "question": "Design a macro-driven per-tenant daily_summary from staging.tenant_events to analytics_{{tenant}}.daily_summary(tenant_id, day, event_type, count). Include 1-day late data, schema-drift guards, and incremental materialization. Add tests not_null on keys and unique(tenant_id, day, event_type). CI should ensure analytics_{{tenant}}.daily_summary exists for all active tenants and that data remains isolated per tenant; explain how isolation is validated in CI?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement a dbt macro that reads active tenants, loops over them, and materializes analytics_{{tenant}}.daily_summary incrementally from staging.tenant_events with 1-day late data. Include not",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "I would implement a macro that generates analytics_{{tenant}}.daily_summary by selecting tenant_id, date_trunc('day', occurred_at) as day, event_type, count(*) as cnt from staging.tenant_events where",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use a macro to materialize analytics_{{tenant}}.daily_revenue by incrementally merging staging.sales and staging.refunds per day. Build a global analytics.lineage to track dependencies. Backfill with tenant-specific dat…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose an incremental dbt flow: MERGE upsert from staging.raw_events (...) into analytics.{tenant}.daily_user_state, with day derived from occurred_at and 1-day late data. Use a macro to create analy",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question tests macro-based per-tenant model generation, incremental materialization, and data isolation in a beginner context.\n\n## Key Concepts\n\n- dbt macros for dynamic per-tenant models\n- incremental models with late-arrival data\n- schema drift guards and basic tests\n\n## Code Example\n\n```sql\n{% macro daily_summary_sql(tenant) %}\nselect\n  '{{- tenant -}}' as tenant_id,\n  date_trunc('day', occurred_at) as day,\n  event_type,\n  count(*) as cnt\nfrom {{ source('staging', 'tenant_events') }}\nwhere tenant_id = '{{ tenant }}'\ngroup by 1,2,3;\n{% endmacro %}\n```\n\n## Follow-up Questions\n\n- How would you test for 1-day late data in CI?\n- What changes if active tenants change mid-run?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-14",
+        "questionId": "q-9144",
+        "question": "Design a per-tenant incremental cohort funnel with differential privacy in Snowflake/dbt, from staging.tenant_events to analytics_{{tenant}}.cohort_funnel daily; apply Laplace noise to counts, track per-tenant epsilon, and allow 1-day late data. Include tenant schemas, global analytics.lineage, and tests (not_null on keys; unique on (tenant_id, day_start, cohort))?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Outline an incremental, per-tenant cohort funnel with differential privacy. Use a macro to generate analytics_{{tenant}}.cohort_funnel and a per-tenant epsilon budget tracked in analytics_privacy; app",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Proposed approach: implement a dbt macro drift_check(tenant) that compares analytics_{{tenant}}.facts to analytics_base.contract, emits drift rows into analytics_{{tenant}}.drift_metrics (tenant_id, t",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose a per-tenant lineage validator: a macro analytics_base.export_lineage(tenant) that reads manifest.json, emits a JSON lineage graph analytics_base.lineage_{{tenant}} mapping sources to downstre",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a per-tenant incremental path from staging.tenant_impressions into analytics_{{tenant}}.impressions_facts using analytics_base.impression_model as the common transformation. 15-minute late window;",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design a privacy-aware, scalable per-tenant analytics flow with dbt/Snowflake, including DP, isolation, and CI checks.\n\n## Key Concepts\n- Differential privacy budgets per tenant (epsilon) and noise mechanisms\n- Incremental/dbt macro to create tenant schemas and analytics.lineage\n- Data isolation via per-tenant schemas + security policies\n- 1-day late data handling and schema-drift guards\n\n## Code Example\n```sql\n-- macro: create_cohort_funnel.sql\nselect\n  tenant_id,\n  date_trunc('day', occurred_at) as day_start,\n  cohort,\n  count(distinct user_id) as raw_count\nfrom {{ ref('staging_tenant_events') }}\ngroup by 1,2,3\n```\n\n## Follow-up Questions\n- How would you implement privacy budget accounting and auditing in CI?\n- What tests would you add to ensure no cross-tenant bleed while preserving DP guarantees?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-15",
+        "questionId": "q-7312",
+        "question": "Design a per-tenant, incremental dbt flow in Snowflake to compute analytics.{tenant}.anomaly_summary from staging.events (tenant_id, user_id, event_type, value, occurred_at, predicted_anomaly_score). Build via a macro that creates analytics_{tenant} schemas and analytics_{tenant}.anomaly_summary, plus a global analytics.lineage table. Include 1-day late data, schema-drift guards, tests (not_null on keys, not_null on predicted_anomaly_score, unique on (tenant_id, day_start, event_type)), and a per-tenant users snapshot. Explain cross-tenant isolation validation and anomaly lineage auditing?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Read tenant policy from a central table, generate per-tenant schemas via a macro, and build incremental retention_summary views with 7/14/30 day buckets. Use a 1-day late data watermark; enforce isola",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Describe a per-tenant incremental flow that creates analytics_{tenant} schemas and analytics_{tenant}.anomaly_summary from staging.events, including predicted_anomaly_score. Use a macro for schema cre",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a dbt macro drift_check that compares per-column metadata (data type, nullability, default, and max length) between a source table and its corresponding model, plus a runtime comparison of r",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a macro `calc_anomaly_score(tenant_id, day)` that computes the anomaly score using the formula `(daily_engagement - rolling_mean7) / rolling_stddev7` within each tenant partition, using a 7-day rolling window.…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis angle tests multi-tenant data governance when ML-influenced signals drive analytics. It emphasizes dynamic schema creation, robust lineage, and isolation checks in CI.\n\n## Key Concepts\n- Macro-driven per-tenant schemas and tables\n- Incremental daily anomalySummary with ML scores\n- Global analytics.lineage for cross-tenant tracing\n- Schema drift guards and data-quality tests\n\n## Code Example\n```jinja\n{% macro create_anomaly_schema(tenant) %}\n  {% set tbl = 'analytics_' ~ tenant ~ '.anomaly_summary' %}\n  -- dbt macro to initialize tenant schema objects\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you validate cross-tenant isolation in CI?\n- How would you monitor anomaly_score drift across tenants?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-16",
+        "questionId": "q-6361",
+        "question": "Design a beginner dbt exercise to generate per-tenant daily_event_summary and a per-tenant data_quality score using a macro that creates analytics_{{tenant}}.daily_event_summary (incremental by day) and analytics_{{tenant}}.quality (score 0-100 from not_null checks and late data). Include 1-day late data window, tests (not_null on tenant_id, day_start, event_type; unique on tenant_id/day_start/event_type). CI should verify analytics_{{tenant}}.daily_event_summary exists for all tenants and that new tenants auto-create. How would you validate cross-tenant isolation by filtering by tenant_id and checking lineage?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Create a macro that materializes analytics_{{tenant}}.daily_event_summary incrementally by day from staging.events (tenant_id, event_type, occurred_at). Add analytics_{{tenant}}.quality computed from",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "A macro `generate_alerts(tenant)` materializes `analytics_{{tenant}}.alerts` from `staging.tenant_events` and `analytics_base.alert_rules`. The macro reads global alert rules (containing `rule_id`, `severity`, `sql_cond…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Build a per-tenant revenue flow via a macro that creates analytics_{{tenant}}.daily_revenue from staging.billing_events, normalizing to USD with a currencies table. Add analytics_{{tenant}}.data_avail",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a dbt macro that reads a central tenants table, iterates over active tenants to create analytics_{{tenant}} schemas with appropriate grants, and drops schemas and all associated objects when tenant status chan…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests a beginner-friendly dbt flow with macros, per-tenant schemas, incremental models, and basic data quality scoring. Also exercises CI automation to auto-create new tenants and verify isolation.\n\n## Key Concepts\n\n- dbt macros for tenant-scoped tables\n- incremental models by day\n- simple data_quality scoring\n- tests: not_null and unique\n- CI checks and automatic tenant provisioning\n- data lineage visibility across tenants\n\n## Code Example\n\n```sql\n-- micro-example: incremental by day for analytics_{{tenant}}.daily_event_summary\nwith src as (\n  select tenant_id, date_trunc('day', occurred_at) as day_start, event_type, count(*) as cnt\n  from {{ ref('staging.events') }}\n  group by 1,2,3\n)\nselect * from src\n```\n\n## Follow-up Questions\n\n- How would you handle a tenant deletion in this model?\n- How would you scale the data_quality computation to more metrics without increasing build time?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-17",
+        "questionId": "q-23711",
+        "question": "Design a per-tenant data-quality and lineage validator in Snowflake/dbt: analytics_{{tenant}}.quality fed from staging.tenant_events, with analytics_base.mappings for cross-tenant lineage. Include a 2-day late data window, per-tenant masking, and an RLS policy. Propose macro analytics_base.build_qc and tests not_null(keys) and unique(tenant_id, day, qc_id). CI gates production if any tenant’s quality_score drifts >5% for two consecutive days?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use an incremental model with is_incremental(). Join staging events to pricing.exchange_rates on date and currency, then aggregate revenue in USD by date, city, ride_type. Implement a 2-day late-data",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose a per-tenant data-quality and lineage validator that uses Snowflake streams on analytics_{{tenant}}.quality, sourced from staging.tenant_events, with a shared analytics_base.mappings for cross",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Propose a per-tenant daily sessions model: derive sessions by grouping events within a 30-minute inactivity gap per tenant, generate session_id as tenant_id || '_' || min(event_time), and populate session_start, session…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a per-tenant quality pass with a shared analytics_base macro analytics_base.verify_fk that scans analytics_{{tenant}}.fact_sales for orphaned product_id or customer_id across tenants, emits",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design data quality and lineage checks in a multi-tenant dbt/Snowflake setup, focusing on late data, masking, RLS, and governance.\n\n## Key Concepts\n- Snowflake streams, dbt tests, and macros\n- Per-tenant lineage with analytics_base.mappings\n- Data quality metrics and drift thresholds\n- CI gates and alerting\n\n## Code Example\n```sql\n-- macro: analytics_base.build_qc\n{% macro build_qc(tenant) %}\nselect\n  '{{tenant}}' as tenant_id,\n  count(*) as total_checks,\n  sum(case when status = 'pass' then 1 else 0 end) as passes\nfrom {{ ref('quality_results') }}\nwhere tenant_id = '{{ tenant }}';\n{% endmacro %}\n```\n\n## Follow-up Questions\n- What metrics would you track to monitor validator efficacy?\n- How would you test macro idempotence across tenants with varying schemas?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-18",
+        "questionId": "q-14118",
+        "question": "Design a per-tenant dbt pipeline in Snowflake that exports a privacy-preserving event digest to analytics_export_{{tenant}}.digest from staging.tenant_events (tenant_id, user_id, event_type, occurred_at). Use a macro to generate per-tenant schemas analytics_{{tenant}} and a global analytics.lineage. Hash user_id with a tenant-specific salt to produce hashed_user_id, masking for non-full-access roles. Include 1-day late data, schema-drift guards, and tests: not_null on keys, unique on (tenant_id, digest_day, hashed_user_id). Explain how you'd validate cross-tenant isolation in CI and ensure deterministic hashing?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement an incremental model analytics.{tenant}.daily_user_activity using staging.events per tenant, UTC-normalize occurred_at to date, and aggregate distinct user_id by action. Add tests: not_null",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "## Per-Tenant Data Catalog Export Feature ### Design Overview Create a macro `analytics_base.export_catalog(tenant)` that reads the dbt project's `manifest.json`, extracts model metadata, and writes it to a per-tenant c…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement `analytics_{{tenant}}.daily_anomalies` as an incremental dbt model that computes z-scores per tenant by joining `staging.tenant_events` with `analytics_base.compute_sigma(tenant)`. Flag values deviating more t…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Explain per-tenant schemas analytics_{{tenant}} and a per-tenant export analytics_export_{{tenant}}.digest; digest_day = date(occurred_at). Hash user_id with tenant_salt using HMAC_SHA256 to hashed_us",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests privacy-preserving cross-tenant exports and CI-driven isolation in dbt Snowflake pipelines.\n\n## Key Concepts\n\n- Per-tenant macros generating analytics_{{tenant}} schemas and analytics_export_{{tenant}}.digest\n- HMAC-based hashing of user_id with tenant-specific salt for hashed_user_id\n- 1-day late data and schema-drift guards\n- Global analytics.lineage tracking and per-tenant view existence checks in CI\n- Access controls: raw_user_id visible only to full-access roles\n\n## Code Example\n\n```javascript\n-- Pseudo SQL for hashed_user_id (illustrative)\nSELECT HMAC_SHA256(user_id, tenant_salt) AS hashed_user_id\nFROM staging.tenant_events\n```\n\n## Follow-up Questions\n\n- How would you validate tenancy isolation in CI and production with evolving salts?\n- How would you detect and remediate drift in the digest schema across tenants?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-19",
+        "questionId": "q-28929",
+        "question": "In a Snowflake/dbt environment with per-tenant schemas analytics_{{tenant}} and a shared analytics_base, implement a beginner-friendly per-tenant signup cohort model analytics_{{tenant}}.cohorts that assigns each new user to a monthly cohort using staging.tenant_events (event_ts, user_id, event_type='sign_up'). Create a macro analytics_base.assign_cohort(event_ts) that returns the cohort in 'YYYY-MM' format. Add tests: not_null on user_id and cohort, and a unique test on (tenant, user_id, cohort). Propose a lightweight CI gate that blocks production if any tenant has more than two cohorts for the same month. Include macro name and a minimal schema outline?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "This interview question evaluates a candidate's ability to architect a scalable, compliant data masking framework in a multi-tenant dbt/Snowflake environment. The solution requires: (1) a dbt macro `analytics_base.apply…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement `analytics_{{tenant}}.revenue_daily` as an incremental model from `staging.orders` (order_ts, tenant_id, revenue, customer_ssn) and `staging.payments`, keyed on `date(order_ts)`. Use `analytics_base.redact_ssn…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "The solution uses a dbt macro `analytics_base.assign_cohort(event_ts)` to return cohorts in 'YYYY-MM' format. A per-tenant model `analytics_{{tenant}}.cohorts` joins `staging.tenant_events` to assign cohorts based on si…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Per-tenant daily revenue in Snowflake/dbt with a macro that auto-creates analytics_{{tenant}}.daily_revenue and aggregates staging.sales_events (tenant_id, sale_date, amount) by day. Support 1-day lat",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests the ability to design a simple, tenant-aware cohort pipeline using macros, dbt tests, and production governance.\n\n## Key Concepts\n- Tenant-scoped models and macros\n- Cohort logic with date formatting\n- dbt tests: not_null and unique constraints\n- Lightweight CI governance\n\n## Code Example\n```jinja2\n{% macro analytics_base.assign_cohort(event_ts) %}\n  {{ return(dbt_date.date_trunc('month', event_ts) | string | slice(0, 7)) }}\n{% endmacro %}\n```\n\n## Follow-up Questions\n- How would you extend this to handle late-arriving events?\n- How would you validate that cohort distribution looks reasonable?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-20",
+        "questionId": "q-9717",
+        "question": "Design a dbt-based per-tenant health framework in Snowflake for a multi-tenant analytics platform. Build an incremental daily health model that compares counts from staging.tenants_events to analytics_{tenant}.daily_aggregation for each tenant, with 2-day late data tolerance. Create a macro to auto-create per-tenant schemas analytics_{tenant} and capture a central analytics.lineage. Implement a privacy mask for user_id for tenants flagged restricted_access. Add CI that fails if any tenant health score falls below 0.8 and include tests: not_null on keys, unique on (tenant_id, day, user_id), and drift checks?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Per-tenant incremental dbt flow from staging.tenant_events to analytics_{{tenant}}.secure_engagement; use a mask_user_pii() macro to hash user_id for non-FULL_ACCESS roles. Expose analytics_{{tenant}}",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Create analytics_{{tenant}}.anomaly_scores incrementally, using analytics_base.daily_metrics to compute a 7-day mean and stddev for revenue per tenant, via a macro analytics_base.compute_zscore(val, m",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Create analytics_base.check_fk(tenant, child_table, parent_table, child_key, parent_key) to return a boolean predicate flagging orphans, e.g., NOT EXISTS(SELECT 1 FROM analytics_{{tenant}}.{parent_tab",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a dbt-driven per-tenant health framework in Snowflake: a daily incremental health model that compares counts from staging.tenants_events to analytics_{tenant}.daily_aggregation for each tena",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssesses building a scalable, tenant-isolated data health framework with dbt macros, incremental modeling, late data handling, and privacy controls. Evaluates CI gating and data contracts to prevent regressions.\n\n## Key Concepts\n- dbt macros for per-tenant schema generation\n- incremental daily health model with late data tolerance\n- drift detection and data quality tests\n- tenant privacy masking with access controls\n- CI gating on health thresholds\n\n## Code Example\n```sql\n-- Example macro scaffold: tenant_schema_name\n{% macro tenant_schema_name(tenant) %} analytics_{{ tenant }} {% endmacro %}\n```\n\n## Follow-up Questions\n- How would you test cross-tenant isolation in CI?\n- How would you instrument health scores and alert on degradation?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-21",
+        "questionId": "q-17321",
+        "question": "Design a per-tenant weekly forecast pipeline in Snowflake/dbt that derives analytics_{{tenant}}.weekly_forecast from staging.tenant_events by combining a global baseline analytics_base.forecast_base with per-tenant calibration analytics_{{tenant}}.calibration. Include 2-day late data, schema-drift guards, and tests not_null(tenant_id, week_start, forecast) and unique(tenant_id, week_start). Explain how you would enforce cross-tenant isolation in CI and Snowflake row-level security?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a macro to materialize analytics_{{tenant}}.daily_revenue by incrementally merging staging.sales and staging.refunds per day. Build a global analytics.lineage to track dependencies. Backfill with tenant-specific dat…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose a macro-driven per-tenant weekly forecast that merges staging.tenant_events with analytics_base.forecast_base and analytics_{{tenant}}.calibration to produce analytics_{{tenant}}.weekly_foreca",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a comprehensive cross-tenant data quality and governance framework: **1. Freshness Macro** ```jinja {% macro freshness_by_tenant(tenant) %} SELECT MAX(event_ts) AS max_event_ts, CURRENT_TIMESTAMP() AS evaluate…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I’d implement analytics.daily_engagement as an incremental model that aggregates distinct users per date and event_type, joining dimensions.regions on region_code. Late data is allowed in a 3-day wind",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis probes practical dbt/Snowflake multi-tenant forecasting design, including macro-based schema generation, late data handling, and cross-tenant isolation.\n\n## Key Concepts\n\n- dbt macros for tenant scoping\n- Snowflake baseline + calibration joining\n- RLS, schema drift tests, CI isolation checks\n\n## Code Example\n\n```sql\n-- Example macro usage (illustrative)\nSELECT f.forecast_date AS week_start, f.forecast_value AS forecast\nFROM analytics_base.forecast_base f\nJOIN analytics_{{tenant}}.calibration c ON f.tenant_id = c.tenant_id\n```\n\n## Follow-up Questions\n\n- How would you test isolation across tenants in CI?\n- How would you handle schema drift events that impact the forecast model?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-22",
+        "questionId": "q-26755",
+        "question": "Design a per-tenant data retention and archival workflow in a Snowflake/dbt setup with per-tenant schemas analytics_{{tenant}} and a shared analytics_base. Requirements: (1) central analytics_base.retention_policies with tenant, table, retention_days, archive_schema; (2) macro analytics_base.apply_retention(tenant, table) that moves rows older than retention_days to analytics_{{tenant}}.archive.{{table}} and purges live; (3) nightly Snowflake TASK + dbt run-operation to apply retention; (4) tests for archival completeness and retention_days > 0; (5) per-tenant RLS; (6) CI gate blocking prod if any policy is invalid or archival fails for 2+ days. Include a minimal schema sketch?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement a macro analytics_base.column_drift(tenant, table) that queries information_schema.columns and compares column_name, data_type, and is_nullable against analytics_base.transaction_reg",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a macro analytics_base.row_completeness(tenant, model, pk) that computes non-null counts for the given primary key in analytics_{{tenant}}.{{model}} and compares to analytics_base.reference_",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "A central retention policy table `analytics_base.retention_policies` stores tenant, table_name, retention_days, and archive_schema. The `analytics_base.apply_retention(tenant, table)` macro moves rows older than retenti…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Build a dbt macro that emits analytics_{{tenant}}.ltv_cohorts by joining staging.tenant_events and staging.tenant_revenue, aggregating by tenant_id and cohort_start (date_trunc day minus cohort_length",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests the ability to design a compliant, scalable data lifecycle with multi-tenant isolation, clear ownership, and automated governance in a dbt/Snowflake environment.\n\n## Key Concepts\n- dbt macros and run-operations for lifecycle management\n- Snowflake Tasks and time-based scheduling\n- Per-tenant Row-Level Security (RLS) isolation\n- Data governance and CI gates for lifecycle policies\n\n## Code Example\n```sql\n{% macro apply_retention(tenant, table) %}\n  {% set policy = ref('retention_policies') | where('tenant = \\''~tenant~'\\' AND table_name = \\''~table~'\\'') | first %}\n  {% set retention_days = policy.retention_days %}\n  {% set archive_schema = policy.archive_schema %}\n\n  {% set move_query %}\n    INSERT INTO {{ archive_schema }}.archive_{{ table }}\n    SELECT * FROM {{ this }}\n    WHERE row_timestamp < DATEADD(day, -{{ retention_days }}, CURRENT_TIMESTAMP());\n\n    DELETE FROM {{ this }}\n    WHERE row_timestamp < DATEADD(day, -{{ retention_days }}, CURRENT_TIMESTAMP());\n  {% endset %}\n\n  {% do run_query(move_query) %}\n{% endmacro %}\n```",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-23",
+        "questionId": "q-3016",
+        "question": "Design an advanced, privacy-aware per-tenant dbt flow. Tenants table stores privacy_level. Create a macro that SHA256-hashes user_id to analytics.{tenant}.daily_engagement.hashed_user_id only when privacy_level=high; otherwise pass-through. Build analytics.{tenant}.daily_engagement incrementally by date and action with 2-day late data; snapshot analytics.{tenant}.users for cohort and country changes. Enforce per-tenant schemas, schema-drift tests, and not_null/unique constraints; expose a cross-tenant lineage view and privacy-aware dashboards?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement a privacy-aware, per-tenant dbt flow with dynamic data masking based on tenant privacy settings. The solution includes a macro that conditionally SHA256-hashes user_id to analytics.{tenant}.daily_engag…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use a macro to materialize analytics_{{tenant}}.daily_revenue by incrementally merging staging.sales and staging.refunds per day. Build a global analytics.lineage to track dependencies. Backfill with tenant-specific dat…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a dbt macro invoked by on-run-end to insert into analytics_{{tenant}}.audit_log; use an AFTER_RUN hook that creates the per-tenant log table if missing; include run_id, model_name, status, duration_ms, execute…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Create a dbt macro that generates analytics_{{tenant}}.churn_score incrementally from staging.tenant_events and analytics_common.customer_dim, with 1-day late data. Enforce masking policies on PII, an",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to implement privacy-aware per-tenant data pipelines with dynamic masking, per-tenant schema isolation, and robust data quality controls.\n\n## Key Concepts\n- dbt macros and Jinja logic for per-tenant behavior\n- Conditional data masking with hashing (SHA256)\n- Incremental models with late data handling\n- Per-tenant schemas and strict tests for isolation\n- Snapshotting and lineage exposure\n\n## Code Example\n```sql\n-- Macro skeleton for privacy-aware hashing\n{% macro hash_user_for_tenant(privacy_level, user_id) %}\n  {% if privacy_level == 'high' %}\n    SHA2(CONCAT('{{ user_id }}'), 256)\n  {% else %}\n    {{ user_id }}\n  {% endif %}\n{% endmacro %}\n```\n\n## Implementation Approach\n1. Create tenant-aware macro for conditional hashing\n2. Build incremental daily_engagement with late data handling\n3. Implement snapshot for users tracking changes\n4. Add per-tenant schema tests and constraints\n5. Create cross-tenant lineage views and dashboards",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "dbt-analytics-engineer-q-24",
+        "questionId": "q-2933",
+        "question": "Design a multi-tenant dbt flow in Snowflake that computes analytics.{tenant}.hourly_metrics from staging.events_raw (tenant_id, user_id, event_type, occurred_at, record_hash). Implement an incremental analytics.{tenant}.hourly_metrics by hour_start and event_type with active_users = count(distinct user_id); support 1-day late data; add dynamic schema-drift guards and tests (not_null on hour_start, tenant_id; unique on (tenant_id, hour_start, event_type)); include analytics.{tenant}.users_cohort snapshot for first_session and country changes; ensure per-tenant isolation via schemas and a global analytics.lineage table. Outline macro-driven tests and tenant-scoped materializations?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a per-tenant incremental model analytics.{tenant}.daily_event_score built on staging.events, joined to seeds.tenants for multiplier. Bucket occurred_at to day, group by tenant_id, day, event_type;",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Outline a per-tenant reconciliation pipeline that compares analytics_{{tenant}}.reconciled_costs with external billing data for each tenant, product, and period. Implement 2-day late data, use analyti",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a tenant-scoped daily_summary as an incremental analytics.{tenant}.daily_summary built from staging.events (tenant_id, user_id, event_type, occurred_at) joined to dimensions.countries, with",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "## Per-Tenant Schema Architecture - `analytics.{tenant}.hourly_metrics` - incremental model - `analytics.{tenant}.users_cohort` - snapshot table - `analytics.lineage` - global lineage tracking ## Incremental Model: anal…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design a production-grade multi-tenant dbt flow with: hourly granularity, late data handling, schema drift protection, testing strategy, snapshots, and governance.\n\n## Key Concepts Covered\n\n**1. Tenant Isolation**: Per-tenant schemas via `analytics_{tenant}` pattern with macro-driven materialization\n\n**2. Incremental Modeling**: `DATE_TRUNC('HOUR', occurred_at)` for hourly bucketing, `merge` strategy with `unique_key`\n\n**3. Late Data Handling**: \n- 1-day grace window via `WHERE hour_start >= DATE_TRUNC('DAY', CURRENT_DATE - 1)`\n- `is_invalidated` flag pattern for reprocessing\n- Use `incremental_strategy='merge'` for upserts\n\n**4. Schema Drift Guards**:\n- `is_valid_column()` - checks column existence at runtime\n- `validate_columns()` - enforces required columns\n- `guard_column_type()` - detects type changes\n\n**5. Tests**: \n- `not_null` on `hour_start`, `tenant_id`\n- `unique` on composite key `(tenant_id, hour_start, event_type)`\n- `contract.enforced: true` for schema enforcement\n\n**6. Snapshot Strategy**: `check` strategy with `invalidate_hard_deletes` tracking `first_session` and `country` changes\n\n**7. Lineage**: Global `analytics.lineage` table capturing source-target relationships for governance\n\n## Technical Notes\n- Snowflake-specific: `DATE_TRUNC`, `TIMESTAMP_NTZ`, cluster-by optimization\n- dbt 1.6+ features: `contract`, `invalidate_hard_deletes`\n- Use `adapter.get_columns_in_relation()` for runtime schema inspection\n- Tenant-scoped runs via `dbt ls --select tenant:xxx` or manifest parsing",
         "difficulty": "intermediate"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-06-05T11:59:48.434Z",
+    "createdAt": "2026-06-06T05:54:54.401Z",
     "version": 1
   }
 ]
