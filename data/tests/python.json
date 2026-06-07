@@ -8,68 +8,248 @@
     "questions": [
       {
         "id": "python-q-0",
-        "questionId": "q-22997",
-        "question": "Design an asyncio-based processor in Python that consumes an async NDJSON stream where each line is {timestamp: int, symbol: str, price: float}. For each symbol, maintain a rolling window of the last 5 seconds and emit, every 2 seconds, the symbol’s average price within that window to a sink. Ensure per-symbol isolation, bounded memory, and backpressure to the source; provide a small test harness simulating bursts and a slow sink?",
+        "questionId": "q-6003",
+        "question": "Design an async Python pipeline that reads length-delimited YAML documents over a TLS socket, validates each document against a dynamic JSON Schema retrieved from a remote registry, applies a per-version transformation, and emits JSON Lines to a sink. Constraints: bounded memory with a single bounded asyncio.Queue, per-version in-order processing, and hot-swap of schemas without restart. Include a v1→v2 migration example and runtime schema swap needs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Create an async generator as the source, a Pydantic BaseModel for validation, and a dict of asyncio.Queues per category with maxsize. For each line, parse JSON, validate, and put into the correspondin",
-            "isCorrect": false
+            "text": "Implement an asyncio TLS reader framing 4-byte length prefixes, YAML.safe_load, validate with a JSON Schema fetched from registry (with ETag caching). Route by doc.version to per-version transformers,",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Maintain per-key sliding windows: a dict api_key -> deque of timestamps within the last 60 seconds. On each NDJSON line, prune old timestamps, allow if len(deque) < N, then append; else drop and log.",
+            "text": "To implement, create an async function ingest(source, writer_factory) that builds a dict of per-tenant queues and a small worker pool per tenant. Each line is parsed as JSON, validated with a Pydantic",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "I would implement a bounded, per-id FIFO deduper: parse NDJSON lines, validate with Pydantic, route each event to an asyncio.Queue keyed by event_id. A per-id worker drains in-order and emits to the s",
+            "text": "Use per-service async workers with bounded asyncio.Queues to preserve in-order delivery. Implement a token-bucket limiter per service (capacity C, refill rate R). Parse NDJSON lines, dispatch payload",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use an in-memory dictionary mapping each symbol to a deque of (timestamp, price) tuples. For each incoming NDJSON record, append it to the symbol's deque and drop any entries older than timestamp - 5 seconds to maintain…",
-            "isCorrect": true
+            "text": "To solve this, implement an async producer-consumer chain using an asyncio.Queue, a Pydantic Event model for validation, a per-user deduplicator with an LRU/minute cache (action_id seen timestamps) to",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question tests the ability to implement time-based per-key state management, memory bounding, and backpressure in asyncio—skills critical for building real-time data pipelines.\n\n## Key Concepts\n- Per-key state management using dictionaries and deques\n- Time-based sliding windows with timestamped data\n- asyncio tasks, queues, and backpressure mechanisms\n- Memory bounding via deque size limits and window eviction\n- Safe shutdown and task management in async systems\n\n## Code Example\n```python\nimport asyncio\nfrom collections import deque\nfrom dataclasses import dataclass\n\n@dataclass\nclass PriceRecord:\n    timestamp: int\n    symbol: str\n    price: float\n\nclass RollingWindowProcessor:\n    def __init__(self, window_seconds: int = 5, emit_interval: int = 2, sink_capacity: int = 100):\n        self.window_seconds = window_seconds\n        self.emit_interval = emit_interval\n        self.sink_queue = asyncio.Queue(maxsize=sink_capacity)\n        self.windows: dict[str, deque] = {}\n        self.running = False\n\n    async def consume(self, stream):\n        self.running = True\n        async for line in stream:\n            if not self.running:\n                break\n            record = PriceRecord(**line)\n            await self._ingest(record)\n\n    async def _ingest(self, record: PriceRecord):\n        if record.symbol not in self.windows:\n            self.windows[record.symbol] = deque()\n        \n        window = self.windows[record.symbol]\n        window.append((record.timestamp, record.price))\n        \n        cutoff = record.timestamp - self.window_seconds\n        while window and window[0][0] < cutoff:\n            window.popleft()\n\n    async def emit_averages(self):\n        while self.running:\n            await asyncio.sleep(self.emit_interval)\n            for symbol, window in self.windows.items():\n                if window:\n                    avg_price = sum(p for _, p in window) / len(window)\n                    await self.sink_queue.put((symbol, avg_price))\n\n    async def sink(self):\n        while self.running:\n            try:\n                item = await asyncio.wait_for(self.sink_queue.get(), timeout=1.0)\n                symbol, avg = item\n                print(f\"{symbol}: {avg:.2f}\")\n            except asyncio.TimeoutError:\n                continue\n\n    async def run(self, stream):\n        emitter = asyncio.create_task(self.emit_averages())\n        consumer = asyncio.create_task(self.consume(stream))\n        sink_task = asyncio.create_task(self.sink())\n        \n        await consumer\n        self.running = False\n        await sink_task\n        emitter.cancel()\n        await asyncio.gather(emitter, return_exceptions=True)\n\n# Test harness\nasync def slow_sink_processor():\n    processor = RollingWindowProcessor()\n    \n    async def slow_sink():\n        while True:\n            await asyncio.sleep(0.5)  # Simulate slow sink\n            try:\n                item = processor.sink_queue.get_nowait()\n                print(f\"Sink processed: {item}\")\n            except asyncio.QueueEmpty:\n                pass\n    \n    async def burst_producer():\n        import time\n        base_time = int(time.time())\n        records = [\n            {\"timestamp\": base_time, \"symbol\": \"AAPL\", \"price\": 150.0},\n            {\"timestamp\": base_time + 1, \"symbol\": \"AAPL\", \"price\": 151.0},\n            {\"timestamp\": base_time + 2, \"symbol\": \"GOOG\", \"price\": 2800.0},\n            {\"timestamp\": base_time + 3, \"symbol\": \"AAPL\", \"price\": 152.0},\n            {\"timestamp\": base_time + 4, \"symbol\": \"GOOG\", \"price\": 2810.0},\n        ]\n        for record in records:\n            await processor._ingest(PriceRecord(**record))\n            await asyncio.sleep(0.1)\n    \n    await asyncio.gather(burst_producer(), slow_sink(), processor.emit_averages())\n\nif __name__ == \"__main__\":\n    asyncio.run(slow_sink_processor())\n```\n\nThis implementation provides per-symbol isolation through separate deques, bounded memory via window eviction, and backpressure through a bounded queue that blocks producers when full.",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nTests streaming primitives, dynamic schemas, and hot-reload.\n\n## Key Concepts\n- Async IO, TLS streams, length framing\n- YAML parsing and JSON Schema validation\n- Dynamic schema loading and caching with ETag\n- Per-version routing and in-order guarantees\n- Bounded memory and backpressure\n- Hot schema swap without downtime\n\n## Code Example\n```python\n# skeleton: framed_reader -> validate -> route_by_version -> transform -> emit\n```\n\n## Follow-up Questions\n- How would you test memory boundedness under backpressure?\n- How to handle schema evolution that drops required fields?",
+        "difficulty": "advanced"
       },
       {
         "id": "python-q-1",
-        "questionId": "q-8622",
-        "question": "Implement a memory-efficient Python function load_config_stream(path, required_keys) that streams a newline-delimited config file with lines KEY=VALUE. Ignore blanks and comments (#). Validate that all required_keys exist using a dynamically created Pydantic model and return the Settings object. Do not read the whole file into memory; lines are processed one by one. If a required key is missing, raise ValidationError?",
+        "questionId": "q-29759",
+        "question": "In Python, design an asynchronous streaming processor that consumes two NDJSON sources concurrently (trades and quotes), validates each line with Pydantic models, performs a time-based windowed join on the symbol field within a 1-second tolerance, and emits joined records to a sink. Maintain per-symbol in-order processing, bound memory, and backpressure. Include a test plan simulating late trades/quotes and a slow sink?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement a per-tenant, bounded-queue async pipeline. A single NDJSON reader routes each line to an asyncio.Queue keyed by tenant (bounded to cap memory). Each tenant has a dedicated worker that validates with Pydantic,…",
+            "text": "Implement using metaclass with double-checked locking and TypeVar for generics: metaclass provides compile-time enforcement, decorator offers simplicity, while module-level singletons are most Pythonic. Use threading.Lo…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "To meet scale and latency, implement a central dispatcher that routes each input line to a per-key queue guarded by an asyncio.Lock. Spawn a dedicated task per key that drains its queue in-order and e",
-            "isCorrect": false
+            "text": "Coordinate two NDJSON streams with asyncio, validating items via Pydantic. Maintain per-symbol small buffers and perform a 1-second window join on symbol and near-simultaneous timestamps. Emit joined",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Design an asyncio-based NDJSON embedding pipeline in Python that: 1. Ingests lines from an async source, where each line contains {id, model, text} 2. Groups items by model into batches of up to N items or within T seco…",
+            "text": "Process the JSONL stream line by line; validate host and numeric value; accumulate per-host totals in a dict; maintain a fixed-size min-heap of (total, host) for the current top-N; when a host total increases, update he…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a generator to stream the file and parse KEY=VALUE lines, skipping blanks and comments. Collect values for required_keys in a dict, then build a dynamic Pydantic model with create_model({required_",
-            "isCorrect": true
+            "text": "Approach: stream NDJSON lines, validate with a Pydantic Record, buffer per category in a dict preserving arrival order. When total buffered lines across all categories reaches batch_size, yield a dict",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests ability to write a memory‑efficient config loader that handles large files without loading them fully into RAM, plus practical validation via Pydantic.\n\n## Key Concepts\n\n- Streaming I/O with generators\n- Dynamic Pydantic model creation (create_model)\n- Minimal memory footprint tied to required keys\n- Robust parsing with error handling for missing/malformed lines\n\n## Code Example\n\n```python\nfrom pydantic import create_model\nfrom typing import List\n\ndef load_config_stream(path: str, required_keys: List[str]):\n    data = {}\n    with open(path, 'r') as f:\n        for line in f:\n            s = line.strip()\n            if not s or s.startswith('#'):\n                continue\n            if '=' not in s:\n                continue\n            k, v = s.split('=', 1)\n            data[k.strip()] = v.strip()\n    model = create_model('Settings', **{k: (str, ...) for k in required_keys})\n    return model(**{k: data[k] for k in required_keys})\n```\n\n## Follow-up Questions\n\n- How would you extend to support typed values (ints, bools) and defaults?\n- How would you test with extremely large files and verify memory usage?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nTests ability to design a real-time Python streaming component that combines multiple asynchronous sources with tight timing constraints, ordering guarantees, and backpressure. It also probes validation strategy and test planning for edge cases.\n\n## Key Concepts\n- Async streaming coordination across multiple sources\n- Pydantic validation and schema evolution handling\n- Time-based window join with per-key ordering\n- Bounded memory buffers and backpressure\n- Test planning for late data and slow sinks\n\n## Code Example\n```python\nfrom pydantic import BaseModel\nfrom typing import AsyncIterator, Dict, List\nimport asyncio\n\nclass Trade(BaseModel):\n    symbol: str\n    ts: int\n    price: float\n    size: int\n\nclass Quote(BaseModel):\n    symbol: str\n    ts: int\n    bid: float\n    ask: float\n\nclass Joined(BaseModel):\n    symbol: str\n    trade_ts: int\n    quote_ts: int\n    price: float\n    bid: float\n    ask: float\n\nasync def stream_join(trades: AsyncIterator[str], quotes: AsyncIterator[str], sink: asyncio.Queue):\n    # placeholder for a concrete implementation\n    pass\n```\n\n## Follow-up Questions\n- How would you scale this to more streams or variable window lengths?\n- How would you handle clock drift or out-of-order arrivals at scale?\n- How would you monitor and test memory usage under burst traffic?",
+        "difficulty": "intermediate"
       },
       {
         "id": "python-q-2",
-        "questionId": "q-13045",
-        "question": "Design a beginner-friendly Python function process_stream(source, max_concurrency=3) that consumes an async line source yielding NDJSON JSON objects, validates each with a Pydantic model, buckets items by user_id, processes each bucket in-order with at most max_concurrency active buckets, and writes results to a sink. Ensure bounded memory and provide minimal tests?",
+        "questionId": "q-17497",
+        "question": "Implement an asyncio-based Python NDJSON processor that ingests lines from a fast, unbounded async source; each line must include an 'event_type' and a 'payload'. Use Pydantic discriminated unions to validate two event shapes (e.g., 'click' with 'user_id', 'timestamp', 'url'; 'purchase' with 'user_id','timestamp','amount'). Route records to per-event_type sinks via bounded asyncio.Queues while preserving per-type order. Implement a dynamic backpressure policy controlled by a flag: when the flag is 'stall', backpressure stalls producers; when 'log_and_drop', records are dropped beyond queue capacity. Add a small test harness simulating a fast producer and slower sinks. Ensure restartability by persisting a simple durable progress log on disk and resuming from the last processed line on restart. Include a minimal test runner?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Leverage asyncio with per-service task handlers, a bounded sliding window (deque) per service to compute moving averages, and an async sink queue with backpressure. Use a watermark based on min(ts) -",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement an asyncio-based Python NDJSON processor that ingests lines from a fast, unbounded async source. Each line must include an 'event_type' and a 'payload'. Use Pydantic discriminated unions to validate two event…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "The candidate should implement per-source in-order routing, kind-based partitioning, bounded asyncio queues, and a batching loop that yields to a sink with backpressure. They should validate events wi",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Initialize a ProcessPoolExecutor for scoring, parse NDJSON with a Pydantic model, and push results to per-symbol bounded queues. A router enforces backpressure by awaiting queue.put, and a lightweight",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests the ability to compose asyncio pipelines with schema validation using Pydantic discriminated unions, implement per-type routing with bounded queues, design backpressure policies, and ensure durability with checkpointing. It also probes understanding of async producer/consumer patterns and testability.\n\n## Key Concepts\n- Asyncio producers and consumers\n- Pydantic discriminated unions for schema validation\n- Per-type bounded queues with backpressure\n- Durable checkpoints for restartability\n- Test harness with simulated fast/slow components\n\n## Code Example\n\n```python\nimport asyncio\nimport json\nfrom pathlib import Path\nfrom typing import Annotated, Any, Literal\nfrom pydantic import BaseModel, Field\n\nclass ClickEvent(BaseModel):\n    event_type: Literal[\"click\"]\n    user_id: str\n    timestamp: float\n    url: str\n\nclass PurchaseEvent(BaseModel):\n    event_type: Literal[\"purchase\"]\n    user_id: str\n    timestamp: float\n    amount: float\n\nEvent = Annotated[ClickEvent | PurchaseEvent, Field(discriminator=\"event_type\")]\n\nclass NDJSONProcessor:\n    def __init__(self, queue_size: int = 100, backpressure: str = \"stall\"):\n        self.queues: dict[str, asyncio.Queue] = {}\n        self.backpressure = backpressure\n        self.queue_size = queue_size\n        self.progress_file = Path(\"progress.log\")\n        self.offset = self._load_offset()\n\n    def _load_offset(self) -> int:\n        if self.progress_file.exists():\n            return int(self.progress_file.read_text().strip())\n        return 0\n\n    def _save_offset(self, offset: int):\n        self.progress_file.write_text(str(offset))\n\n    async def process_line(self, line: str, offset: int):\n        data = json.loads(line)\n        event_type = data.get(\"event_type\")\n        \n        if event_type not in self.queues:\n            self.queues[event_type] = asyncio.Queue(maxsize=self.queue_size)\n            asyncio.create_task(self._sink(event_type, self.queues[event_type]))\n\n        queue = self.queues[event_type]\n        \n        if self.backpressure == \"stall\":\n            await queue.put(data)\n        elif self.backpressure == \"log_and_drop\":\n            try:\n                queue.put_nowait(data)\n            except asyncio.QueueFull:\n                print(f\"Dropped event {event_type} at offset {offset}\")\n        \n        self._save_offset(offset)\n\n    async def _sink(self, event_type: str, queue: asyncio.Queue):\n        while True:\n            data = await queue.get()\n            print(f\"Processing {event_type}: {data}\")\n            await asyncio.sleep(0.1)  # Simulate slow sink\n            queue.task_done()\n\n    async def run(self, source: AsyncIterator[str]):\n        offset = self.offset\n        async for line in source:\n            if offset > 0:\n                offset -= 1\n                continue\n            await self.process_line(line, offset)\n            offset += 1\n```\n\n## Follow-up Questions\n- How would you extend this to support dynamic event schemas without downtime?\n- How would you measure per-type throughput and latency?\n- How would you handle poison messages that fail validation repeatedly?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "python-q-3",
+        "questionId": "q-22609",
+        "question": "Write a Python function to robustly normalize and validate an NDJSON stream where lines may use either 'userId' or 'user_id' for the ID and either 'ts' or 'timestamp' for the time. Normalize to canonical keys: user_id and timestamp (ISO 8601). Validate with a Pydantic model (user_id: int, timestamp: datetime, email: Optional[str]). Read from a generator of strings, yield only records with valid types, and stop after collecting 100 records in input order. Provide the function process_lines(lines) -> Generator[YourModel, None, None]?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose an async NDJSON pipeline that validates each record via Pydantic, loads per-record transforms from plugins/ using a multiprocessing isolation model, and hot-reloads on disk changes. Use a boun",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a small generator: define a Pydantic model with user_id: int, timestamp: datetime, email: Optional[str]. Normalize line dicts by aliasing 'userId'/'user_id' to user_id and 'ts'/'timestamp' t",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use an asyncio-based streaming pipeline that maintains per-user, 5-minute tumbling windows in memory. Parse each NDJSON line, compute window_start = floor(ts to 5 minutes), and accumulate totals in a",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I would implement an asyncio-based processor that maintains per-trace state, storing start times per span_id in a bounded in-memory map (LRU up to 1000 traces). Each NDJSON line is validated via Pydan",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question checks basic Python, streaming, and data validation skills. It also tests handling of multiple field names and type coercion in a realistic ingestion task.\n\n## Key Concepts\n\n- NDJSON parsing\n- Field normalization/aliasing\n- Pydantic validation\n- Generator-based streaming and early termination\n\n## Code Example\n\n```python\nfrom datetime import datetime\nimport json\nfrom typing import Generator, Optional\nfrom pydantic import BaseModel\n\nclass Record(BaseModel):\n    user_id: int\n    timestamp: datetime\n    email: Optional[str] = None\n\n\ndef process_lines(lines) -> Generator[Record, None, None]:\n    count = 0\n    for line in lines:\n        try:\n            data = json.loads(line)\n            data = {\n                'user_id': int(data.get('userId') or data.get('user_id')),\n                'timestamp': data.get('ts') or data.get('timestamp'),\n                'email': data.get('email')\n            }\n            rec = Record(**data)\n        except Exception:\n            continue\n        yield rec\n        count += 1\n        if count >= 100:\n            break\n```\n\n## Follow-up Questions\n\n- How would you handle more permissive date parsing?\n- How would you test with corrupted lines?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "python-q-4",
+        "questionId": "q-21865",
+        "question": "Design a Python async microservice that consumes an async NDJSON stream of events with fields event_id, user_id, action, ts. Validate with Pydantic, partition by user_id, and compute per-user 1-minute window counts of actions, emitting results to a sink with backpressure. Enforce per-user in-order delivery, bounded memory, and exactly-once emission semantics using an idempotent sink or dedupe cache. Include a test plan for duplicates and restarts?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement with asyncio: a streaming reader feeds per-user bounded queues; each user has a short-lived window state (1-minute buckets) and a per-user worker aggregates counts. Validate with Pydantic, t",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Propose a pipeline where: 1) a live NDJSON feed yields records with id, schema, payload, and ts fields; 2) a dynamic SchemaRegistry maintains schema-name-to-PydanticModel mappings with hot-reloading capabilities; 3) an…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Per-user asyncio workers with bounded queues. Demux NDJSON lines by user_id, validate with Pydantic, and enqueue. Each user task drains its queue in order, drops events older than TTL, and writes to a",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement per-tenant worker pools; use bounded asyncio.Queues per tenant; buffer out-of-order user events with a per-user min-heap to emit in ts order; compute per-minute distinct user counts and send",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design per-key state, windowed aggregation, backpressure, and exactly-once semantics in streaming data.\n\n## Key Concepts\n- Async streams\n- Per-user partitioning\n- Windowed aggregation\n- Pydantic validation\n- Deduplication and idempotent sinks\n- Backpressure and restart safety\n\n## Code Example\n```python\nfrom pydantic import BaseModel\nclass Event(BaseModel):\n    event_id: str\n    user_id: str\n    action: str\n    ts: int\n```\n\n## Follow-up Questions\n- How would you scale to millions of users?  \n- How would you test with duplicates and network failures?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "python-q-5",
+        "questionId": "q-11408",
+        "question": "Python beginner task: Build an async rate-limited file writer. Given an async generator of log lines, implement rate_limited_writer(source, dest_path, max_bytes_per_min=1048576, max_lines_per_sec=100) that writes lines to a file without exceeding the byte rate or line rate. Backpressure the source to preserve order and keep memory bounded?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use per-user asyncio queues with dedicated workers to ensure in-order processing per user. Batch incoming NDJSON lines into micro-batches constrained by configurable size N or time window T. Validate each line with Pyda…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use per-user BatchHandler with an asyncio.Queue. Validate each line with a Pydantic model. Accumulate until N lines or T seconds, then process; for enrichment call a per-user rate-limited async API wi",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Per-(host, metric) sliding window with a dict of keys to a small state object. Each state holds a deque for (ts, value), a running sum, and two monotonic deques for min and max. On each line: evict ol",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Proposed answer: implement a single background consumer using an asyncio.Queue with a bounded size. The producer pushes lines; the consumer writes to disk and uses two simple token buckets (bytes and",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of asyncio basics, backpressure, and memory safety in a realistic I/O task.\n\n## Key Concepts\n- asyncio.Queue for bounded buffering\n- single writer to preserve order\n- simple token bucket rate limiting for bytes and lines\n- backpressure by awaiting when limits are reached\n- testability with fast/slow async sources\n\n## Code Example\n```python\nimport asyncio\n\nasync def rate_limited_writer(source, dest_path, max_bytes_per_min=1024*1024, max_lines_per_sec=100, queue_size=1000):\n    q = asyncio.Queue(maxsize=queue_size)\n    writer = asyncio.create_task(_writer(q, dest_path, max_bytes_per_min, max_lines_per_sec))\n    try:\n        async for line in source:\n            await q.put(line)\n    finally:\n        await q.put(None)\n        await writer\n\nasync def _writer(q, dest_path, max_bytes_per_min, max_lines_per_sec):\n    with open(dest_path, 'a') as f:\n        bpt = max_bytes_per_min\n        lpt = max_lines_per_sec\n        last = asyncio.get_event_loop().time()\n        while True:\n            line = await q.get()\n            if line is None:\n                break\n            now = asyncio.get_event_loop().time()\n            if now - last >= 1:\n                bpt = max_bytes_per_min\n                lpt = max_lines_per_sec\n                last = now\n            line_len = len(line.encode('utf-8'))\n            if line_len > bpt or 1 > lpt:\n                await asyncio.sleep(0.01)\n                # simplistic backoff until tokens refill\n            f.write(line)\n            f.flush()\n            bpt -= line_len\n            lpt -= 1\n```\n\n## Follow-up Questions\n- How would you adapt to multiple destinations with per-destination quotas?\n- How would you test at scale with simulated bursts and verify exact rate adherence?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "python-q-6",
+        "questionId": "q-25382",
+        "question": "Task: Implement a Python asyncio NDJSON router that ingests lines via an async source, validates with Pydantic, and routes records to per-key sinks. Add live, atomic routing reconfiguration from a JSON config that can change which key is used for routing (e.g., region or account_type) without dropping in-flight records or breaking per-key in-order guarantees. Provide a test harness simulating bursty input and slow sinks?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Dispatcher holds per key queues and a read optimized routing map. Config watcher updates a copy on write routing dict atomically under a lock to re route new keys without touching in flight records. E",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Read NDJSON from stdin, validate with a Pydantic model, convert amount to Decimal, and keep a per-user sliding window of the last 60 amounts using a deque plus a running sum. After each valid line, up",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design an asyncio-based pipeline that ingests an async iterable of JSON deltas for a distributed cache, validates each delta with a Pydantic model, and applies per-key state in-order. Persist a checkp",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Leverage an asyncio pipeline with a bounded queue, Pydantic validation, and per-user 5-minute tumbling windows. Guarantee exactly-once by maintaining a bounded in-memory dedup cache (LRU+TTL) plus a d",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design a dynamic routing system in Python async pipelines with per-key ordering, hot-reconfig, and backpressure. It probes correctness under config changes without downtime and restart resilience.\n\n## Key Concepts\n- Async per-key streaming and in-order guarantees\n- Copy-on-write routing map and atomic updates\n- Runtime reconfiguration without downtime\n- Backpressure via bounded per-key queues\n- Durability for restarts (offset/log/SINK idempotence)\n\n## Code Example\n```python\n# Skeleton: atomic routing map and per-key queues with a watcher\nimport asyncio\nfrom typing import Dict\n\nclass Router:\n    pass\n```\n\n## Follow-up Questions\n- How would you test backpressure with rapid routing changes?\n- How would you scale to multiple processes or nodes?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "python-q-7",
+        "questionId": "q-24906",
+        "question": "Build an asyncio NDJSON processor in Python that ingests lines from an async generator. Validate each line with a Pydantic model: id:int, value:int, category:str. Track per-category counts and sums; every 50 valid lines emit a batch summary to a sink: { batch_end: last_id, per_category: { cat: { count, sum_value } } }. Enforce memory bounds by capping to 1000 categories with LRU eviction; drop data beyond cap?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Architect a reader that streams NDJSON via an async generator, dispatching each line to a per-schema queue keyed by schema_id. Register schema_id to Pydantic model (V1, V2). Hot-swap by atomically upd",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Build an async NDJSON processor that validates lines with a versioned Pydantic model. Maintain a registry of per-version migrations and apply the correct mapping when schema_version changes mid-stream",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement an asynchronous loop that reads lines from the async source, validates with Pydantic, and updates a per-category dictionary of counts and sums. Use a global counter to trigger a flush every",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Ingest NDJSON events, dedupe by event_id, partition by region, batch per region by N or T, validate with Pydantic, and compute per-batch top-k users by cumulative score. Emit to a sink with backpressu",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of async streaming, data validation, per-key aggregation, backpressure, and bounded memory.\n\n## Key Concepts\n- Asyncio and async for loops\n- Pydantic validation of NDJSON lines\n- Per-category aggregation and in-order processing\n- Backpressure via asyncio.Queue\n- Bounded memory with LRU eviction of categories\n\n## Code Example\n```javascript\n# Python-like pseudocode\nasync def process(source, sink):\n    batch_end = None\n    cat_stats = {}\n    seen = LRUCache(1000)\n    count = 0\n    async for line in source():\n        obj = Model.parse_raw(line)\n        if not obj: continue\n        batch_end = obj.id\n        cat = obj.category\n        s = cat_stats.setdefault(cat, {\"count\":0, \"sum_value\":0})\n        s[\"count\"] += 1\n        s[\"sum_value\"] += obj.value\n        count += 1\n        if count % 50 == 0:\n            await sink.put({\"batch_end\": batch_end, \"per_category\": cat_stats})\n```\n\n## Follow-up Questions\n- How would you test backpressure with a slow sink?\n- How would you adapt to miss-detected duplicates due to clock skew?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "python-q-8",
+        "questionId": "q-30205",
+        "question": "Implement an asyncio-based NDJSON streamer in Python that ingests lines from an async generator; each line is a dict with fields: id:int, user:str, action:str, ts:int. Validate with a Pydantic model. Route events to per-user queues to enforce per-user in-order processing. For each user, emit a summary after either 3 events are batched or 1 second has elapsed since the first event in that batch. Enforce memory bound by max 50 events per user and demonstrate backpressure by using a slow sink. Provide runnable core with a simple producer and a slow sink?",
         "type": "single",
         "options": [
           {
@@ -79,42 +259,12 @@
           },
           {
             "id": "b",
-            "text": "Implement per-user state with a bounded deque of (timestamp, amount). Validate each event via a Pydantic model. On arrival, discard if event.time < watermark; otherwise push to the per-user queue, upd",
+            "text": "Design a per-user async processor that validates NDJSON lines with Pydantic, maintains rolling statistics in 5-minute sliding windows, and handles backpressure and checkpointing. Each user gets an isolated processing pi…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "I’d implement an async NDJSON processor that ingests lines {endpoint, latency_ms, ts} from an async source, computes per-endpoint 60-second sliding window averages with a cap of 1000 samples, and emit",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use asyncio with a shared dict of per-user queues and a semaphore to cap active buckets. Validate each line via a Pydantic model, enqueue into the user queue, and spin up per-user workers that drain i",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis checks practical async streaming, per-key in-order processing, memory budgeting, and backpressure handling, plus validating input with Pydantic and routing bad lines to a sink.\n\n## Key Concepts\n- Async streaming and backpressure\n- Per-key in-order processing\n- Bounded memory and concurrency control\n- Pydantic validation and error routing\n- Testing streaming components\n\n## Code Example\n```python\nfrom pydantic import BaseModel, ValidationError\nclass Event(BaseModel):\n    user_id: str\n    value: float\n```\n\n## Follow-up Questions\n- How would you test per-user ordering guarantees?\n- How would you handle a burst where many new user_ids appear?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "python-q-3",
-        "questionId": "q-24115",
-        "question": "In Python, implement an asynchronous streaming processor that consumes NDJSON lines from an async source src. Each line is a JSON object with fields: id:int, category:str, weight:float. Validate each line using a Pydantic model. Maintain a per-category running count of valid records. Every 100 valid lines, emit a summary to a downstream sink as {'batch_end': <id of last line in batch>, 'counts': {'category': count}}. Ensure memory usage remains bounded and invalid lines are logged and skipped. Outline your approach and provide minimal runnable core logic?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a single async loop with a dict mapping user_id to a deque of (ts_ms, value). Validate each line with a Pydantic model, drop entries older than 60 seconds relative to ts_ms, compute the window ave",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement an asyncio-based dispatcher that validates NDJSON lines with a Pydantic schema, routes by sensor_id to per-sensor bounded queues, and spawns per-sensor consumers to preserve in-order emissio",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Read NDJSON asynchronously from src, validate every line with Pydantic Record(id:int, category:str, weight:float). Keep a bounded counts map (LRU using OrderedDict). Increment per-category counts for",
+            "text": "Use a dict of per-user asyncio.Queues (maxsize=50). Each user runs a batcher: collect events until 3 items or 1s from the first item, then emit a batch to a bounded sink Queue. Validate each line with",
             "isCorrect": true
           },
           {
@@ -123,199 +273,79 @@
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests ability to reason about streaming, validation, backpressure, and memory usage in a beginner-friendly Python flow.\n\n## Key Concepts\n\n- Async iteration over a source\n- Pydantic model validation\n- Bounded in-memory state (LRU pruning)\n- Batch emission and sink backpressure\n- Error handling for invalid lines\n\n## Code Example\n\n```python\nfrom pydantic import BaseModel\nfrom collections import OrderedDict\nimport asyncio\n\nclass Record(BaseModel):\n    id: int\n    category: str\n    weight: float\n\nasync def process(src, sink, batch=100, max_cats=100):\n    counts = OrderedDict()\n    total = 0\n    async for line in src:\n        try:\n            rec = Record.parse_raw(line)\n        except Exception:\n            continue\n        counts[rec.category] = counts.get(rec.category, 0) + 1\n        if len(counts) > max_cats:\n            counts.popitem(last=False)\n        total += 1\n        if total % batch == 0:\n            await sink({'batch_end': rec.id, 'counts': dict(counts)})\n```\n\n## Follow-up Questions\n\n- How would you test handling of new categories and pruning behavior?\n- How would you adapt to multiple producers and ensure per-category ordering?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "python-q-4",
-        "questionId": "q-8794",
-        "question": "Beginner Python task: implement a streaming per-user sliding window counter. Given a source of NDJSON lines with fields user_id (str), action (str), ts (int, seconds since epoch), write stream_user_window_counter(source, window_seconds=60) that validates fields, keeps for each user a deque of recent timestamps, and after each line yields {\"user_id\": count} for actions in [ts - window, ts]. Memory must be bounded by active users and the window size. Assume lines have non-decreasing ts?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Parse NDJSON lines with json.loads; for each user maintain a deque of timestamps; prune entries older than ts - window_seconds, append current ts, and yield {user_id: len(deque)}. This gives amortized",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Maintain an in-memory dictionary keyed by user_id to accumulate batches, with per-user queues and a dedicated worker per user that flushes when either N items accumulate or T seconds elapse. Validate each line using a l…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Validate NDJSON lines with a Pydantic model, then merge two async streams by maintaining a min-heap of the current head from each source keyed by (ts, source_id). Pop the smallest entry, push the next line from that sou…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a per-user reorder buffer with a max size, validate each NDJSON line via a Pydantic model, push events into the appropriate per-user queue, and emit aggregates when a watermark advances or on a",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests per-key streaming state management, simple validation, and memory-bounded processing in Python.\n\n## Key Concepts\n- Streaming I/O and per-key state\n- Sliding window with timestamps\n- Deques for efficient pops from the front\n- Simple NDJSON parsing and lightweight validation\n\n## Code Example\n```python\nfrom collections import defaultdict, deque\nimport json\nfrom typing import Dict, Deque\n\ndef stream_user_window_counter(source, window_seconds: int = 60):\n    user_windows: Dict[str, Deque[int]] = defaultdict(deque)\n    for line in source:\n        line = line.strip()\n        if not line:\n            continue\n        try:\n            obj = json.loads(line)\n            uid = obj.get(\"user_id\")\n            ts = obj.get(\"ts\")\n            if not isinstance(uid, str) or not isinstance(ts, int):\n                continue\n        except Exception:\n            continue\n        dq = user_windows[uid]\n        cutoff = ts - window_seconds\n        while dq and dq[0] < cutoff:\n            dq.popleft()\n        dq.append(ts)\n        yield {uid: len(dq)}\n```\n\n## Follow-up Questions\n- How would you handle out-of-order events within the window?\n- How would you scale this to millions of users while keeping latency low?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "python-q-5",
-        "questionId": "q-224",
-        "question": "How would you implement a thread-safe singleton in Python with lazy initialization, proper type hints, and discuss the trade-offs between metaclass, decorator, and module-level approaches for a production system?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement using metaclass with double-checked locking and TypeVar for generics: metaclass provides compile-time enforcement, decorator offers simplicity, while module-level singletons are most Pythonic. Use threading.Lo…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use a streaming approach: read lines from source, parse with csv.reader, require exactly 3 fields (timestamp, user_id, action). Convert timestamp with datetime.fromisoformat, drop future timestamps or",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Recursively traverse the JSON-like object, building keys with dots. For dicts, iterate items in order and extend path with key; for lists, extend with index. Return a flat dict mapping 'a.b' to values",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Propose an async NDJSON pipeline that validates each record via Pydantic, loads per-record transforms from plugins/ using a multiprocessing isolation model, and hot-reloads on disk changes. Use a boun",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Context\n\nThis question assesses understanding of design patterns, concurrency, and Python-specific implementation trade-offs. Senior developers should compare multiple singleton approaches and justify their choice.\n\n## Code Examples\n\n### Metaclass Approach\n\n```python\nfrom typing import TypeVar, Type, Optional\nimport threading\n\nT = TypeVar('T')\n\nclass SingletonMeta(type):\n    _instances: dict[Type, object] = {}\n    _lock: threading.Lock = threading.Lock()\n    \n    def __call__(cls: Type[T], *args, **kwargs) -> T:\n        if cls not in cls._instances:\n            with cls._lock:\n                if cls not in cls._instances:\n                    instance = super().__call__(*args, **kwargs)\n                    cls._instances[cls] = instance\n        return cls._instances[cls]\n```\n\n### Decorator Approach\n\n```python\ndef singleton(cls):\n    instances = {}\n    lock = threading.Lock()\n    \n    def wrapper(*args, **kwargs):\n        if cls not in instances:\n            with lock:\n                if cls not in instances:\n                    instances[cls] = cls(*args, **kwargs)\n        return instances[cls]\n    \n    return wrapper\n```\n\n### Module-Level Approach\n\n```python\n# singleton_module.py\nclass _DatabaseConnection:\n    def __init__(self):\n        self.connection = None\n    \n    def connect(self):\n        if not self.connection:\n            self.connection = create_db_connection()\n        return self.connection\n\n# Single instance at module import time\ndatabase = _DatabaseConnection()\n```\n\n## Trade-offs Analysis\n\n**Metaclass Approach:**\n- Pros: Compile-time enforcement, clean class definition, full type hint support\n- Cons: More complex, metaclass magic can be confusing for new developers\n- Best for: Production systems requiring strict singleton enforcement\n\n**Decorator Approach:**\n- Pros: Simple to apply, non-intrusive, easy to understand\n- Cons: Runtime enforcement only, can be bypassed with direct class instantiation\n- Best for: Quick implementations and prototyping\n\n**Module-Level Approach:**\n- Pros: Most Pythonic, guaranteed thread safety by import system, zero overhead\n- Cons: Less flexible, eager initialization, harder to test\n- Best for: Simple cases where lazy initialization isn't required\n\n## Production Recommendation\n\nFor production systems, use the metaclass approach with double-checked locking. It provides the best balance of thread safety, type hint support, and enforcement while maintaining clean API design.",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "python-q-6",
-        "questionId": "q-26555",
-        "question": "Design an async NDJSON processor in Python that ingests lines from an AsyncIterable[str], each line a JSON with session_id (str), event (str), ts (int, epoch ms). Implement per-session in-order processing, partition by session_id, batch by N lines or T seconds, validate with a Pydantic model, and emit to a sink with backpressure. Enforce bounded per-session memory and a watermark-based late-event policy that drops events with ts < watermark. Provide a test plan for out-of-order and late events and a crash-recovery strategy?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Here's an implementation of an asyncio-based streaming processor with the required features: ```python import asyncio import json from collections import defaultdict from dataclasses import dataclass from typing import…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use asyncio with per-session queues and a dispatcher routing by session_id. For each session, maintain a bounded, ordered batch visible to a per-session worker; emit when N items or T seconds. Validat",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use a two-pass approach: first stream to collect per-user totals in a dict (unavoidable since we need final totals), then use a min-heap of size N to extract top N users with O(N) memory. For tie handling, when totals a…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use an asyncio task that reads from an async NDJSON source, validates each line against a Pydantic Event model, and maintains a per-user dictionary tracking running totals and last-seen timestamps. On each valid event,…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design per-session ordering, backpressure, and watermark handling in an async Python pipeline, plus validation, memory constraints, and fault tolerance.\n\n## Key Concepts\n- Async partitioning by key (session_id)\n- Batching by size/time with asyncio\n- Pydantic validation\n- Watermark-based late-event handling\n- Backpressure and bounded queues\n- Crash recovery planning\n\n## Code Example\n```python\nfrom pydantic import BaseModel\nfrom typing import AsyncIterable\n\nclass Event(BaseModel):\n    session_id: str\n    event: str\n    ts: int\n```\n\n## Follow-up Questions\n- How would you test memory behavior with high-cardinality session_id?\n- How would you evolve the system to tolerate clock skew across producers?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "python-q-7",
-        "questionId": "q-3698",
-        "question": "Design a Python async NDJSON ingest pipeline that reads lines from an AsyncIterable[str], validates each line against a per-schema Pydantic model chosen by a schema_id field, and dispatches to per-schema handlers via bounded asyncio.Queues. Implement runtime hot-swapping of schemas (without restart) and guarantee in-order processing per schema even as schemas are swapped. Include a minimal test scaffold showing schema_id=1 mapped to V1 and swapped to V2 at runtime; discuss memory, latency, and safety trade-offs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I would implement a partitioned async pipeline: a single reader fans NDJSON lines to per-partition asyncio queues keyed by (tenant_id, event_type). Each partition has a worker batching N items or T se",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Architect a reader that streams NDJSON via an async generator, dispatching each line to a per-schema queue keyed by schema_id. Register schema_id to Pydantic model (V1, V2). Hot-swap by atomically upd",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Initialize a ProcessPoolExecutor for scoring, parse NDJSON with a Pydantic model, and push results to per-symbol bounded queues. A router enforces backpressure by awaiting queue.put, and a lightweight",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "The candidate should implement per-source in-order routing, kind-based partitioning, bounded asyncio queues, and a batching loop that yields to a sink with backpressure. They should validate events wi",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design a dynamic, high-throughput streaming pipeline with runtime configurability and strong ordering guarantees. It also probes memory management, backpressure, and safe hot-swapping of schemas without restart.\n\n## Key Concepts\n- Async streaming and NDJSON parsing\n- Per-key routing and bounded queues for backpressure\n- Runtime hot-swapping of schemas with atomic registry updates\n- Per-schema in-order processing and sequence tracking\n\n## Code Example\n```python\n# Pydantic models and dispatcher sketch\nfrom pydantic import BaseModel\nimport asyncio, json\n\nclass V1(BaseModel):\n    id: int; value: int\n\nclass V2(BaseModel):\n    id: int; value: int; meta: str\n\nschema_registry = {1: V1, 2: V1}\nregistry_lock = asyncio.Lock()\nqueues = {1: asyncio.Queue(maxsize=1024), 2: asyncio.Queue(maxsize=1024)}\n\nasync def reader(async_iter):\n    async for line in async_iter:\n        payload = json.loads(line)\n        sid = payload[\"schema_id\"]\n        async with registry_lock:\n            Model = schema_registry.get(sid, None)\n        if Model is None:\n            continue\n        await queues[sid].put((payload, Model))\n\n# workers would validate and emit results preserving order\n```\n\n## Follow-up Questions\n- How would you implement failure handling for invalid lines while preserving ordering?\n- How to measure throughput and detect backpressure saturation?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "python-q-8",
-        "questionId": "q-7075",
-        "question": "You have multiple CSV log files, each sorted by timestamp, and you must output a single stream of rows in increasing timestamp without loading all files into memory. Implement a Python generator merge_sorted_csv(file_paths) that yields dictionaries for each row (using the header as keys) in merged order, streaming until all files are exhausted?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a SerializerProxy that holds the current callable to deserialize lines and a lock to swap it atomically. For each line, acquire the lock-safe serializer, validate with the Pydantic model, route to",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design an asyncio data path that ingests NDJSON records with fields `plugin_id`, `event_ts`, and `payload`; dynamically loads plugins from a directory; and routes records to per-plugin bounded queues. Each plugin expose…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a generator that merges multiple sorted CSV logs by timestamp without loading full data. Maintain per-file iterators and a min-heap of (timestamp, file_index, row_dict). Seed with first row from e",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Stream rows with a lazy generator using csv.DictReader, never loading the whole file. Validate each row with a tiny Pydantic model (id, ts, amount). Maintain running min/max for amount as rows arrive,",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n- Evaluates streaming data merging across files without full materialization.\n- Exercises Python stdlib: heapq, csv, and generators under memory constraints.\n\n## Key Concepts\n- Generators, priority queue for multi-source merge, per-file iterators, lazy I/O, basic error handling.\n\n## Code Example\n```python\nimport csv, heapq\n\ndef merge_sorted_csv(file_paths):\n    files = [open(p, 'r', newline='') for p in file_paths]\n    readers = [csv.DictReader(f) for f in files]\n    heap = []\n    for i, rdr in enumerate(readers):\n        try:\n            row = next(rdr)\n            heap.append((row['timestamp'], i, row))\n        except StopIteration:\n            pass\n    heapq.heapify(heap)\n    while heap:\n        ts, idx, row = heapq.heappop(heap)\n        yield row\n        try:\n            nxt = next(readers[idx])\n            heapq.heappush(heap, (nxt['timestamp'], idx, nxt))\n        except StopIteration:\n            pass\n    for f in files:\n        f.close()\n```\n\n## Follow-up Questions\n- How handle missing/malformed timestamps?  \n- How adapt to different timestamp formats or large numbers of files?  \n- How to extend to streaming inputs that never end?",
+        "explanation": "## Why This Is Asked\nTests asyncio proficiency, per-key state management, and backpressure in a beginner-friendly Python task. It also validates practical data validation with Pydantic and memory-bounded design.\n\n## Key Concepts\n- asyncio queues and per-key state\n- in-order processing guarantees\n- bounded memory and backpressure\n- Pydantic validation for streamed JSON\n\n## Code Example\n```python\nfrom pydantic import BaseModel\nfrom typing import Dict\nimport asyncio\n\nclass Event(BaseModel):\n    id: int\n    user: str\n    action: str\n    ts: int\n\nasync def batcher(input_q: asyncio.Queue, sink_q: asyncio.Queue):\n    batch = []\n    first_ts = None\n    while True:\n        ev = await input_q.get()\n        if first_ts is None:\n            first_ts = ev.ts\n        batch.append(ev)\n        if len(batch) >= 3 or (ev.ts - first_ts) >= 1000:\n            await sink_q.put(batch)\n            batch = []\n            first_ts = None\n        input_q.task_done()\n```\n\n## Follow-up Questions\n- How would you test per-user ordering with out-of-order arrivals?\n- How would you tune maxsize to balance memory and latency for bursts?",
         "difficulty": "beginner"
       },
       {
         "id": "python-q-9",
-        "questionId": "q-5027",
-        "question": "Write a Python generator function stream_top_k_on_score(file_path, k) that reads a JSONL file where each line is a JSON object with fields 'user_id' (string) and 'score' (float). Ignore lines that are not valid JSON or lack fields. Maintain a min-heap of size k to track the top k by score (tie-break by smaller user_id). After processing each valid line, yield the current top-k as a list of (user_id, score) sorted by descending score?",
+        "questionId": "q-21599",
+        "question": "Implement a Python function process_logs(input_path, output_path, keyword, batch_size) that streams NDJSON lines from a log file. Each line is a JSON object with fields: timestamp (ISO 8601 string), level, user_id, message, value (float). The function should: - stream lines one by one; - only keep lines where level == 'INFO' and keyword is present in message; - accumulate batches of at most batch_size lines; - for each batch, compute the average of the 'value' field and write one output JSON line to output_path containing batch_start (timestamp of the first line in the batch), batch_size, and average_value; - preserve input order; - skip lines with invalid JSON or missing fields and count them as errors; - memory usage must be bounded by batch_size and the function should not load the entire input into memory?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Adopt per-tenant pipelines with bounded queues and a shared in-memory txn-log. Validate NDJSON lines with Pydantic; on ingest, dedupe by id and emit to the tenant's queue. Worker applies a two-phase c",
+            "text": "Implement per-partition asyncio tasks with bounded queues; read NDJSON from an HTTP/2 stream, validate with Pydantic, route by (tenant, service), batch by N or T, memory cap via a semaphore, and signa",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Maintain a min-heap of (score, user_id) with a maximum size of k. Read the file line by line, parsing each line with json.loads() within a try/except block to skip invalid JSON. For valid entries with both 'user_id' and…",
-            "isCorrect": true
+            "text": "Leverage an asyncio pipeline with a bounded queue, Pydantic validation, and per-user 5-minute tumbling windows. Guarantee exactly-once by maintaining a bounded in-memory dedup cache (LRU+TTL) plus a d",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement per-(tenant, user_id) coroutines feeding bounded queues, with one worker per key. Validate NDJSON via Pydantic, batch by N/T, compute score = sum(value) for event_type=='purchase' divided by",
-            "isCorrect": false
+            "text": "I would implement an iterator-based pipeline: stream lines with open(input_path) as f; parse json; if valid and level == 'INFO' and keyword in message: append to batch; on reaching batch_size, compute",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Propose an asyncio-based design with two bounded NDJSON streams, per-user state, and a watermark. Validate lines with Pydantic, index users by user_id, and keep a per-user FIFO of joined events. Emit",
+            "text": "Build a Python asyncio streaming processor that ingests NDJSON from a live HTTP endpoint, validates each record with a versioned Pydantic schema, and routes by region to per-region sinks with bounded queues. Implement o…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis problem tests your ability to implement streaming algorithms with bounded memory while providing real-time updates. It's a common pattern in data processing pipelines where you need to maintain top-k results without loading entire datasets into memory.\n\n## Key Concepts\n- **Generator patterns**: Yielding results incrementally enables memory-efficient processing\n- **Heap operations**: Using heapq provides O(log k) insertions and maintains the top-k efficiently\n- **Error handling**: Robust JSON parsing ensures the pipeline continues with malformed data\n- **Deterministic tie-breaking**: Consistent sorting order is crucial for reproducible results\n\n## Code Example\n```python\nimport json\nimport heapq\n\ndef stream_top_k_on_score(file_path, k):\n    \"\"\"Stream top-k results by score from a JSONL file.\n    \n    Args:\n        file_path: Path to JSONL file with user_id and score fields\n        k: Number of top results to maintain\n        \n    Yields:\n        List of (user_id, score) tuples sorted by descending score\n    \"\"\"\n    heap = []  # min-heap storing (score, user_id)\n    \n    with open(file_path, 'r', encoding='utf-8') as f:\n        for line in f:\n            try:\n                data = json.loads(line)\n                user_id = str(data['user_id'])\n                score = float(data['score'])\n                \n                # Maintain heap of size k\n                if len(heap) < k:\n                    heapq.heappush(heap, (score, user_id))\n                elif score > heap[0][0] or (score == heap[0][0] and user_id < heap[0][1]):\n                    heapq.heapreplace(heap, (score, user_id))\n                    \n            except (json.JSONDecodeError, KeyError, ValueError, TypeError):\n                continue  # Skip malformed lines\n            \n            # Yield sorted results: descending score, then ascending user_id\n            yield [(uid, sc) for sc, uid in sorted(heap, key=lambda x: (-x[0], x[1]))]\n```",
+        "explanation": "## Why This Is Asked\nTests a practical streaming pattern with bounded memory and deterministic batch results on real-world log data.\n\n## Key Concepts\n- NDJSON parsing and robust JSON handling\n- streaming I/O and memory efficiency\n- batching, order preservation, and simple aggregation\n- error counting and resilience\n\n## Code Example\n```javascript\nimport json\n\ndef process_logs(input_path, output_path, keyword, batch_size):\n    batch = []\n    batch_start = None\n    with open(input_path) as fin, open(output_path, 'w') as fout:\n        for line in fin:\n            try:\n                obj = json.loads(line)\n            except Exception:\n                continue\n            if obj.get('level') != 'INFO' or keyword not in obj.get('message',''):\n                continue\n            if not batch:\n                batch_start = obj.get('timestamp')\n            batch.append(obj)\n            if len(batch) >= batch_size:\n                avg = sum(x.get('value', 0) for x in batch) / len(batch)\n                fout.write(json.dumps({'batch_start': batch_start, 'batch_size': len(batch), 'average_value': avg}) + '\\n')\n                batch = []\n        if batch:\n            avg = sum(x.get('value', 0) for x in batch) / len(batch)\n            fout.write(json.dumps({'batch_start': batch_start, 'batch_size': len(batch), 'average_value': avg}) + '\\n')\n```\n\n## Follow-up Questions\n- How would you test with corrupted lines and verify error counts?\n- How would you adapt this to handle dynamic batch sizes or streaming sources with backpressure?",
         "difficulty": "beginner"
       },
       {
         "id": "python-q-10",
-        "questionId": "q-17473",
-        "question": "Beginner Python task: Implement a memory-efficient generator that reads a large CSV line-by-line from a file-like object, deduplicates rows by the 'id' column while preserving the first-seen order, and yields only unique rows without loading the entire file into memory. How would you do this?",
+        "questionId": "q-178",
+        "question": "In Python, when do `is` and `==` return different results, and why does this happen with object identity vs equality?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Per-session coroutines with a bounded queue and a sliding window: buffer (ts, amount) per session in a deque, evict items older than watermark. Maintain running sum; emit to sink when abs(new_sum - ol",
+            "text": "Use an asyncio-based streaming pipeline that maintains per-user, 5-minute tumbling windows in memory. Parse each NDJSON line, compute window_start = floor(ts to 5 minutes), and accumulate totals in a",
             "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use asyncio with per-symbol queues and a global PriorityQueue ordered by (deadline, symbol, seq). Validate lines via Pydantic models. Maintain per-symbol in-order sequence counters; batch until N item",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "`is` checks memory identity (same object), `==` checks value equality. Different for distinct objects with same values: `[1,2] is [1,2]` is False but `[1,2] == [1,2]` is True.",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Ingests lines via an async generator, buffers per category, flushes on batch size or timeout, computes per-batch average, and emits a small dict to the sink. Use per-category queues/deques and a singl",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Concept Overview\nPython distinguishes between object identity and value equality. `is` compares memory addresses using `id()`, while `==` compares values using `__eq__` method.\n\n## Implementation\n```python\n# Identity vs Equality\na = [1, 2, 3]\nb = [1, 2, 3]\nc = a\n\nprint(a == b)  # True - same values\nprint(a is b)  # False - different objects\nprint(a is c)  # True - same object\n\n# Integer optimization (small integers)\nx = 256\ny = 256\nprint(x is y)  # True - interned\n\nx = 257\ny = 257\nprint(x is y)  # False - different objects\n```\n\n## Trade-offs\n- `is`: Faster, checks if exactly same object\n- `==`: Slower, checks if values are equivalent\n- Use `is` for singletons (None, True, False)\n- Use `==` for value comparison\n\n## Common Pitfalls\n- Assuming `is` works for value comparison\n- Not understanding integer/string interning\n- Using `is` with mutable objects incorrectly\n- Forgetting that `==` can be overridden by custom classes",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "python-q-11",
+        "questionId": "q-1085",
+        "question": "You’re building a real-time log processor in Python for a messaging app. You receive a stream of JSON lines like {\"user_id\": 123, \"event\": \"message_sent\", \"ts\": 1610000000}. Emit only the first event per (user_id, event) within a 60-second sliding window. Design a memory-bounded, generator-based pipeline that reads from an iterable of strings and yields deduplicated dicts in order. Include edge cases and memory considerations?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a generator-based pipeline that reads lines, parses JSON, and yields the first dict for each (user_id, event) in a 60-second sliding window. Maintain a bounded TTL cache (OrderedDict) key->t",
+            "isCorrect": true
           },
           {
             "id": "b",
@@ -324,153 +354,153 @@
           },
           {
             "id": "c",
-            "text": "Use a memory-friendly generator that streams rows, tracks seen ids in a dict/set to preserve first-seen order, and yields only the first occurrence per id. Reads via csv.DictReader on a file-like obje",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Architect a reader that streams NDJSON via an async generator, dispatching each line to a per-schema queue keyed by schema_id. Register schema_id to Pydantic model (V1, V2). Hot-swap by atomically upd",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nStreaming dedup with order requires either generators or iterators and careful memory use. This tests Python basics plus a practical approach to large data.\n\n## Key Concepts\n- Generators and streaming IO\n- csv.DictReader and file-like objects\n- Order preservation with dicts/sets\n- Memory complexity O(u) where u is unique ids\n\n## Code Example\n```python\nimport csv\nfrom typing import TextIO, Dict, Iterator\n\ndef dedupe_csv_by_id(stream: TextIO, id_field='id') -> Iterator[Dict[str, str]]:\n    seen = set()\n    reader = csv.DictReader(stream)\n    for row in reader:\n        key = row.get(id_field)\n        if key is None:\n            continue\n        if key in seen:\n            continue\n        seen.add(key)\n        yield row\n```\n\n## Follow-up Questions\n- How would you modify to handle very large id spaces and potential memory pressure?\n- How would you add unit tests for duplicates, missing id, and empty input?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "python-q-11",
-        "questionId": "q-10800",
-        "question": "Design an asynchronous Python streaming processor that ingests NDJSON lines from an AsyncIterable[str], validates each line via a Pydantic model, and guarantees exactly-once processing by using a per-key id cache and idempotent sink semantics; ensure per-key in-order processing with bounded memory, a backpressured downstream sink, and pluggable retry/backoff. Provide a test scaffold simulating duplicates and retries?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Read NDJSON asynchronously from src, validate every line with Pydantic Record(id:int, category:str, weight:float). Keep a bounded counts map (LRU using OrderedDict). Increment per-category counts for",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Outline a per-key deduped async pipeline: ingest NDJSON lines, validate with Pydantic, track per-key last_seq to enforce in-order processing, and use a bounded LRU cache for recently seen ids to enabl",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Propose an async per-tenant queue system: assign each tenant its own worker, validate with Pydantic, enrich via an aiohttp call governed by a semaphore to enforce RPS, and emit to a sink with backpres",
+            "text": "Architect a concrete asyncio design: NDJSONRouter with a dynamic dict mapping (tenant, type) to asyncio.Queues, Pydantic-validated events, per-partition workers preserving order, and backpressure by a",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Propose a per-lang streaming window with async queues and per-lang state. Use a Pydantic model to validate each line; extract hashtags; keep a deque per language of events within W seconds; maintain a",
+            "text": "Use per-type FIFO buffers (one asyncio.Task per type) reading NDJSON lines, validate with Pydantic, append to batch, flush when N lines or T seconds elapsed. Compute per-batch: count, sum, min, max, m",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nExplainability: tests ability to design robust async pipelines with correctness under backpressure and failures.\n\n## Key Concepts\n- Per-key ordering\n- Exactly-once semantics\n- Bounded memory\n- Idempotent sinks\n- Backpressure\n\n## Code Example\n\n```python\n# Skeleton of per-key deduped processing (pseudo)\nasync def process(item):\n    key = item.key\n    if item.id in recent_ids[key]:\n        return\n    last_seq[key] = max(last_seq.get(key, 0), item.seq)\n    await sink.put(item)\n```\n\n## Follow-up Questions\n- How would you test exactly-once guarantees with simulated retries?\n- How would you scale the in-memory structures across multiple workers?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\n\nTests ability to design streaming pipelines with memory constraints and dedup logic without external stores.\n\n## Key Concepts\n\n- Generators and streaming data\n- Sliding window deduplication\n- TTL-based cache with eviction\n- Robust JSON parsing and field validation\n\n## Code Example\n\n```python\ndef dedup_stream(lines, window_seconds=60):\n    import json\n    from collections import deque, OrderedDict\n    cache = OrderedDict()\n    for line in lines:\n        obj = json.loads(line)\n        user = obj.get(\"user_id\")\n        evt = obj.get(\"event\")\n        ts = obj.get(\"ts\")\n        if user is None or evt is None or ts is None:\n            continue\n        key = (user, evt)\n        # evict stale\n        for k in list(cache):\n            if ts - cache[k] > window_seconds:\n                del cache[k]\n        if key in cache:\n            continue\n        cache[key] = ts\n        yield obj\n```\n\n## Follow-up Questions\n\n- How would you adapt for out-of-order arrivals? \n- How to scale with multiple processes?",
+        "difficulty": "intermediate"
       },
       {
         "id": "python-q-12",
-        "questionId": "q-9469",
-        "question": "Design an asynchronous Python pipeline that ingests NDJSON lines representing user events with fields tenant, user_id, event_type, value, ts; validate with Pydantic; partition by (tenant, user_id); batch per partition into micro-batches of at most N lines or T seconds; compute per-batch score = sum(value) for event_type == 'purchase' divided by batch size; emit to a downstream sink with backpressure. Add a runtime hot-reloadable policy that can change how to compute score for a given tenant without restart, and ensure per-user in-order processing and bounded memory. Provide a test plan simulating config changes and backpressure?",
+        "questionId": "q-3449",
+        "question": "You have a log file that grows indefinitely containing one numeric value per line (e.g., latency in ms) along with occasional non-numeric lines. Implement a Python function running_stats(file_path) that streams lines, ignores invalid ones, and after each valid line yields a tuple (count, mean, min, max) computed so far. Keep memory usage O(1)?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement per-(tenant, user_id) coroutines feeding bounded queues, with one worker per key. Validate NDJSON via Pydantic, batch by N/T, compute score = sum(value) for event_type=='purchase' divided by",
-            "isCorrect": true
+            "text": "Implement an asyncio pipeline: NDJSON lines with event_id, topic, value, ts validated by a Pydantic model; route events to topic-specific queues with limited size for backpressure. Each topic batches",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a Python asyncio pipeline that listens to a UDP multicast group delivering NDJSON lines. The pipeline should validate each line against a Pydantic model, deduplicate messages by message_id using a time-bounded Bl…",
+            "text": "Design a Python decorator factory that enforces per-key concurrency and rate limits for async callables. It should map each key (derived from function args) to an asyncio.Semaphore and a short sliding",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement an async NDJSON processor: ingest lines with user_id:int, amount:float; validate with Pydantic; group by user_id and batch per-user into micro-batches of at most N lines or T seconds; comput",
+            "text": "Use a Bloom-filter-backed streaming pipeline: read lines via a generator, check a Bloom filter; if a line is not present, yield it and add it to the filter; if present, skip. Persist the filter's bit",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Implement a Pydantic model for the line, accumulate per-endpoint stats in a dict like {endpoint: [count, total_latency]}. On each valid line, increment count and add latency. When 100 lines are proces",
-            "isCorrect": false
+            "text": "Implement a streaming function that reads file_path line by line, parses each line as float, skips invalid lines, and after each valid line yields (count, mean, min, max). Maintain only four scalars (",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests expertise in streaming Python, async partitioning, bounded memory, and dynamic policy changes without restarts.\n\n## Key Concepts\n- Async streaming with backpressure\n- Per-key (tenant, user_id) in-order processing\n- NDJSON validation via Pydantic\n- Runtime policy hot reload using shared state and locks\n- Memory budgeting for per-key queues\n\n## Code Example\n```python\n# Skeleton showing per-key dispatch and hot-reloadable policy\n```\n\n## Follow-up Questions\n- How would you instrument this to debug late or stuck partitions?\n- What changes to support fault tolerance and exactly-once semantics?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests ability to design a streaming statistic, avoids loading entire file, handles dirty data, and maintains simple O(1) state with a generator.\n\n## Key Concepts\n- Streaming I/O with generators\n- Online statistics (count, total, min, max)\n- Defensive parsing and error handling\n- Memory efficiency with large data\n\n## Code Example\n```python\ndef running_stats(file_path):\n    count = 0\n    total = 0.0\n    min_v = None\n    max_v = None\n    with open(file_path, 'r') as f:\n        for line in f:\n            line = line.strip()\n            try:\n                val = float(line)\n            except ValueError:\n                continue\n            count += 1\n            total += val\n            min_v = val if min_v is None else min(min_v, val)\n            max_v = val if max_v is None else max(max_v, val)\n            yield count, (total / count), min_v, max_v\n```\n\n## Follow-up Questions\n- How would you extend to handle NaN values or infinity?\n- How would you modify to support streaming from a network source with backpressure?",
+        "difficulty": "beginner"
       },
       {
         "id": "python-q-13",
-        "questionId": "q-5317",
-        "question": "Implement a Python function streaming_percentile(stream, p, buckets=2048, min_latency=0, max_latency=5000) that processes a continuous stream where each line is 'timestamp latency_ms'. It must maintain a memory-bounded histogram to estimate the p-th percentile in real time, clip out-of-range latencies, support reset, and expose get_percentile() to fetch current estimate without advancing the stream. Provide a minimal runnable example and a test plan?",
+        "questionId": "q-26010",
+        "question": "Design an asyncio-based NDJSON router in Python that ingests a high-velocity NDJSON stream, validates each line with a Pydantic model (id: str, category: str, ts: datetime, payload: dict), and routes records to per-category sinks backed by bounded asyncio.Queues. Ensure per-category in-order delivery and a runtime-configurable backpressure policy (log-and-drop vs stall) toggleable without restart. Persist last offsets per category to SQLite and replay on restart. Include a test harness with a fast producer and slow sinks?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Parse NDJSON lines with json.loads; for each user maintain a deque of timestamps; prune entries older than ts - window_seconds, append current ts, and yield {user_id: len(deque)}. This gives amortized",
+            "text": "Design a Python asyncio router with a per-topic bounded queue. Each topic gets a dedicated worker that validates lines via a Pydantic model (topic, payload, ts) and forwards to its sink. Backpressure",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement an async NDJSON reader that routes events by device_id. For each device, maintain a bounded t-digest and a sliding 5-minute window (deque of events). On each event, prune expired data, updat",
+            "text": "Design an AsyncRateLimiter class in Python to enforce per-user quotas of N requests per minute for async callers. Implement a sliding window with 1-second buckets to bound memory, guarded by per-user asyncio.Lock. Expos…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use asyncio to read NDJSON lines, validate with a Pydantic model (timestamp: datetime, level: str, message: str). For each line with level in {'ERROR','CRITICAL'}, bucket by minute (minute_key = times",
+            "text": "To satisfy, implement a single dispatcher that maps (tenant, event_type) to an internal asyncio.Queue with a fixed maxsize. Spawn a worker per partition that drains its queue to a sink. The dispatcher awaits queue.put()…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Maintain a fixed-size histogram over latency values to estimate a percentile in real time. For each input line, parse latency_ms, clamp to [min_latency, max_latency], map to a bucket, and increment. T",
+            "text": "Approach: maintain a dict of per-category queues with a shared router. Validate via Pydantic, enqueue to the target category queue, and apply backpressure with queue.put with a timeout for stall, or d",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nStreaming metrics need memory-bounded, fast percentiles without storing all samples. An approximate histogram balances accuracy and resource use.\n\n## Key Concepts\n- Streaming histograms for percentile estimation\n- Memory-bounded design with fixed buckets\n- Out-of-range clipping and reset support\n- Real-time read of current percentile without consuming data\n\n## Code Example\n```python\nclass StreamingPercentile:\n    def __init__(self, p, buckets=2048, min_latency=0, max_latency=5000):\n        self.p = p\n        self.buckets = buckets\n        self.min_latency = min_latency\n        self.max_latency = max_latency\n        self.counts = [0] * buckets\n        self.total = 0\n\n    def _bucket(self, value):\n        if value <= self.min_latency:\n            return 0\n        if value >= self.max_latency:\n            return self.buckets - 1\n        scale = (value - self.min_latency) / (self.max_latency - self.min_latency)\n        return int(scale * self.buckets)\n\n    def update(self, line):\n        parts = line.strip().split()\n        if len(parts) < 2:\n            return\n        try:\n            latency = float(parts[1])\n        except:\n            return\n        idx = self._bucket(latency)\n        self.counts[idx] += 1\n        self.total += 1\n\n    def get_percentile(self, p=None):\n        if p is None:\n            p = self.p\n        target = max(0.0, min(1.0, p))\n        if self.total == 0:\n            return None\n        threshold = self.total * target\n        acc = 0\n        for i, c in enumerate(self.counts):\n            acc += c\n            if acc >= threshold:\n                # rough back-mapping to a latency value\n                frac = (threshold - (acc - c)) / max(1, c)\n                return self.min_latency + (i + frac) * (self.max_latency - self.min_latency) / self.buckets\n        return self.max_latency\n\n    def reset(self):\n        self.counts = [0] * self.buckets\n        self.total = 0\n```\n\n## Follow-up Questions\n- How does bucket count affect accuracy and latency range changes?\n- How would you adapt this for dynamic min/max ranges?\n- How would you test stability under burst traffic or skewed distributions?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests ability to design a robust asyncio routing layer with per-category ordering, runtime-configurable backpressure, and durable replay across restarts. It also probes how a candidate handles schema validation, testability, and observability in a realistic data-plane scenario.\n\n## Key Concepts\n- Asyncio queues and per-key routing\n- Pydantic validation and schema evolution\n- Runtime backpressure policies (stall vs log-and-drop)\n- Durable offset storage (SQLite) and restart replay\n- Test harness design with fast producers and slow sinks\n\n## Code Example\n```python\nfrom pydantic import BaseModel\nfrom datetime import datetime\n\nclass Record(BaseModel):\n    id: str\n    category: str\n    ts: datetime\n    payload: dict\n```\n\n## Follow-up Questions\n- How would you scale this to multiple processes while preserving per-category order?\n- How would you derive and expose latency metrics with minimal overhead?",
+        "difficulty": "advanced"
       },
       {
         "id": "python-q-14",
-        "questionId": "q-29470",
-        "question": "Design an asyncio-based Python function that consumes NDJSON lines from an async generator src. Each line has id:int, tier:str, amount:float. Validate with Pydantic. For each tier, retain only the latest 100 items in memory. Every 50 valid lines, emit a summary to sink: batch_end: id, per_tier: {tier: [amounts]}. Ensure per-tier isolation and bounded memory, dropping older items. Provide a minimal runnable core?",
+        "questionId": "q-24090",
+        "question": "Beginner Python task: Build an async NDJSON consumer that ingests lines from an async generator. Each line is a JSON object: {\"user\": \"u123\", \"amount\": 12.5, \"ts\": 1610000000}. For each user, maintain a 60-second sliding window of events and emit the running sum of 'amount' for that user on every new line. Memory bounded by dropping old events; backpressure via a bounded asyncio.Queue. Include a tiny test harness with a fast producer and slow sink?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement an asyncio function that consumes NDJSON lines from an async generator src, validates each line with a Pydantic model, and buffers by tier using a per-tier deque with maxlen=100. Every 50 va",
+            "text": "Implement an asyncio NDJSON consumer: read lines from an async generator; each line {user, amount, ts}. For each user, keep a deque of (ts, amount) for last 60s, drop older entries, and emit the sum f",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "```python import asyncio import json from datetime import datetime, timedelta, timezone from collections import defaultdict, deque from typing import AsyncGenerator, Any from pydantic import BaseModel, ValidationError,…",
+            "text": "Ingest NDJSON via an async reader, partition by user_id, and keep per-user state: a dedup set of event_id and a batch buffer. Flush with MongoDB bulk_upsert when batch size N or timer T fires. Ensure",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement an SSE reader that yields NDJSON lines, validate with a Pydantic model, partition by user_id, batch per user by N lines or T seconds, and upsert into PostgreSQL on (user_id, event_id) to gua",
+            "text": "I would implement two bounded asyncio queues feeding per-source NDJSON readers, with each record validated via Pydantic before entering a per-key join buffer keyed by 'id'. The joiner maintains a 3-second sliding window…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Approach: Implement per-user asyncio queues within a global memory budget, batching by both N lines and T seconds, validated via Pydantic. Maintain a 60-second moving average per user. If a queue exceeds the configured…",
+            "text": "Use Python's `csv` module with generator functions to read files line-by-line. Implement `yield` in a custom generator that processes chunks, avoiding loading entire files. Combine with `itertools.islice` for batch proc…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design small, end-to-end async pipelines with per-key state and memory constraints. It checks validation, per-key isolation, and a clear emission cadence.\n\n## Key Concepts\n- Async generators with backpressure\n- Pydantic validation\n- Per-key buffering with deque(maxlen=100)\n- Emission cadence and memory bounds\n\n## Code Example\n```python\nfrom pydantic import BaseModel\nfrom collections import defaultdict, deque\nimport asyncio\n\nclass Item(BaseModel):\n    id: int\n    tier: str\n    amount: float\n\nasync def processor(src, sink):\n    buffers = defaultdict(lambda: deque(maxlen=100))\n    count = 0\n    async for line in src:\n        item = Item.parse_raw(line)\n        buffers[item.tier].append(item.amount)\n        count += 1\n        if count % 50 == 0:\n            summary = {tier: list(buf) for tier, buf in buffers.items()}\n            await sink.put({\"batch_end\": item.id, \"per_tier\": summary})\n```\n\n## Follow-up Questions\n- How would you test memory usage across many tiers?\n- How would you adapt to dynamic tier creation or backpressure when sink is slow?",
+        "explanation": "## Why This Is Asked\nTests practical async IO and per-user state management with memory bounds.\n\n## Key Concepts\n- Async IO and bounded queues for backpressure\n- Per-user sliding window implemented with deque\n- Time-based pruning and streaming aggregation\n- Lightweight testing harness and correctness checks\n\n## Code Example\n\n```python\nimport asyncio\nfrom collections import deque\nimport json\n\nasync def sink(item):\n    await asyncio.sleep(0)  # simulate async sink\n    print(item)\n\nclass SlidingWindowConsumer:\n    def __init__(self, window=60, maxsize=1000):\n        self.window = window\n        self.q = asyncio.Queue(maxsize=maxsize)\n        self.state = {}\n\n    async def feed(self, line: str):\n        await self.q.put(line)\n\n    async def run(self):\n        while True:\n            line = await self.q.get()\n            obj = json.loads(line)\n            user = obj[\"user\"]\n            ts = int(obj[\"ts\"])\n            amt = float(obj[\"amount\"])\n            dq = self.state.setdefault(user, deque())\n            dq.append((ts, amt))\n            cutoff = ts - self.window\n            while dq and dq[0][0] < cutoff:\n                dq.popleft()\n            total = sum(a for _, a in dq)\n            await sink({\"user\": user, \"sum\": total, \"ts\": ts})\n            self.q.task_done()\n```\n\n## Follow-up Questions\n- Edge cases with out-of-order timestamps?\n- How to extend for multiple sinks with backpressure?",
         "difficulty": "beginner"
       },
       {
         "id": "python-q-15",
-        "questionId": "q-25108",
-        "question": "Design a small streaming batcher in Python (beginner) that reads lines from a real-time text stream. Each line is 'id,timestamp,country'. Implement batch_stream(stream, N, T) that yields batches of at most N lines or every T seconds, whichever comes first. Validate lines with a Pydantic model (id:int, timestamp:datetime ISO8601, country:str(2)). For each batch, compute per-country counts and emit {'batch_end': last_id, 'counts': {'US': 5, ...}}. Keep memory bounded and log/skip invalid lines?",
+        "questionId": "q-29364",
+        "question": "Design a Python async NDJSON processor that consumes lines from an async source. Each line has event_id:str, user_id:str, action:str, ts:float. Validate with a Pydantic model. Maintain a per-user 60-second sliding window of seen event_ids and emit only if event_id hasn't appeared in the window. Prune old entries to bound memory; ensure backpressure with a bounded sink. Provide minimal runnable core and a basic test harness?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement batch_stream(stream, N, T) that yields batches of at most N lines or every T seconds. Validate lines with a Pydantic model (id:int, timestamp:datetime ISO8601, country:str(2)). For each batc",
-            "isCorrect": true
+            "text": "Approach: implement an asyncio pipeline that consumes NDJSON over UDP multicast, validates with a Pydantic model, partitions by cohort_id and event_type, and routes to per-partition bounded queues. Co",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use a central router that forwards lines to per-tenant bounded asyncio.Queues, with one dedicated worker per tenant to guarantee in-order processing. Maintain a global memory cap; a dynamic rate limiter adjusts per-tena…",
+            "text": "Create a Pydantic Event model, subscribe to the SSE endpoint with aiohttp, parse each event as Event, and for each user_id maintain a deque of timestamps in the last 10 seconds; prune old ones on each",
             "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "I would implement an asyncio-based processor that maintains per-trace state, storing start times per span_id in a bounded in-memory map (LRU up to 1000 traces). Each NDJSON line is validated via Pydan",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Maintain a per-user sliding window of seen event_ids (a deque of (event_id, ts) pairs) limited to 60 seconds. On each NDJSON line, validate with a Pydantic model, then check if event_id is already present in the user's…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests per-key state management, sliding window algorithms, and memory-bounded async processing in Python. It exercises correctness, minimal latency, and backpressure handling.\n\n## Key Concepts\n- Async NDJSON ingestion\n- Pydantic validation\n- Per-user state with sliding window\n- Memory bounding via time-based pruning\n- Backpressure with bounded sinks\n\n## Code Example\n```python\nfrom __future__ import annotations\nfrom collections import deque\nfrom dataclasses import dataclass, field\nfrom typing import AsyncIterator\nimport asyncio\nfrom pydantic import BaseModel, ValidationError\n\nclass Event(BaseModel):\n    event_id: str\n    user_id: str\n    action: str\n    ts: float\n\n@dataclass\nclass SlidingWindow:\n    events: deque = field(default_factory=deque)\n    window_seconds: float = 60.0\n\n    def add(self, event_id: str, ts: float) -> None:\n        self.events.append((event_id, ts))\n        self._prune(ts)\n\n    def has_seen(self, event_id: str, ts: float) -> bool:\n        self._prune(ts)\n        return any(eid == event_id for eid, _ in self.events)\n\n    def _prune(self, current_ts: float) -> None:\n        cutoff = current_ts - self.window_seconds\n        while self.events and self.events[0][1] < cutoff:\n            self.events.popleft()\n\n\nclass DedupProcessor:\n    def __init__(self, sink: asyncio.Queue, max_queue_size: int = 1000):\n        self.user_windows: dict[str, SlidingWindow] = {}\n        self.sink = sink\n        self.dropped = 0\n\n    async def process_line(self, line: str, current_ts: float) -> bool:\n        try:\n            event = Event.model_validate_json(line)\n        except ValidationError:\n            return False\n\n        user_window = self.user_windows.setdefault(\n            event.user_id, SlidingWindow()\n        )\n        if user_window.has_seen(event.event_id, current_ts):\n            return False\n\n        user_window.add(event.event_id, current_ts)\n        try:\n            self.sink.put_nowait(event)\n            return True\n        except asyncio.QueueFull:\n            self.dropped += 1\n            return False\n\n    def get_memory_usage(self) -> int:\n        return sum(len(w.events) for w in self.user_windows.values())\n\n\nasync def stream_ndjson(\n    source: AsyncIterator[str], sink: asyncio.Queue\n) -> tuple[int, int]:\n    processor = DedupProcessor(sink)\n    emitted = dropped = 0\n\n    async for line in source:\n        line = line.strip()\n        if not line:\n            continue\n        ts = asyncio.get_event_loop().time()\n        success = await processor.process_line(line, ts)\n        if success:\n            emitted += 1\n        else:\n            dropped += 1\n\n    return emitted, dropped\n\n\nasync def test_dedup_processor():\n    sink = asyncio.Queue(maxsize=10)\n    processor = DedupProcessor(sink)\n    ts = 0.0\n\n    events = [\n        Event(event_id=\"e1\", user_id=\"u1\", action=\"click\", ts=ts),\n        Event(event_id=\"e1\", user_id=\"u1\", action=\"click\", ts=ts + 1),\n        Event(event_id=\"e2\", user_id=\"u1\", action=\"submit\", ts=ts + 5),\n        Event(event_id=\"e3\", user_id=\"u2\", action=\"view\", ts=ts + 10),\n    ]\n\n    for e in events:\n        await processor.process_line(e.model_dump_json(), e.ts)\n\n    assert sink.qsize() == 3\n    assert sink.get_nowait().event_id == \"e1\"\n    assert sink.get_nowait().event_id == \"e2\"\n    assert sink.get_nowait().event_id == \"e3\"\n\n    ts = 100.0\n    await processor.process_line(\n        Event(event_id=\"e4\", user_id=\"u1\", action=\"click\", ts=ts).model_dump_json(),\n        ts\n    )\n    assert sink.qsize() == 1\n\n    print(f\"Memory usage: {processor.get_memory_usage()} entries\")\n    print(\"All tests passed!\")\n\n\nif __name__ == \"__main__\":\n    asyncio.run(test_dedup_processor())\n```",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "python-q-16",
+        "questionId": "q-27672",
+        "question": "Design an async Python processor that ingests NDJSON lines via an AsyncIterable[str]. Each line has: id (str), user_id (str), event (str), ts (int), value (float). Partition by user_id, batch per-user into micro-batches of at most N lines or T seconds. Validate with a Pydantic model. For each batch, compute per-user cumulative sum of value and a HyperLogLog sketch of event types; enrich lines by calling a bounded-rate external API per user (cached by user_id with TTL). Emit to a downstream sink with backpressure. Ensure per-user in-order processing and bounded memory, and handle late events via a per-user watermark. Include a concise test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a Python async pipeline that ingests NDJSON lines, validates each with a Pydantic model, partitions by tenant_id and event_type, batches per partition into micro-batches of at most N lines or T",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use per-user BatchHandler with an asyncio.Queue. Validate each line with a Pydantic model. Accumulate until N lines or T seconds, then process; for enrichment call a per-user rate-limited async API wi",
+            "isCorrect": true
           },
           {
             "id": "c",
@@ -479,82 +509,22 @@
           },
           {
             "id": "d",
-            "text": "Implement an asyncio-based NDJSON router in Python that ingests events with event_id, user_id, action, ts; validate with Pydantic; route by action to bounded per-action sinks using asyncio.Queues, pre",
+            "text": "Proposed answer: implement a single background consumer using an asyncio.Queue with a bounded size. The producer pushes lines; the consumer writes to disk and uses two simple token buckets (bytes and",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests ability to reason about streaming data, simple batching windows, and strict validation without heavy dependencies. It also probes memory management and error handling in a beginner-friendly setting.\n\n## Key Concepts\n\n- Streaming batch processing\n- Time- and size-based batching\n- Data validation with Pydantic\n- Per-batch aggregation and memory bounds\n\n## Code Example\n\n```python\nfrom typing import Iterator, Dict, Any\nfrom datetime import datetime\nfrom pydantic import BaseModel, ValidationError\n\nclass Line(BaseModel):\n    id: int\n    timestamp: datetime\n    country: str\n\ndef batch_stream(stream: Iterator[str], N: int, T: float):\n    batch = []\n    last_id = None\n    start = None\n    for raw in stream:\n        try:\n            line = Line.parse_raw(raw)\n        except ValidationError:\n            continue\n        batch.append(line)\n        last_id = line.id\n        if start is None:\n            start = __import__('time').time()\n        if len(batch) >= N:\n            yield batch, last_id\n            batch = []\n            start = None\n        elif __import__('time').time() - start >= T:\n            if batch:\n                yield batch, last_id\n            batch = []\n            start = None\n```\n\n## Follow-up Questions\n\n- How would you test this with a synthetic stream of lines?\n- How would you adapt to handle out-of-order timestamps within a batch?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "python-q-16",
-        "questionId": "q-19930",
-        "question": "Design an asynchronous Python streaming processor for NDJSON spans that simulates a distributed trace collection. Spans arrive potentially out of order across services; each span has trace_id, span_id, parent_id, service, start_ms, end_ms. Implement per-trace buffering to assemble complete traces, compute total duration, per-service counts, and emit TraceSummary to a sink. Ensure bounded memory, late-span handling via timeout, and pluggable sink?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a Pydantic model for validation, a deque to age-out entries, and a set for in-window ids. For each line: parse, validate, and convert ts to datetime. Pop aging entries beyond window_seconds, remov",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design an asyncio pipeline that ingests JSONL trades from a WebSocket, routes by symbol to per-symbol workers with a bounded 5-minute sliding window, computes VWAP and a volume profile, uses a hot-swa",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "I’d implement an asyncio-based span assembler. Parse NDJSON lines with a Pydantic Span model, buffer per trace_id including child spans and a pending set, and emit a TraceSummary once all children are",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Implement a Pydantic model for the line, accumulate per-endpoint stats in a dict like {endpoint: [count, total_latency]}. On each valid line, increment count and add latency. When 100 lines are proces",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nAssesses ability to design streaming stateful logic with memory bounds and late data handling in Python.\n\n## Key Concepts\n\n- Async streaming with asyncio\n- Per-trace buffering and out-of-order emission\n- Memory-bounded caches and backpressure\n\n## Code Example\n\n```python\n# Skeleton models for validation\nfrom pydantic import BaseModel\nfrom typing import Optional\n\nclass Span(BaseModel):\n    trace_id: str\n    span_id: str\n    parent_id: Optional[str]\n    service: str\n    start_ms: int\n    end_ms: int\n```\n\n## Follow-up Questions\n\n- How would you test memory usage at scale?\n- How would you extend to multi-process workers and a shared cache?",
+        "explanation": "## Why This Is Asked\n\nThis question probes async batching per key, backpressure, and memory budgeting in Python. It also tests optional features like caching, rate-limited enrichment, and a HyperLogLog sketch for cardinality.\n\n## Key Concepts\n\n- Async batch processing per key\n- Backpressure and bounded memory\n- Per-key watermark for late events\n- Caching and rate-limited external calls\n- HyperLogLog for cardinality\n\n## Code Example\n\n```python\n# Skeleton showing per-user batcher structure\nclass BatchHandler(Generic[T]):\n    ...\n```\n\n## Follow-up Questions\n\n- How would you test late events and watermark under high skew?\n- How would you implement minimal HyperLogLog in Python without extra deps?",
         "difficulty": "intermediate"
       },
       {
         "id": "python-q-17",
-        "questionId": "q-28801",
-        "question": "Design a beginner-friendly Python asyncio pipeline that consumes a Server-Sent Events (SSE) JSON stream from an HTTP endpoint emitting events with fields user_id (int), action (str), and ts (int). Validate with Pydantic, group by user_id, maintain a 10-second sliding window of events per user, and emit a per-user summary every second to a sink with counts in the last window. Ensure bounded memory and backpressure?",
+        "questionId": "q-22146",
+        "question": "Build an asyncio-based streaming processor in Python that ingests NDJSON lines from an async source, validates each line with a Pydantic model (event_id, user_id, ts, payload), deduplicates by event_id, partitions by user_id, and writes to a durable in-memory store with per-user queues. Implement watermarking to tolerate out-of-order events and guarantee idempotence across restarts. Provide a minimal test harness simulating late arrivals and a restart?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Approach: Implement per-user asyncio queues within a global memory budget, batching by both N lines and T seconds, validated via Pydantic. Maintain a 60-second moving average per user. If a queue exceeds the configured…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement an asyncio pipeline with a bounded Queue that feeds a validation worker. The worker validates NDJSON lines against a Pydantic model. For each user, maintain a deque of (timestamp, count) pairs representing a 5…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Create a Pydantic Event model, subscribe to the SSE endpoint with aiohttp, parse each event as Event, and for each user_id maintain a deque of timestamps in the last 10 seconds; prune old ones on each",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Implement a generator-based pipeline that reads lines, parses JSON, and yields the first dict for each (user_id, event) in a 60-second sliding window. Maintain a bounded TTL cache (OrderedDict) key->t",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "Why This Is Asked\\n\\nThis question tests practical streaming fundamentals: SSE ingestion, per-user state, bounded memory, and backpressure, all at beginner level. It also touches data validation with Pydantic and simple windowed aggregations.\\n\\nKey Concepts\\n- Async I/O with a streaming HTTP client\\n- Pydantic model validation\\n- Per-user state with bounded memory using deque\\n- Sliding window logic\\n- Backpressure via asyncio.Queue\\n\\nFollow-up Questions\\n- How would you test backpressure with a slow sink?\\n- How would you handle clock skew or late events?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "python-q-18",
-        "questionId": "q-1884",
-        "question": "Implement an asynchronous Python data transformer for a JSONL event stream where each line includes a 'version' field. Build transform_stream(input: AsyncIterable[str], schemas: Dict[int, Type[BaseModel]]) that validates each line against its versioned Pydantic model, applies a version-aware field mapping, and outputs transformed JSONL lines to a downstream sink while guaranteeing per-version in-order processing, memory-bounded streaming, and backpressure. Include a small test scaffold showing a v1→v2 migration?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use an AsyncStream with per-version queues. Validate by loading schemas[version] and applying mapping; emit transformed JSON via an async sink. Maintain in-order by preserving sequence_id per version",
+            "text": "Use an async generator to stream NDJSON from the source, validate each line against a Pydantic model with event_id, user_id, ts, and payload fields, deduplicate entries using a TTL-based in-memory cache keyed by event_i…",
             "isCorrect": true
           },
           {
@@ -564,201 +534,231 @@
           },
           {
             "id": "c",
-            "text": "Use a separate bounded asyncio.Queue per account, spawn workers per queue, measure sink latency, and scale workers when latency exceeds a threshold. Validate each line with a Pydantic model, enqueue,",
+            "text": "To meet scale and latency, implement a central dispatcher that routes each input line to a per-key queue guarded by an asyncio.Lock. Spawn a dedicated task per key that drains its queue in-order and e",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Propose a generator-based approach: stream lines, json.loads each line, validate with a minimal TypedDict{level:str, ts:int, msg:str}. Maintain a per-level counter and a total line counter; on every 5",
+            "text": "Use Redis sorted sets with timestamps as scores and request IDs as members. For each request, ZADD current timestamp, ZREMRANGEBYSCORE to remove old entries, then ZCARD to count. Use Lua script for atomic operations to…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question probes the ability to design a robust streaming Python solution that handles schema evolution, backpressure, and memory constraints in real-time data processing.\n\n## Key Concepts\n- AsyncIO pipelines with bounded queues\n- Versioned Pydantic models loaded from a registry\n- In-order processing across dynamic schemas\n- Safe error handling and backpressure-driven flow control\n\n## Code Example\n```python\nfrom typing import AsyncIterable, Dict, Type\nfrom pydantic import BaseModel\nimport asyncio\nimport json\n\nasync def transform_stream(\n    input_lines: AsyncIterable[str],\n    schemas: Dict[int, Type[BaseModel]],\n    mapper: Dict[int, callable],\n    sink: asyncio.Queue\n) -> None:\n    # simplified skeleton\n    queues = {v: asyncio.Queue(maxsize=1024) for v in schemas}\n    async def worker(version: int, q: asyncio.Queue):\n        while True:\n            line = await q.get()\n            if line is None:\n                break\n            data = json.loads(line)\n            model = schemas[version](**data)  # validate\n            out = mapper[version](model)\n            await sink.put(json.dumps(out.dict()))\n            q.task_done()\n\n    procs = [asyncio.create_task(worker(v, queues[v])) for v in schemas]\n    async for line in input_lines:\n        data = json.loads(line)\n        ver = data.get(\"version\")\n        if ver not in queues:\n            continue\n        await queues[ver].put(line)\n    for q in queues.values():\n        await q.put(None)\n    await asyncio.gather(*procs)\n```\n\n## Follow-up Questions\n- How would you handle missing or unknown versions gracefully?\n- How would you test migration paths between versions?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nThis question assesses the ability to design stateful streaming systems with deduplication, backpressure handling, and restart durability.\n\n## Key Concepts\n- Async streams with Python asyncio\n- Pydantic validation for schema enforcement\n- Event deduplication by unique event_id\n- Per-user partitioning with bounded queues for backpressure\n- Watermarking to handle late-arriving events\n- Durable in-memory log with replay capability for crash recovery\n\n## Code Example\nSee implementation in repository.\n\n## Follow-up Questions\n- How would you extend this to support multi-tenant billing or rate limiting per user?\n- How would you scale this horizontally across multiple workers?\n- What trade-offs would you make between memory usage and deduplication window size?",
+        "difficulty": "advanced"
       },
       {
-        "id": "python-q-19",
-        "questionId": "q-24090",
-        "question": "Beginner Python task: Build an async NDJSON consumer that ingests lines from an async generator. Each line is a JSON object: {\"user\": \"u123\", \"amount\": 12.5, \"ts\": 1610000000}. For each user, maintain a 60-second sliding window of events and emit the running sum of 'amount' for that user on every new line. Memory bounded by dropping old events; backpressure via a bounded asyncio.Queue. Include a tiny test harness with a fast producer and slow sink?",
+        "id": "python-q-18",
+        "questionId": "q-12958",
+        "question": "Task: Implement an async NDJSON router in Python that ingests lines from an async source, validates each with a Pydantic model, and routes records to per-category sinks via bounded asyncio.Queues. Each category must preserve line order, backpressure must be applied when any sink queue is full (log and drop, or stall depending on a flag). Provide a small test harness that simulates a fast source and slow sinks?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a dict of per-user asyncio.Queues (maxsize=50). Each user runs a batcher: collect events until 3 items or 1s from the first item, then emit a batch to a bounded sink Queue. Validate each line with",
+            "text": "Implement an async generator that reads NDJSON lines, validates them with a Pydantic model (id: str, ts: int, payload: dict), and maintains a TTL cache using a dictionary mapping id → expiry time alongside a deque to tr…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "To solve this, implement an async producer-consumer chain using an asyncio.Queue, a Pydantic Event model for validation, a per-user deduplicator with an LRU/minute cache (action_id seen timestamps) to",
+            "text": "Outline a per-key deduped async pipeline: ingest NDJSON lines, validate with Pydantic, track per-key last_seq to enforce in-order processing, and use a bounded LRU cache for recently seen ids to enabl",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement a Python generator function stream_grouped_batches(path, key='user_id', max_batch=50, timeout=2.0) that reads an NDJSON file line by line, groups objects by the given key into per-key micro-",
+            "text": "Propose an async per-user micro-batcher: batch NDJSON events by user_id into batches of at most N lines or T seconds, then enrich with a single external async service per user. Coalesce in-flight enri",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Implement an asyncio NDJSON consumer: read lines from an async generator; each line {user, amount, ts}. For each user, keep a deque of (ts, amount) for last 60s, drop older entries, and emit the sum f",
+            "text": "Create an async generator as the source, a Pydantic BaseModel for validation, and a dict of asyncio.Queues per category with maxsize. For each line, parse JSON, validate, and put into the correspondin",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical async IO and per-user state management with memory bounds.\n\n## Key Concepts\n- Async IO and bounded queues for backpressure\n- Per-user sliding window implemented with deque\n- Time-based pruning and streaming aggregation\n- Lightweight testing harness and correctness checks\n\n## Code Example\n\n```python\nimport asyncio\nfrom collections import deque\nimport json\n\nasync def sink(item):\n    await asyncio.sleep(0)  # simulate async sink\n    print(item)\n\nclass SlidingWindowConsumer:\n    def __init__(self, window=60, maxsize=1000):\n        self.window = window\n        self.q = asyncio.Queue(maxsize=maxsize)\n        self.state = {}\n\n    async def feed(self, line: str):\n        await self.q.put(line)\n\n    async def run(self):\n        while True:\n            line = await self.q.get()\n            obj = json.loads(line)\n            user = obj[\"user\"]\n            ts = int(obj[\"ts\"])\n            amt = float(obj[\"amount\"])\n            dq = self.state.setdefault(user, deque())\n            dq.append((ts, amt))\n            cutoff = ts - self.window\n            while dq and dq[0][0] < cutoff:\n                dq.popleft()\n            total = sum(a for _, a in dq)\n            await sink({\"user\": user, \"sum\": total, \"ts\": ts})\n            self.q.task_done()\n```\n\n## Follow-up Questions\n- Edge cases with out-of-order timestamps?\n- How to extend for multiple sinks with backpressure?",
+        "explanation": "## Why This Is Asked\nTests practical asyncio composition, per-key routing, and backpressure control using bounded queues. It also touches JSON parsing, data validation, and testability with a simple harness.\n\n## Key Concepts\n- Async IO with asyncio\n- NDJSON parsing and JSON validation with Pydantic\n- Per-category routing with a dict of bounded asyncio.Queues\n- Backpressure handling: drop vs. stall, logging, and order preservation\n\n## Code Example\n```python\nfrom typing import Dict\nimport asyncio\nimport json\nfrom pydantic import BaseModel\n\nclass Record(BaseModel):\n    category: str\n    value: float\n\nasync def ndjson_source(lines: int, delay: float):\n    for i in range(lines):\n        yield json.dumps({\"category\": f\"cat{i%3}\", \"value\": i})\n        await asyncio.sleep(delay)\n\nasync def router(source, sinks: Dict[str, asyncio.Queue], drop_on_full: bool = True):\n    async for line in source:\n        obj = json.loads(line)\n        rec = Record(**obj)\n        q = sinks.setdefault(rec.category, asyncio.Queue(maxsize=5))\n        if q.full() and drop_on_full:\n            print(f\"Drop: {rec}\")\n            continue\n        await q.put(rec)\n\nasync def sink_worker(name: str, q: asyncio.Queue):\n    while True:\n        rec = await q.get()\n        await asyncio.sleep(0.1)  # simulate work\n        print(f\"{name} consumed {rec}\")\n        q.task_done()\n\nasync def main():\n    source = ndjson_source(20, 0.02)\n    sinks: Dict[str, asyncio.Queue] = {}\n    # start pump and per-category sinks after the first few lines\n    task = asyncio.create_task(router(source, sinks))\n    # small demo: start workers after buffers exist\n    await asyncio.sleep(0.2)\n    for cat, q in list(sinks.items()):\n        asyncio.create_task(sink_worker(cat, q))\n    await task\n\nif __name__ == '__main__':\n    asyncio.run(main())\n```\n\n## Follow-up Questions\n- How would you flip the policy to stall producers instead of dropping when a queue is full?\n- How would you add metrics for dropped records and per-category throughput?",
         "difficulty": "beginner"
       },
       {
-        "id": "python-q-20",
-        "questionId": "q-29754",
-        "question": "In Python, design a streaming processor that ingests an async HTTP streaming JSON lines feed from IoT devices, validates lines with Pydantic, partitions by device_id, batches into micro-batches of at most N lines or after T seconds, computes per-batch the 90th percentile of a metric named latency_ms, and writes results to an asynchronous sink with backpressure. Implement a dynamic backpressure strategy that slows ingestion when sink latency exceeds threshold, while guaranteeing per-device in-order processing and bounded memory. Provide a test plan with varying arrival rates and sink slowdowns?",
+        "id": "python-q-19",
+        "questionId": "q-5317",
+        "question": "Implement a Python function streaming_percentile(stream, p, buckets=2048, min_latency=0, max_latency=5000) that processes a continuous stream where each line is 'timestamp latency_ms'. It must maintain a memory-bounded histogram to estimate the p-th percentile in real time, clip out-of-range latencies, support reset, and expose get_percentile() to fetch current estimate without advancing the stream. Provide a minimal runnable example and a test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use per-device asyncio Tasks with dedicated queues, validate each line via a Pydantic model, batch by N items or T seconds per device, compute 90th percentile latency with numpy.percentile, and emit t",
-            "isCorrect": true
+            "text": "Plan: Build an async streaming processor that ingests NDJSON line-by-line. For each event, validate using Pydantic's SensorEvent model (sensor_id, ts, reading). Maintain a per-sensor sliding window (deque) of the last 5…",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use a Pydantic model for validation, a deque to age-out entries, and a set for in-window ids. For each line: parse, validate, and convert ts to datetime. Pop aging entries beyond window_seconds, remov",
+            "text": "Define a generator that opens the file and uses csv.DictReader, yielding rows only when all required_fields exist and have non-empty values; track skipped rows with a counter. Use typing.Iterator[Dict",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use an async generator consuming the source, maintain a dict of sensor_id -> deque[(ts, value)] and a running sum. For each line, append, drop entries with ts < current_ts - window_seconds, update sum",
+            "text": "Maintain a fixed-size histogram over latency values to estimate a percentile in real time. For each input line, parse latency_ms, clamp to [min_latency, max_latency], map to a bucket, and increment. T",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use a Python CLI (argparse) named linescan. Recursively find files with Path(root).rglob('*'+ext). For each file, open with encoding='utf-8', errors='ignore', stream read line by line to count lines a",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nStreaming metrics need memory-bounded, fast percentiles without storing all samples. An approximate histogram balances accuracy and resource use.\n\n## Key Concepts\n- Streaming histograms for percentile estimation\n- Memory-bounded design with fixed buckets\n- Out-of-range clipping and reset support\n- Real-time read of current percentile without consuming data\n\n## Code Example\n```python\nclass StreamingPercentile:\n    def __init__(self, p, buckets=2048, min_latency=0, max_latency=5000):\n        self.p = p\n        self.buckets = buckets\n        self.min_latency = min_latency\n        self.max_latency = max_latency\n        self.counts = [0] * buckets\n        self.total = 0\n\n    def _bucket(self, value):\n        if value <= self.min_latency:\n            return 0\n        if value >= self.max_latency:\n            return self.buckets - 1\n        scale = (value - self.min_latency) / (self.max_latency - self.min_latency)\n        return int(scale * self.buckets)\n\n    def update(self, line):\n        parts = line.strip().split()\n        if len(parts) < 2:\n            return\n        try:\n            latency = float(parts[1])\n        except:\n            return\n        idx = self._bucket(latency)\n        self.counts[idx] += 1\n        self.total += 1\n\n    def get_percentile(self, p=None):\n        if p is None:\n            p = self.p\n        target = max(0.0, min(1.0, p))\n        if self.total == 0:\n            return None\n        threshold = self.total * target\n        acc = 0\n        for i, c in enumerate(self.counts):\n            acc += c\n            if acc >= threshold:\n                # rough back-mapping to a latency value\n                frac = (threshold - (acc - c)) / max(1, c)\n                return self.min_latency + (i + frac) * (self.max_latency - self.min_latency) / self.buckets\n        return self.max_latency\n\n    def reset(self):\n        self.counts = [0] * self.buckets\n        self.total = 0\n```\n\n## Follow-up Questions\n- How does bucket count affect accuracy and latency range changes?\n- How would you adapt this for dynamic min/max ranges?\n- How would you test stability under burst traffic or skewed distributions?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "python-q-20",
+        "questionId": "q-27738",
+        "question": "In Python, design an async streaming processor that consumes an async iterable of JSON NDJSON lines from a long-polling HTTP endpoint. Each line contains: service (str), ts (int, epoch ms), metric (str), value (float). Partition by service, maintain per-service state with a bounded sliding window of the last N events, compute per-service moving average of value for batches collected within a time window T or until N lines arrive, and emit per-service aggregates to a sink with backpressure. Support dynamic service additions, and apply a watermark-based lateness policy to drop events older than current_watermark. Provide a minimal test plan with out-of-order and late events?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Leverage asyncio with per-service task handlers, a bounded sliding window (deque) per service to compute moving averages, and an async sink queue with backpressure. Use a watermark based on min(ts) -",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use a generator that reads one line at a time, json.loads the line, validate: id is str, action in {click, view, purchase}, ts is int. If valid, yield Event(id, action, ts); else increment invalid. Us",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "I would parse each NDJSON line to extract the endpoint and latency_ms fields. For each record, I'd compute the bucket using integer division: `bucket = (latency_ms // bucket_width) * bucket_width`, creating ranges like…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Adopt per-tenant pipelines with bounded queues and a shared in-memory txn-log. Validate NDJSON lines with Pydantic; on ingest, dedupe by id and emit to the tenant's queue. Worker applies a two-phase c",
+            "text": "Consume NDJSON lines asynchronously, validate with a Pydantic model, and batch by user_id into micro-batches of at most N lines or T seconds. For each user flush, compute the 95th percentile of amount",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question probes real-time streaming design: per-device in-order processing, dynamic backpressure, bounded memory, and on-the-fly statistics (90th percentile). It also tests integration of async I/O, data validation, and testability in a practical IoT telemetry setting.\n\n## Key Concepts\n- Async streaming and per-device partitioning\n- Micro-batching with thresholds N and T\n- Pydantic validation and schema evolution handling\n- Percentile computation (90th) on batch latency\n- Backpressure strategies and bounded memory\n\n## Code Example\n```python\nfrom pydantic import BaseModel\nfrom typing import List\nimport numpy as np\n\nclass Event(BaseModel):\n    device_id: str\n    timestamp: int\n    latency_ms: float\n    value: float\n\n# Skeleton: per-device batch, validate, compute percentile, emit\n```\n\n## Follow-up Questions\n- How would you handle clock drift across devices in this design?\n- What tests would you add to simulate bursty arrivals with a slow sink?",
+        "explanation": "## Why This Is Asked\nThis question probes real-world streaming challenges: dynamic per-key partitions, bounded memory state, backpressure, and watermarking for late events. It tests asyncio design, memory discipline, and test planning.\n\n## Key Concepts\n- Async streaming and backpressure\n- Per-key sliding window state\n- Watermark-based lateness handling\n- Dynamic key management and deterministic output\n\n## Code Example\n\n```python\n# sketch\n```\n\n## Follow-up Questions\n\n- How would you verify correctness with late events?\n- How would you scale to thousands of services?",
         "difficulty": "intermediate"
       },
       {
         "id": "python-q-21",
-        "questionId": "q-3420",
-        "question": "Design a Python async event router that ingests NDJSON lines from an AsyncIterable[str], routes each line to a per-type Pydantic model registry based on a 'type' field, supports hot-swapping of routing rules at runtime without restart, guarantees per-type in-order processing, and uses bounded asyncio.Queues to provide backpressure to downstream sinks. Include a minimal test scaffold showing a type A mapping to V1 and a runtime swap to V2?",
+        "questionId": "q-24288",
+        "question": "Implement an asyncio-based NDJSON processor in Python. Each line is a JSON object with fields: {\"user_id\": str, \"value\": float, \"ts\": int}. Read lines from an async generator, validate with a tiny dataclass, and group by user_id into micro-batches of at most N lines or T seconds. For each batch, compute the sum of value per user and emit {\"user_id\": ..., \"sum\": ...} to a sink via a bounded asyncio.Queue. Ensure per-user in-order processing and bounded memory?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design an AsyncRouter with a registry mapping type->Pydantic model, guarded by an asyncio.Lock, plus per-type bounded queues and a dedicated consumer per type to preserve in-order processing. Implemen",
+            "text": "Maintain an in-memory dictionary keyed by user_id to accumulate batches, with per-user queues and a dedicated worker per user that flushes when either N items accumulate or T seconds elapse. Validate each line using a l…",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Use a gRPC bidi stream; decode protobuf to a Pydantic model; key by customer_id; per-customer sliding window of 5 minutes stored in Redis with sorted sets; incremental avg update via Redis Lua script;",
+            "text": "Design a versioned, async NDJSON pipeline: maintain a registry mapping schema_version -> Pydantic model; validate each line with the matching model; route to per-version sinks via bounded asyncio.Queu",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Leverage an asyncio pipeline with a bounded queue, Pydantic validation, and per-user 5-minute tumbling windows. Guarantee exactly-once by maintaining a bounded in-memory dedup cache (LRU+TTL) plus a d",
+            "text": "I'll implement an asyncio-driven per-device processor. Each device id gets a 60-second sliding window of temperature values stored in a deque and a TDigest to compute the 95th percentile. NDJSON lines",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Read NDJSON from stdin, validate with a Pydantic model, convert amount to Decimal, and keep a per-user sliding window of the last 60 amounts using a deque plus a running sum. After each valid line, up",
+            "text": "Create a Pydantic Event model, subscribe to the SSE endpoint with aiohttp, parse each event as Event, and for each user_id maintain a deque of timestamps in the last 10 seconds; prune old ones on each",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question tests dynamic routing, hot-swapping, per-type in-order processing, and backpressure in an async Python pipeline. It also probes correctness under concurrent updates and memory safety.\n\n## Key Concepts\n\n- Asyncio queues for per-type backpressure\n- Atomic hot-swap of routing rules with asyncio.Lock\n- Per-type in-order workers\n- Pydantic validation and error handling\n- End-to-end testing scaffold\n\n## Code Example\n\n```python\n# Skeleton illustrating the pattern; full impl expected in interview\nfrom typing import Dict, Type\nfrom pydantic import BaseModel\nimport asyncio\n\nclass Router:\n    def __init__(self, registry: Dict[str, Type[BaseModel]]):\n        self._registry = registry\n        self._lock = asyncio.Lock()\n        self._queues: Dict[str, asyncio.Queue] = {}\n        self._consumers: Dict[str, asyncio.Task] = {}\n\n    async def hot_swap(self, new_registry: Dict[str, Type[BaseModel]]):\n        async with self._lock:\n            self._registry = new_registry\n            # optionally swap queues/consumers if needed\n```\n\n## Follow-up Questions\n\n- How would you test race conditions during hot_swap?\n- How would you scale to many types while preserving fairness?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nThis question assesses understanding of asyncio primitives, per-key batching strategies, backpressure mechanisms, and minimal-dependency validation. It emphasizes bounded memory usage, per-user ordering guarantees, and safe producer-consumer coordination via queues.\n\n## Key Concepts\n- Async generators and bounded queues\n- Per-key batching with time-based and count-based flush conditions\n- Lightweight validation using dataclasses\n- Backpressure via bounded queue semantics\n\n## Code Example\n```python\nfrom dataclasses import dataclass\nimport asyncio\nfrom typing import AsyncGenerator\n\n@dataclass\nclass Event:\n    user_id: str\n    value: float\n    ts: int\n\n    def validate(self) -> bool:\n        return (\n            isinstance(self.user_id, str)\n            and isinstance(self.value, float)\n            and isinstance(self.ts, int)\n        )\n\n# Core processing loop with per-user batching\nasync def process_events(\n    source: AsyncGenerator[dict, None],\n    sink: asyncio.Queue,\n    max_batch_size: int = 100,\n    timeout: float = 1.0\n):\n    user_batches: dict[str, list[Event]] = {}\n    pending_tasks: set[asyncio.Task] = set()\n\n    async def flush_user(user_id: str):\n        if user_id not in user_batches or not user_batches[user_id]:\n            return\n        \n        batch = user_batches.pop(user_id)\n        user_sum = sum(e.value for e in batch)\n        await sink.put({\"user_id\": user_id, \"sum\": user_sum})\n\n    async def timer_task(user_id: str):\n        await asyncio.sleep(timeout)\n        await flush_user(user_id)\n\n    async for raw in source:\n        event = Event(**raw)\n        if not event.validate():\n            continue\n\n        if event.user_id not in user_batches:\n            user_batches[event.user_id] = []\n            task = asyncio.create_task(timer_task(event.user_id))\n            pending_tasks.add(task)\n            task.add_done_callback(pending_tasks.discard)\n\n        user_batches[event.user_id].append(event)\n\n        if len(user_batches[event.user_id]) >= max_batch_size:\n            await flush_user(event.user_id)\n\n    for user_id in list(user_batches.keys()):\n        await flush_user(user_id)\n```",
+        "difficulty": "beginner"
       },
       {
         "id": "python-q-22",
-        "questionId": "q-8588",
-        "question": "Design an asynchronous Python router that ingests NDJSON events from an AsyncIterable[str], each event has fields 'service', 'endpoint', and 'payload'. Route events to per-service HTTP endpoints using aiohttp, enforce per-service token-bucket rate limits with configurable capacity and refill rate, preserve per-service in-order delivery, and bound memory with per-service queues. Support hot-reloading routing rules without restart and backpressure to upstream. Include a minimal test scaffold simulating bursts and config reload?",
+        "questionId": "q-5382",
+        "question": "Design a streaming normalizer that accepts records as either dicts with keys 'id' and 'value' or objects implementing a Protocol with properties id and value. Implement a memory-efficient transformer that yields canonical dicts {'id': id, 'value': value} in input order without materializing all records. Use typing.Protocol to define the interface, and provide a minimal test showing both input shapes producing identical CSV output?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Connect to a WebSocket feed; validate each message with a Pydantic model; dispatch to per-topic asyncio.Queues; ensure in-order delivery by tracking last_id per topic; pause reads when any queue hits",
+            "text": "Use a Bloom-filter-backed streaming pipeline: read lines via a generator, check a Bloom filter; if a line is not present, yield it and add it to the filter; if present, skip. Persist the filter's bit",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design an advanced Python asyncio streaming processor that: 1. Ingests NDJSON records from an async source 2. Validates each item using a versioned Pydantic model with backward-compatible schema evolution (new fields ad…",
+            "text": "I would implement sanitize_events(stream) as a streaming generator: for line in stream, json.loads; validate user_id (str), email (str), action (str), ts (int); skip invalid. Mask email local part: ke",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use per-service async workers with bounded asyncio.Queues to preserve in-order delivery. Implement a token-bucket limiter per service (capacity C, refill rate R). Parse NDJSON lines, dispatch payload",
+            "text": "Use a generator normalize_records(source) with a Protocol: class RecordLike(Protocol): id: object; value: object. For each item, if isinstance(item, dict): id = item['id']; value = item['value']; else",
             "isCorrect": true
           },
           {
             "id": "d",
-            "text": "This uses a generator that reads the file line by line, parses with split(), and updates a dict of user_id -> Counter(actions). Malformed lines are skipped. After batch_size hits, yield a shallow copy",
+            "text": "Use a Count-Min Sketch with configurable dimensions (width, depth) to estimate item frequencies, combined with a min-heap keyed by estimated counts to maintain the top-K elements. Implement a sliding window using a dequ…",
             "isCorrect": false
           }
         ],
-        "explanation": "Why this is asked\n- Tests ability to design a scalable, production-grade async router with per-service isolation\n- Exercises correct use of asyncio primitives, backpressure, and dynamic config\n\nKey concepts\n- Asyncio queues and per-service workers\n- Token-bucket rate limiting and backpressure\n- Hot-reload of routing rules without restart\n- Bounded memory and in-order guarantees\n\nCode example\n```python\n# Skeleton illustrating per-service worker pattern\nimport asyncio\nfrom aiohttp import ClientSession\n\nclass Router:\n    def __init__(self, routing: dict, cap: int, refill: float):\n        self.routing = routing\n        self.cap = cap\n        self.refill = refill\n        self.queues = {s: asyncio.Queue(maxsize=cap) for s in routing}\n        self.locks = {s: asyncio.Lock() for s in routing}\n        self.tokens = {s: cap for s in routing}\n\n    async def run_service(self, name, url):\n        async with ClientSession() as sess:\n            while True:\n                event = await self.queues[name].get()\n                # post with backoff on failure\n                await sess.post(url, json=event)\n                self.queues[name].task_done()\n\n    async def start(self):\n        tasks = [self.run_service(n, self.routing[n]['url']) for n in self.routing]\n        await asyncio.gather(*tasks)\n```",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests memory-aware data normalization and duck typing through Protocols, ensuring streaming without full materialization.\n\n## Key Concepts\n- typing.Protocol for structural typing\n- runtime type handling for dict vs object\n- generator-based streaming with O(1) extra memory\n- minimal, deterministic tests comparing inputs across shapes\n\n## Code Example\n```python\nfrom typing import Protocol, Iterable, Dict\n\nclass RecordLike(Protocol):\n    id: object\n    value: object\n\ndef normalize_records(source: Iterable[RecordLike]) -> Iterable[Dict[str, object]]:\n    for item in source:\n        if isinstance(item, dict):\n            yield {\"id\": item[\"id\"], \"value\": item[\"value\"]}\n        else:\n            yield {\"id\": getattr(item, \"id\"), \"value\": getattr(item, \"value\")}\n```\n\n## Follow-up Questions\n- How would you handle missing keys/attributes gracefully?\n- How does this scale with very large streams and multiple producers?",
+        "difficulty": "intermediate"
       },
       {
         "id": "python-q-23",
-        "questionId": "q-559",
-        "question": "You're building a data processing pipeline that needs to handle large CSV files efficiently. How would you implement a memory-efficient solution using Python generators to process files that don't fit in RAM?",
+        "questionId": "q-1675",
+        "question": "Design a memory-bounded streaming processor in Python for a JSONL event stream with fields: timestamp, service, event_type, payload. Group by (service, event_type), maintain an in-order per-key queue with bounded capacity, and emit a 60-second rolling histogram of payload sizes per group to a downstream sink. Ensure backpressure via per-key queues and a global memory cap, and provide a test plan with skewed keys and slow sinks?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement a robust streaming architecture with a disk-based write-ahead log (WAL) that records each committed batch using unique batch identifiers and per-event sequence numbers. Employ a two-phase commit protocol with…",
+            "text": "Approach: implement an async NDJSON ingest with a bounded asyncio.Queue, Pydantic validation, and a dedupe stage using a sliding window Bloom filter implemented with buckets. The Bloom filter stores f",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement an async generator that reads JSONL lines, validates each with the provided Pydantic BaseModel, deduplicates by the line id using a BloomFilter, and forwards new events to sink with backpres",
+            "text": "Implement a streaming generator that opens the CSV file using line-delimited reading, maintains per-hour sums in a dictionary keyed by category, and yields results when the hour bucket changes. Track `current_hour_start…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use asyncio to consume lines from an async source, parse each as a Pydantic model, and for each category maintain a deque of the last N values. On a new line, append, drop older entries, compute the p",
+            "text": "Implement a decorator retry(max_retries=3, base_delay=0.1, jitter=0.05, retry_exceptions=(TimeoutError, ConnectionError)). Detect async using inspect.iscoroutinefunction and await for async, sleep for",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use Python's `csv` module with generator functions to read files line-by-line. Implement `yield` in a custom generator that processes chunks, avoiding loading entire files. Combine with `itertools.islice` for batch proc…",
+            "text": "Use asyncio with per-key bounded queues and a global memory budget. Each key = (service, event_type) has a fixed-size asyncio.Queue and a 60-second circular histogram of payload sizes. On arrival, pus",
             "isCorrect": true
           }
         ],
-        "explanation": "## Memory-Efficient CSV Processing\n\n- **Generator Pattern**: Use `yield` to process rows incrementally\n- **csv.reader**: Built-in CSV parser handles edge cases\n- **Chunk Processing**: Batch rows with `itertools.islice`\n- **Memory Control**: Constant O(1) memory usage\n\n```python\nimport csv\nfrom itertools import islice\n\ndef csv_generator(filename, chunk_size=1000):\n    with open(filename) as f:\n        reader = csv.DictReader(f)\n        while True:\n            chunk = list(islice(reader, chunk_size))\n            if not chunk:\n                break\n            yield chunk\n```\n\n## Key Benefits\n\n- Processes files of any size without memory constraints\n- Maintains constant memory usage regardless of file size\n- Allows streaming data transformation and analysis\n- Integrates seamlessly with existing Python data tools",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nEfficient streaming with per-key backpressure and bounded memory.\n\n## Key Concepts\n- asyncio, per-key bounded queues\n- sliding window histograms\n- memory budgeting and backpressure\n- test plan with skewed keys\n\n## Code Example\n```python\n# sketch: per-key histogram and bounded queues\nfrom collections import deque\nimport asyncio\n\nclass WindowHistogram:\n    def __init__(self, window=60):\n        self.bins = deque([0]*window, maxlen=window)\n        self._last_tick = None\n\n    def add(self, size, timestamp):\n        # simplistic implementation; real version rotates bins per second\n        self.bins[-1] += size\n```",
+        "difficulty": "advanced"
       },
       {
         "id": "python-q-24",
-        "questionId": "q-26304",
-        "question": "Design an async Python processor that ingests AsyncIterable[bytes] with NDJSON lines like {\"user_id\": \"u123\", \"ts\": 1610000000, \"latency\": 123}. Partition by user_id, ensure per-user in-order processing, batch into micro-batches of at most N lines or T seconds, validate with Pydantic, compute per-batch moving-average latency, and upsert into MongoDB on (user_id, ts). Maintain bounded memory and backpressure to the source. Include a test plan with bursts and slow sinks?",
+        "questionId": "q-7616",
+        "question": "Design a beginner-friendly Python function stream_validate_agg(file_path, batch_size=100, timeout=2.0) for a JSONL file where each line is a JSON object with fields id:str, type:str, value=float. Read lazily, validate with a Pydantic model, and group values by 'type' into per-type batches. Emit a batch as {type: [value,...]} when a batch reaches batch_size or the batch's age exceeds timeout. Memory usage must stay O(batch_size). Ensure per-type in-order processing. Provide a small test snippet with synthetic JSONL data?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement per-partition asyncio workers keyed by (merchant_id, country). Each partition has a bounded input queue and a single writer to preserve in-order semantics. Validate lines with a Pydantic mod",
+            "text": "Use per-customer worker coroutines with a dictionary mapping customer_id to asyncio.Queue. A producer coroutine parses NDJSON lines, validates each using Pydantic, and enqueues events to the appropriate per-customer que…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use per-user asyncio queues with dedicated workers to ensure in-order processing per user. Batch incoming NDJSON lines into micro-batches constrained by configurable size N or time window T. Validate each line with Pyda…",
-            "isCorrect": true
+            "text": "In an async Python pipeline, ingest NDJSON lines, validate with Pydantic, partition by user_id, and push to per-user bounded queues with one worker per user to preserve order. Gate the source when any",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Build per-symbol async readers feeding bounded queues, with an in-memory per-symbol buffer. Use a 1s watermark to decide when to emit a join. Join when a trade and a quote timestamps overlap within th",
-            "isCorrect": false
+            "text": "Read lazily using a generator; validate each line via a Pydantic model; accumulate per-type buffers in a dict of lists; when any buffer reaches batch_size or the batch age exceeds timeout, emit the pe",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Use a generator to stream the file and parse KEY=VALUE lines, skipping blanks and comments. Collect values for required_keys in a dict, then build a dynamic Pydantic model with create_model({required_",
+            "text": "This question asks for a bounded-memory, line-by-line CSV processor. Implement parse_and_group_csv(lines, batch_size=100) that reads lines with header id,name,score,group; validates types (id:int, sco",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question assesses real-world streaming concerns: per-key ordering guarantees, memory-bounded buffering, backpressure in async pipelines, and idempotent writes with MongoDB upserts.\n\n## Key Concepts\n- AsyncIO and per-key task orchestration using asyncio queues\n- NDJSON parsing with Pydantic validation\n- Sliding-window metrics (moving-average latency per batch)\n- MongoDB upserts with compound index (user_id, ts) for deduplication\n- Backpressure mechanisms: bounded queue depth and producer pause on full queue\n\n## Code Example\n```python\nimport asyncio\nfrom collections import defaultdict\nfrom typing import AsyncIterable\n\nimport pydantic\nfrom pydantic import BaseModel\nfrom motor.motor_asyncio import AsyncIOMotorClient\n\n\nclass NDJSONRecord(BaseModel):\n    user_id: str\n    ts: int\n    latency: int\n\n\nclass MicroBatchProcessor:\n    def __init__(\n        self,\n        mongo_uri: str,\n        db_name: str,\n        collection_name: str,\n        batch_size: int = 100,\n        batch_timeout: float = 1.0,\n        max_queue_depth: int = 1000,\n    ):\n        self.client = AsyncIOMotorClient(mongo_uri)\n        self.db = self.client[db_name]\n        self.collection = self.db[collection_name]\n        self.batch_size = batch_size\n        self.batch_timeout = batch_timeout\n        self.max_queue_depth = max_queue_depth\n        self.user_queues: dict[str, asyncio.Queue] = defaultdict(\n            lambda: asyncio.Queue(maxsize=max_queue_depth)\n        )\n        self.workers: list[asyncio.Task] = []\n        self._running = False\n\n    async def start(self, source: AsyncIterable[bytes]):\n        self._running = True\n        asyncio.create_task(self._producer(source))\n        for user_id in list(self.user_queues.keys()):\n            worker = asyncio.create_task(self._worker(user_id))\n            self.workers.append(worker)\n        await asyncio.gather(*self.workers)\n\n    async def _producer(self, source: AsyncIterable[bytes]):\n        async for line in source:\n            record = pydantic.model_validate(NDJSONRecord, self._parse(line))\n            queue = self.user_queues[record.user_id]\n            if queue.full():\n                await queue.put(None)  # Signal backpressure\n                continue\n            await queue.put(record)\n\n    async def _worker(self, user_id: str):\n        queue = self.user_queues[user_id]\n        batch: list[NDJSONRecord] = []\n        last_batch_time = asyncio.get_event_loop().time()\n        moving_avg_latency: float | None = None\n\n        while self._running:\n            try:\n                record = await asyncio.wait_for(\n                    queue.get(), timeout=self.batch_timeout\n                )\n                batch.append(record)\n                queue.task_done()\n            except asyncio.TimeoutError:\n                pass\n\n            should_flush = (\n                len(batch) >= self.batch_size\n                or (batch and asyncio.get_event_loop().time() - last_batch_time >= self.batch_timeout)\n            )\n\n            if should_flush and batch:\n                await self._flush_batch(user_id, batch, moving_avg_latency)\n                moving_avg_latency = self._update_moving_avg(moving_avg_latency, batch)\n                batch = []\n                last_batch_time = asyncio.get_event_loop().time()\n\n    async def _flush_batch(\n        self, user_id: str, batch: list[NDJSONRecord], prev_avg: float | None\n    ):\n        if not batch:\n            return\n        operations = [\n            {\n                \"filter\": {\"user_id\": record.user_id, \"ts\": record.ts},\n                \"update\": {\n                    \"$set\": {\"latency\": record.latency},\n                    \"$setOnInsert\": {\"user_id\": record.user_id, \"ts\": record.ts},\n                },\n                \"upsert\": True,\n            }\n            for record in batch\n        ]\n        await self.collection.bulk_write(operations)\n\n    def _update_moving_avg(\n        self, prev_avg: float | None, batch: list[NDJSONRecord]\n    ) -> float:\n        batch_avg = sum(r.latency for r in batch) / len(batch)\n        if prev_avg is None:\n            return batch_avg\n        return 0.7 * prev_avg + 0.3 * batch_avg\n\n    def _parse(self, line: bytes) -> dict:\n        import json\n        return json.loads(line.decode().strip())\n\n    async def stop(self):\n        self._running = False\n        for worker in self.workers:\n            worker.cancel()\n        await asyncio.gather(*self.workers, return_exceptions=True)\n        self.client.close()\n```\n\n## Test Plan\n1. **Burst test**: Stream 10,000 records from multiple users simultaneously to verify bounded memory and backpressure.\n2. **Slow sink test**: Configure a slow MongoDB instance to verify the system correctly applies backpressure and maintains in-order processing.\n3. **Micro-batch timing**: Inject records with known timestamps and verify batch flush at configured time threshold.\n4. **Idempotency**: Insert duplicate (user_id, ts) pairs and verify no duplicate MongoDB documents.\n5. **Moving average convergence**: Feed records with known latency values and verify EMA converges to expected range.",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests understanding of streaming I/O, incremental batching, per-key grouping, and memory-based flush semantics in a beginner-friendly setting.\n\n## Key Concepts\n- Generators and lazy file I/O\n- Pydantic validation\n- Per-type buffering and batch flushing\n- Time-based flush with time.monotonic\n- Memory-bounded streaming\n\n## Code Example\n```python\nfrom typing import Dict, List, Iterator\nimport time\nfrom pydantic import BaseModel, ValidationError\n\nclass Record(BaseModel):\n    id: str\n    type: str\n    value: float\n\n\ndef stream_validate_agg(file_path: str, batch_size: int = 100, timeout: float = 2.0) -> Iterator[Dict[str, List[float]]]:\n    buffers: Dict[str, List[float]] = {}\n    start = None\n    with open(file_path, 'r') as f:\n        for line in f:\n            line = line.strip()\n            if not line:\n                continue\n            try:\n                rec = Record.parse_raw(line)\n            except ValidationError:\n                continue\n            if start is None:\n                start = time.monotonic()\n            buffers.setdefault(rec.type, []).append(rec.value)\n            flush = False\n            if len(buffers[rec.type]) >= batch_size:\n                flush = True\n            elif time.monotonic() - start >= timeout:\n                flush = True\n            if flush:\n                yield {t: vals[:] for t, vals in buffers.items() if vals}\n                buffers.clear()\n                start = time.monotonic()\n```\n\n## Follow-up Questions\n- How would you adapt this to async file I/O or WebSocket streams?\n- What testing strategy would you use for timing-sensitive batches?",
+        "difficulty": "beginner"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-06-06T10:42:40.230Z",
+    "createdAt": "2026-06-07T06:25:24.087Z",
     "version": 1
   }
 ]
