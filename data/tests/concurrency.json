@@ -8,53 +8,323 @@
     "questions": [
       {
         "id": "concurrency-q-0",
-        "questionId": "q-16728",
-        "question": "Design a beginner-friendly concurrency exercise: dozens of producers publish events into a bounded global queue; implement per-source FIFO buffers, a small worker pool to process events, and a per-source token-bucket rate limiter that throttles bursts. When backlog grows beyond a threshold, divert excess events to a pending path and re-schedule. Explain backpressure, fairness, and provide a test plan for per-source ordering, backlog behavior, and graceful shutdown?",
+        "questionId": "q-12910",
+        "question": "Design a concurrent processor for a user-centric event stream: many producers emit events with fields user_id, event_id, ts into a bounded global queue. Guarantee per-user event order across all workers under burst traffic, while allowing dynamic worker scaling. Implement per-user buffers with bounded size K, and a spill path that batches overflowed events for later processing without breaking order. Provide data structures, a runnable enqueue/consume sketch, and a concrete test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a beginner-friendly concurrency exercise: dozens of producers publish events into a bounded global queue. Implement per-source FIFO buffers, a small worker pool to process events, and a per-source token-bucket ra…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Per-symbol FIFO buffers of size K, a bounded global queue, and per-symbol sequence numbers ensure ordering across venues under backpressure. A pool of M stateless risk-check workers consumes from each per-symbol buffer,…",
+            "text": "Implement a bounded reorder buffer using a min-heap keyed by event.TS. Ingested events are enqueued; producers block when buffer hits capacity to apply backpressure. A worker pool drains and emits onl",
             "isCorrect": false
           },
           {
+            "id": "b",
+            "text": "Design a per-user FIFO pipeline with a global bounded queue and per-user local buffers. Route events by user_id to dedicated worker queues, maintain per-user sequence ordering, support dynamic worker",
+            "isCorrect": true
+          },
+          {
             "id": "c",
-            "text": "Propose a bounded global queue feeding a small transcoder pool with per-camera FIFO buffers. When the queue fills, apply backpressure by delaying new frames or dropping with an increasing retry window",
+            "text": "Implement a bounded global queue and per-tenant buffers; workers pull in round-robin across active tenants. Each tenant buffer preserves order; on overflow, apply backpressure to producers (block subm",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Per-cell bounded FIFOs and a dispatcher using consistent hashing route events to workers. Each worker keeps a per-cell last_seq and only processes a message if its seq is last_seq+1; gaps are buffered",
+            "text": "Use per-type bounded channels to enforce backpressure, a dispatcher routing tasks to each type queue, and a central scaler that monitors tail latency and throughput to adjust worker counts via atomic",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question introduces a concurrency pattern focused on per-source fairness with a graceful degradation path. It complements existing questions that emphasize per-region, per-producer, or rate-limiting in isolation.\n\n## Key Concepts\n\n- **Bounded Queues**: Fixed-capacity queues that prevent unbounded memory growth\n- **Per-Source FIFO Buffers**: Ordered queues that preserve event sequence per source\n- **Token Bucket Rate Limiter**: Algorithm that allows bursts while enforcing average rate limits\n- **Round-Robin Draining**: Fair scheduling across multiple sources\n- **Degradation Path**: Secondary queue for excess events when backpressure is triggered\n- **Graceful Shutdown**: Proper handling of in-flight events during termination\n\n## Code Example\n\n```python\nimport time\nimport threading\nfrom collections import deque\nfrom dataclasses import dataclass\n\n@dataclass\nclass Event:\n    source_id: str\n    payload: any\n    timestamp: float\n\nclass TokenBucket:\n    def __init__(self, rate: float, capacity: int):\n        self.rate = rate\n        self.capacity = capacity\n        self.tokens = float(capacity)\n        self.last_update = time.monotonic()\n        self.lock = threading.Lock()\n    \n    def consume(self, tokens: int = 1) -> bool:\n        with self.lock:\n            self._refill()\n            if self.tokens >= tokens:\n                self.tokens -= tokens\n                return True\n            return False\n    \n    def _refill(self):\n        now = time.monotonic()\n        elapsed = now - self.last_update\n        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)\n        self.last_update = now\n\nclass PerSourceLimiter:\n    def __init__(self, rate: float, capacity: int):\n        self.buckets: dict[str, TokenBucket] = {}\n        self.rate = rate\n        self.capacity = capacity\n        self.lock = threading.Lock()\n    \n    def get_bucket(self, source_id: str) -> TokenBucket:\n        with self.lock:\n            if source_id not in self.buckets:\n                self.buckets[source_id] = TokenBucket(self.rate, self.capacity)\n            return self.buckets[source_id]\n\nclass EventProcessor:\n    def __init__(self, queue_capacity: int, backlog_threshold: float, num_workers: int = 4):\n        self.global_queue = deque(maxlen=queue_capacity)\n        self.pending_queue = deque()\n        self.backlog_threshold = backlog_threshold\n        self.source_buffers: dict[str, deque] = {}\n        self.rate_limiter = PerSourceLimiter(rate=10.0, capacity=20)\n        self.workers = []\n        self.running = False\n        self.lock = threading.Lock()\n    \n    def publish(self, event: Event) -> bool:\n        bucket = self.rate_limiter.get_bucket(event.source_id)\n        if not bucket.consume():\n            return False\n        \n        with self.lock:\n            if len(self.global_queue) >= self.backlog_threshold:\n                self.pending_queue.append(event)\n                return True\n            self.global_queue.append(event)\n            return True\n    \n    def _get_next_event(self) -> Event | None:\n        with self.lock:\n            if self.pending_queue and len(self.global_queue) < self.backlog_threshold:\n                return self.pending_queue.popleft()\n            return self.global_queue.popleft() if self.global_queue else None\n    \n    def worker(self):\n        while self.running:\n            event = self._get_next_event()\n            if event:\n                self._process(event)\n            else:\n                time.sleep(0.01)\n    \n    def _process(self, event: Event):\n        print(f\"Processing event from {event.source_id}: {event.payload}\")\n    \n    def start(self):\n        self.running = True\n        for _ in range(self.num_workers):\n            t = threading.Thread(target=self.worker)\n            t.start()\n            self.workers.append(t)\n    \n    def shutdown(self, timeout: float = 5.0):\n        self.running = False\n        for t in self.workers:\n            t.join(timeout=timeout)\n```\n\n## Key Design Principles\n\n### Backpressure\nWhen the global queue reaches capacity, new events are diverted to a pending queue instead of blocking or rejecting producers. This provides **backpressure** by slowing production without losing data.\n\n### Fairness\n- **Per-Source Token Buckets**: Each source gets independent rate limiting, preventing one noisy source from monopolizing resources\n- **Round-Robin Processing**: Workers cycle through sources to ensure no source is starved\n- **Pending Queue Drain**: When backlog subsides, pending events are re-scheduled fairly\n\n### Graceful Shutdown\n1. Signal workers to stop accepting new events\n2. Process remaining events in global and pending queues\n3. Wait for in-flight processing to complete with timeout\n4. Clean up resources\n\n## Test Plan\n\n### 1. Per-Source Ordering\n- Publish events from a single source out of order; verify they process in FIFO order\n- Test with multiple sources interleaved\n\n### 2. Backlog Behavior\n- Publish rapidly until threshold is hit\n- Verify excess events go to pending queue\n- Verify pending events are processed when backlog clears\n\n### 3. Rate Limiting\n- Burst many events from one source; verify throttling\n- Verify other sources aren't blocked\n\n### 4. Graceful Shutdown\n- Publish events, trigger shutdown while processing\n- Verify no events are lost\n- Verify workers terminate within timeout",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nTests ability to reason about per-user ordering under backpressure while enabling dynamic scaling.\n\n## Key Concepts\n- Per-user FIFO buffers with bounded size\n- Global bounded queue and backpressure signaling\n- Dynamic worker scaling and per-user routing\n- Spill path that batches overflowed events while preserving order\n\n## Code Example\n```javascript\n// Sketch: per-user routing and buffers\nclass Event { constructor(userId, eventId, ts, payload){ this.userId = userId; this.eventId = eventId; this.ts = ts; this.payload = payload; } }\n```\n\n## Follow-up Questions\n- How would you recover from worker failure and preserve order?\n- How do you handle hot keys with skewed traffic and limited buffers?",
+        "difficulty": "intermediate"
       },
       {
         "id": "concurrency-q-1",
-        "questionId": "q-2329",
-        "question": "Design a bounded, concurrent router for a real-time analytics platform ingesting events from thousands of clients. Each client's events must be processed in arrival order, while events from different clients may be processed in parallel. The router should implement per-client backpressure and support clients joining/leaving on the fly. Describe two concrete implementations: (A) per-client queues with a central scheduler using locks, (B) per-client lock-free queues with a shared ready-list. Include correctness, failure handling, and a practical test plan?",
+        "questionId": "q-6204",
+        "question": "Intermediate: In a real-time event processor, N producers emit events into a bounded global queue of size Q. A pool of M workers consumes events. Each event has a key (e.g., user_id). Guarantee per-key in-order processing across all producers while allowing parallel processing for different keys. Implement per-key FIFO buffers with a maximum size K and a global backpressure mechanism when the queue is full. Decide overflow policy (drop oldest, drop new, or reject) and justify?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Propose a two-stage pipeline with per-user ordering and dynamic rebalancing. Map user_id to a worker using a consistent-hash ring; when load rises, rebalance a subset of users to less-busy workers whi",
+            "text": "Implement per-tenant FIFO queues and a shared bounded queue. Each tenant has a token-bucket budget to permit bursts; enqueue blocks when budget is exhausted to apply backpressure. Dispatcher uses a mi",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use N per-client FIFO queues and a fixed worker pool. Each client has a credit counter; producers enqueue only when credits>0, decrementing atomically. (A) Lock-based: guard each queue with a mutex; a",
+            "text": "Implement a bounded global queue and per-tenant buffers; workers pull in round-robin across active tenants. Each tenant buffer preserves order; on overflow, apply backpressure to producers (block subm",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Two-layer: a global bounded queue (size Q) and per-key FIFO buffers with cap K. A dispatcher routes next event for a key to an available worker, preserving in-order delivery per key. Use a semaphore t",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use a fixed 1024-slot circular buffer guarded by a ReentrantLock with two Conditions: notFull and notEmpty. Producers await notFull; consumers await notEmpty. Update head, tail, and count under lock;",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design multithreaded pipelines with per-key ordering and bounded buffers, a common real-time constraint in payment/telemetry systems. It also probes overflow policies and fairness under contention.\n\n## Key Concepts\n- Per-key in-order processing\n- Bounded buffers and global backpressure\n- Overflow policy and starvation considerations\n\n## Code Example\n```javascript\n// Dispatcher sketch: map<Key, FIFO>; global semaphore for Q\n```\n\n## Follow-up Questions\n- How would you extend to dynamically adjust K or Q under load?\n- How would you verify ordering and backpressure with realistic workloads?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-2",
+        "questionId": "q-22305",
+        "question": "Design a beginner-friendly concurrency exercise: a streaming analytics dispatcher for sensors. Dozens of sensors (producers) emit events tagged by sensor_id into a bounded global queue feeding a small worker pool. Ensure per-sensor FIFO ordering, apply a per-sensor rate cap, and add a 'late-batch' path that aggregates queued events per sensor into 1-5-item batches when backlog grows. Explain backpressure, fairness, and provide a concrete test plan for per-sensor ordering, rate-limiter behavior, batch correctness, and graceful shutdown?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a global bounded queue with per-sensor FIFO buffers. Use a token-bucket limiter per sensor (capacity 10, refill 2/s). When backlog rises, batch up to 5 events per sensor for the late-batch p",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Propose a per-symbol partitioned, bounded ring-buffer with credit-based flow. Producers atomically decrement a per-partition credit counter to enqueue, avoiding locks; consumers advance a per-partitio",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a bounded worker pool with a fixed number of workers and a lock-free ring buffer. Block enqueue when full to enforce backpressure; use per-task cancellation via context and per-task timeouts",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a bounded global queue with per-service FIFO buffers, and a round-robin time-slice scheduler giving each service a fixed time budget per round. Enforce a per-round cap on processed work. Whe",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nExplores per-source ordering, per-source rate limiting, and a late-batch path under backpressure, plus graceful shutdown and observability.\n\n## Key Concepts\n\n- Bounded queues and per-key FIFO\n- Token-bucket rate limiting per sensor\n- Late-batch batching and backpressure management\n- Fairness across sensors and graceful shutdown\n\n## Code Example\n\n```python\n# Python sketch: per-sensor token bucket and batcher (simplified)\nimport time\nclass TokenBucket:\n    def __init__(self, rate, capacity):\n        self.rate = rate\n        self.capacity = capacity\n        self.tokens = capacity\n        self.last = time.time()\n    def consume(self, n=1):\n        now = time.time()\n        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)\n        self.last = now\n        if self.tokens >= n:\n            self.tokens -= n\n            return True\n        return False\n\ndevices = {}\n\ndef get_bucket(sensor_id):\n    if sensor_id not in devices:\n        devices[sensor_id] = TokenBucket(2, 10)\n    return devices[sensor_id]\n```\n\n## Follow-up Questions\n\n- How would you validate per-sensor ordering under interleaved bursts?\n- How would you adjust batch size under varying workload to meet SLAs?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "concurrency-q-3",
+        "questionId": "q-27734",
+        "question": "Design a bounded, per-topic speculative processing pipeline: producers emit (topic, key, ts, value) into a single bounded input queue. A Transformer with M workers may route to two downstream handlers: fast-path (speculative) and slow-path (verification). If fast-path violates per-key SLA, rollback that key’s speculative work and move to slow-path, preserving per-key in-order across all stages. Support dynamic worker resizing, backpressure, and a late-message policy. Provide runnable sketch and test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use two bounded queues (High and Normal) sharing capacity C. Enqueue blocks via a counting semaphore representing total items. A single dispatcher drains High first, then Normal, preserving FIFO withi",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose per-tenant FIFO queues feeding a global scheduler built on virtual time. Each tenant gets a fixed quantum; the scheduler advances to the head task of the tenant with the smallest virtual time",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Leverage per-key sequence buffers in the Transformer: map key->ordered queue, one global bounded channel, and a speculative layer that routes to fast-path and slow-path with a commit/rollback protocol",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Approach: implement per-aggregate FIFO buffers, a global sequencer to assign events to workers while preserving aggregate order, and a per-aggregate backpressure tag. Use bounded queue Q, a dynamic sh",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssesses handling of speculative execution, rollback, and per-key order in a bounded, dynamic worker pool under backpressure. It tests practical tooling for latency-sensitive systems common in finance and payments.\n\n## Key Concepts\n- Per-key in-order delivery with speculative paths\n- Commit/Rollback protocol and versioned keys\n- Bounded queues and backpressure signaling\n- Dynamic worker resizing and failure handling\n- Late-message policy and watermarking\n\n## Code Example\n```javascript\n// Pseudocode sketch of routing decision per key\nfunction route(key, event) {\n  // decide path, manage speculative state, and commit/rollback\n}\n```\n\n## Follow-up Questions\n- How would you implement a robust rollback when fast-path data is already observed downstream?\n- How would you test SLA guarantees under burst arrivals and random slow-path delays?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-4",
+        "questionId": "q-17307",
+        "question": "Design a bounded, fairness-preserving dispatcher for a multi-tenant API gateway. Each tenant has an ordered queue; processing has two stages: authentication and business logic. Build a global scheduler that (1) preserves per-tenant order across stages, (2) enforces fair shares under bursts via virtual time, (3) supports dynamic worker resizing and upstream backpressure. Provide data structures, a runnable sketch, and a concrete test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Approach: partition by user_id into fixed shards; bounded per-shard queues; transformers emit to a per-user state store keyed by user_id to preserve order. Use sequence numbers and a barrier during re",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a map of key to in-flight struct { done chan struct{}, result any, err error, ref int }. On miss, increment refs, start a single fetch, close done to release waiters, and cleanup. Each waiter read",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a per-room bounded queue with blocking semantics: producers block when the queue is full, consumers block when empty. In Go, use a buffered channel per room; in Python/Java, use a bounded queue with mutex/cond…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose per-tenant FIFO queues feeding a global scheduler built on virtual time. Each tenant gets a fixed quantum; the scheduler advances to the head task of the tenant with the smallest virtual time",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests ability to design fair, bounded concurrency with multi-tenant isolation and backpressure in a gateway.\n\n## Key Concepts\n\n- Per-tenant FIFO queues\n- Virtual time fair scheduling\n- Two-stage processing with order preservation\n- Dynamic worker resizing and backpressure signaling\n\n## Code Example\n\n```go\n// skeleton data structures\ntype Task struct { tenantID string; payload []byte; enqueue time.Time }\ntype TenantState struct { queue chan Task; quota int; lastScheduled time.Time }\n```\n\n## Follow-up Questions\n\n- How would you adapt for arriving tenants vs existing ones? \n- How would you measure fairness under different traffic patterns?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-5",
+        "questionId": "q-9886",
+        "question": "You operate a real-time event platform where events from many producers must be consumed in per-user FIFO order across a pool of workers. Design a scalable, fair, low-latency pipeline that preserves per-user ordering under bursty load, avoids starvation of low-volume users, and supports dynamic backpressure. Describe data structures, coordination, failure handling, and a concrete test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Two-level queue: a bounded global ring buffer plus per-tenant FIFO subqueues. Each event includes tenantId and a monotonic sequence. Producers push to the ring; a dispatcher forwards to the tenant’s q",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Adopt per-user FIFO queues backed by Redis Streams, with a dispatcher that assigns events to a fixed-size worker pool. Consumers read in-order per stream (XREADGROUP) to preserve user sequencing. Glob",
             "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Use a global bounded queue with a pool of workers, plus per-tenant FIFO buffers and a distributor that enforces in-order processing for each tenant. Add aging to increase priority for stalled tenants",
+            "text": "Propose per-tenant FIFO queues feeding a global scheduler built on virtual time. Each tenant gets a fixed quantum; the scheduler advances to the head task of the tenant with the smallest virtual time",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a bounded global queue + per-team FIFO buffers in Go or Python asyncio. A dispatcher pulls from per-team buffers to a small worker pool; per-team rate limits via token buckets. Add a dynamic",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nAdvanced concurrency problem: preserving per-user ordering across many producers and workers under bursty traffic with backpressure and fairness.\n\n## Key Concepts\n\n- Per-user FIFO queues\n- Global backpressure\n- Fairness under heavy-tailed workloads\n- Durable ordering and idempotence\n\n## Code Example\n\n```javascript\n// simple in-memory per-user FIFO (demo)\nclass PerUserQueues {\n  constructor() { this.queues = new Map(); }\n  enqueue(userId, evt) { const q = this.queues.get(userId) || []; q.push(evt); this.queues.set(userId, q); }\n  dequeue(userId) { const q = this.queues.get(userId); if(!q || q.length===0) return null; return q.shift(); }\n}\n```\n\n## Follow-up Questions\n\n- How would you handle hot keys creating backlog?\n- How to migrate from Redis Streams to a different system without breaking ordering?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "concurrency-q-6",
+        "questionId": "q-11380",
+        "question": "You’re building a real-time collaborative editor service. Clients emit edits with document_id, client_id, and a logical clock. Edits may arrive out of order and under backpressure. Design a concurrency model with a bounded global queue, per-document in-memory buffers, and a scheduler that guarantees per-document causal order while allowing dynamic worker scaling. Include handling for missing edits and late edits, and a runnable enqueue/consume sketch plus a test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose: use a bounded global ring buffer with a per-document min-heap of in-flight edits keyed by a logical vector clock. Each document has a sequence frontier; producers enqueue edits; workers commi",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Design a per-document ordered pipeline with a shared bounded queue and per-document buffers. Track per-document sequence numbers and fan-out across a worker pool to preserve document order. Implement",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a per-user FIFO queue system managed by a global bounded work queue with a supervisory coordinator ensuring ordering guarantees. Maintain a versioned atomic model reference that workers access via shared point…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement per-room FIFO buffers feeding a bounded global worker queue to preserve per-room ordering while allowing parallelism across rooms. Add a backlog-based degradation path that coalesces rapid typing events per ro…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nExamines practical concurrency design for ordering guarantees under backpressure in a multi-client, multi-document setting, including missing/late edits and dynamic scaling.\n\n## Key Concepts\n\n- Bounded queues and backpressure signaling\n- Per-document causal ordering using logical clocks or vector clocks\n- Per-document buffers and a scheduler that avoids cross-document reordering\n- Dynamic worker scaling and fault-tolerant enqueue/consume paths\n\n## Code Example\n\n```javascript\n// Skeleton enqueue/consume sketch for per-document causal ordering\nclass DocBuffer {\n  constructor() {\n    this.frontier = new Map(); // docId -> lastCommittedClock\n    this.buffers  = new Map(); // docId -> priority queue of edits\n  }\n  enqueue(edit) {\n    const { document_id } = edit;\n    if (!this.buffers.has(document_id)) this.buffers.set(document_id, []);\n    // insert into per-doc heap with key = edit.clock\n  }\n  tryCommit(document_id) {\n    // commit edits in order if their clocks are contiguous with frontier\n  }\n}\n```\n\n## Follow-up Questions\n\n- How would you test memory pressure and buffer aging?\n- How would you extend to handle missing edits and recovery?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-7",
+        "questionId": "q-24577",
+        "question": "Design a multi-tenant task scheduler with a single bounded backlog that preserves per-tenant FIFO order, applies dynamic quotas per tenant that adapt to observed burstiness, and introduces a global backpressure signal when backlog nears capacity. Build a runnable sketch (Go or Rust) showing per-tenant queues, a central dispatcher, and a graceful shutdown; explain how you prevent starvation and measure fairness?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a bounded global queue (e.g., 1024) with per-match FIFOs. Use a 4-worker pool, each worker applying updates for a given match in sequence; track per-match sequencing to detect gaps. If backl",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use per-type bounded channels to enforce backpressure, a dispatcher routing tasks to each type queue, and a central scaler that monitors tail latency and throughput to adjust worker counts via atomic",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Per-user sharded queues with a central sequencer. Each user tracks expected sequence; out-of-order events are buffered until the missing seq arrives, ensuring in-order processing. Use a bounded dispat",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a per-tenant FIFO queue and a single bounded backlog. Each tenant gets a dynamic quota updated by a central scheduler (token buckets that adjust to burstiness). A dispatcher drains queues in weigh",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nDesigning a multi-tenant scheduler that preserves per-tenant ordering while adapting quotas to burstiness tests deep knowledge of backpressure, fairness, and liveness. It also challenges how to measure and guarantee fairness across tenants in a shared resource.\n\n## Key Concepts\n\n- Per-tenant FIFO queues\n- Global bounded backlog with backpressure signaling\n- Dynamic quotas via token buckets adjusted by observed burstiness\n- Scheduling policy (weighted RR) to prevent starvation\n- Observability: per-tenant throughput, latency, and starvation windows\n\n## Code Example\n\n```javascript\n// Skeleton: per-tenant queues and central dispatcher\nclass TokenBucket {\n  constructor(rate, burst){ this.rate = rate; this.burst = burst; this.tokens = burst; this.last = Date.now(); }\n  tryConsume(n=1){ const now = Date.now(); const elapsed = (now - this.last)/1000; this.tokens = Math.min(this.burst, this.tokens + elapsed*this.rate); this.last = now; if(this.tokens >= n){ this.tokens -= n; return true; } return false; }\n}\n\nclass TenantQueue {\n  constructor(id){ this.id = id; this.q = []; }\n  enqueue(item){ this.q.push(item); }\n  dequeue(){ return this.q.shift(); }\n}\n\n// Dispatcher sketch (async flow-control omitted for brevity)\n```\n\n## Follow-up Questions\n\n- How would you validate fairness under bursty workloads and detect starvation?\n- How would you scale this across processes or machines with consistent quotas?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "concurrency-q-8",
+        "questionId": "q-27082",
+        "question": "Design an intermediate concurrency problem: implement a bounded, per-user streaming pipeline with deduplication and per-user ordering guarantees. Ingest events: user_id, event_id, ts, payload. Route via a bounded global queue into N transformer workers and M per-user aggregators. Use per-user sequence tracking and a dedupe window keyed by (user_id,event_id). Maintain per-user order across stages; handle late events with a watermark; support dynamic resizing by rebalancing partitions. Provide runnable sketch and a test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a bounded, per-user streaming pipeline with dedup and in-order guarantees. Ingest events: user_id, event_id, ts, payload. Route via a bounded global queue to N transformer workers and M per-",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement a per-publisher FIFO translation pipeline with a bounded global queue. Publishers push posts with language and priority; M workers translate to a target language. Maintain per-publisher orde",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Sketch: per-tenant FIFO queues, a global bounded asyncio.Queue, and per-tenant token buckets. A central scheduler round-robins across tenants, decrementing budgets on dispatch. If a tenant exhausts to",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "To meet scale, implement a bounded, per-tenant, multi-region queue backed by a durable store with region-local buffers. Use a per-task sequence ID and idempotent handlers to realize exactly-once proce",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis explores handling exact per-user ordering and dedup under backpressure with dynamic workers and late data, a real-world constraint in large-scale services.\n\n## Key Concepts\n\n- Per-user ordering across stages\n- Dedup window and sequence tracking\n- Watermark-based late-event handling\n- Bounded queues and backpressure\n- Dynamic rebalancing of partitions\n\n## Code Example\n\n```go\n// skeleton illustrating dedupe map and per-user sequence tracking\ntype Event struct{ UserID, EventID string; TS int64; Payload int64 }\n```\n\n## Follow-up Questions\n\n- How would you implement exact-once semantics with retries?\n- How would you stress-test ordering under skewed latencies?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-9",
+        "questionId": "q-16244",
+        "question": "Design a real-time collaborative editor backend: edits arrive as events with document_id, user_id, op_id, and delta. Build a bounded global queue and per-document FIFO buffers to guarantee per-document in-order application across a pool of workers. Add a backlog-driven coalescing policy that merges consecutive edits from the same user on the same document when possible, and a backpressure strategy that defers or stalls new edits while preserving order. Provide a runnable sketch and test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a per-document ordered pipeline with a shared bounded queue and per-document buffers. Track per-document sequence numbers and fan-out across a worker pool to preserve document order. Implement",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement per-producer bounded queues fed into a rotating, weighted fair dispatcher that pushes into a fixed-size ring buffer consumed by worker threads. Use a single-order-book lock for matching, wit",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design and implement a bounded ingress -> worker pool -> per-key in-order processor. Each event carries (key, seq, payload). A central scheduler assigns tasks to workers while each key has its own FIF",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a global bounded intake channel feeding per-tenant FIFO queues. A dispatcher allocates work to a fixed worker pool using a round-robin over active tenants, preserving order via next_seq per tenant",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes ordering, backpressure, and per-document isolation in a real-time editor backend, plus a pragmatic coalescing optimization.\n\n## Key Concepts\n- Per-document in-order processing across a shared queue\n- Bounded queues and dynamic worker scaling\n- Coalescing of same-user edits; deferral when needed\n- Correctness under backpressure and failure modes\n\n## Code Example\n```javascript\n// skeleton for per-document sequencing and coalescing\nclass DocBuffer {\n  constructor() { this.nextSeq = 1; this.buffer = new Map(); }\n  enqueue(userId, op) { /* coalesce if same user and doc */ }\n  applyNext(): boolean { /* apply if next in order */ }\n}\n```\n\n## Follow-up Questions\n- How would you test coalescing semantics and backpressure guarantees?\n- How would you extend to multi-document transactional consistency?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-10",
+        "questionId": "q-14353",
+        "question": "Design an intermediate concurrency problem: a bounded, multi‑stage risk‑check pipeline for high‑frequency trading. Ingest trade events from N venues into a global bounded queue. Each trade has symbol, trade_id, and timestamp. Guarantee per-symbol in‑order processing across venues under backpressure. Implement per-symbol bounded buffers of size K, a stateless risk-check stage with M workers, and a dynamic fast-path for volatile symbols that preserves per-symbol order. Provide a runnable sketch and test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Per-tenant FIFO buffers + bounded global queue. Each tenant has next_seq and a token budget that replenishes over time. A scheduler grants work to tenants with positive budget, preserving per-tenant i",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Per-symbol FIFO buffers of size K, a bounded global queue, and per-symbol sequence numbers ensure ordering across venues under backpressure. A pool of M stateless risk-check workers consumes from each per-symbol buffer,…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Design a bounded MPMC queue built as a ring buffer with atomic head/tail indices and per-slot state. Use memory_order_release/acquire, padding to avoid false sharing, and a backoff strategy for conten",
             "isCorrect": false
           },
           {
@@ -63,259 +333,19 @@
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design per-client ordering with global parallelism and backpressure, plus two concrete implementations and correctness reasoning.\n\n## Key Concepts\n- Per-client FIFO queues with bounded capacity\n- Backpressure via per-client credits\n- Locking vs. lock-free queue design\n- Dynamic client join/leave handling and fairness\n\n## Code Example\n```javascript\n// Skeleton illustrating per-client queues and a central scheduler (pseudo)\nclass Router {\n  constructor(capacity){/* ... */}\n  enqueue(clientId, item){/* ... */}\n  dequeue(workerId){/* ... */}\n}\n```\n\n## Follow-up Questions\n- How would you test ordering guarantees under bursty traffic?\n- How do you detect/handle starvation and ensure fairness across clients?\n- What failure scenarios require replay or idempotency guarantees?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "concurrency-q-2",
-        "questionId": "q-9886",
-        "question": "You operate a real-time event platform where events from many producers must be consumed in per-user FIFO order across a pool of workers. Design a scalable, fair, low-latency pipeline that preserves per-user ordering under bursty load, avoids starvation of low-volume users, and supports dynamic backpressure. Describe data structures, coordination, failure handling, and a concrete test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use per-module bounded queues (size K) with a global dispatcher over a shared worker pool. Route all tasks for a given module through a per-module sequence to guarantee in-order execution across bursts; dispatch tokens…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement per-partition bounded queues with backpressure signaling upstream; use 5-second tumbling windows with a monotonic watermark for time advancement; route late events to a buffer during the grace period; ensure e…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Adopt per-user FIFO queues backed by Redis Streams, with a dispatcher that assigns events to a fixed-size worker pool. Consumers read in-order per stream (XREADGROUP) to preserve user sequencing. Glob",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use a global bounded intake channel feeding per-tenant FIFO queues. A dispatcher allocates work to a fixed worker pool using a round-robin over active tenants, preserving order via next_seq per tenant",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nAdvanced concurrency problem: preserving per-user ordering across many producers and workers under bursty traffic with backpressure and fairness.\n\n## Key Concepts\n\n- Per-user FIFO queues\n- Global backpressure\n- Fairness under heavy-tailed workloads\n- Durable ordering and idempotence\n\n## Code Example\n\n```javascript\n// simple in-memory per-user FIFO (demo)\nclass PerUserQueues {\n  constructor() { this.queues = new Map(); }\n  enqueue(userId, evt) { const q = this.queues.get(userId) || []; q.push(evt); this.queues.set(userId, q); }\n  dequeue(userId) { const q = this.queues.get(userId); if(!q || q.length===0) return null; return q.shift(); }\n}\n```\n\n## Follow-up Questions\n\n- How would you handle hot keys creating backlog?\n- How to migrate from Redis Streams to a different system without breaking ordering?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "concurrency-q-3",
-        "questionId": "q-13228",
-        "question": "Design an intermediate concurrency problem: implement a dynamic, lock-free bounded multi-producer multi-consumer scheduler for a streaming analytics pipeline. Each input event has stream_id and event_id. Guarantee per-stream in-order processing across a worker pool that can resize at runtime. Use per-stream bounded queues, a global balancer, and a backpressure signal when thresholds are hit. Provide a runnable sketch and concrete test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a NUMA-aware concurrent task scheduler for a multi-socket server with a global bounded queue and local queues per NUMA node. Enqueue operations should apply backpressure when the global queue is full. A dispatche…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Approach: Implement per-stream FIFO ring buffers with configurable capacity (K) using stream_id sharding. A lock-free dispatcher distributes streams to workers via atomic steering tables; idle workers perform work steal…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Leverage per-key sequence buffers in the Transformer: map key->ordered queue, one global bounded channel, and a speculative layer that routes to fast-path and slow-path with a commit/rollback protocol",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a shared bounded queue with per-tenant FIFO buffers. Each event has tenant_id and event_id. Guarantee per-tenant in-order processing via buffers of size K and a credit-based scheduler that allocat",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis tests mastery of lock-free data structures, per-key ordering guarantees, and dynamic resizing under backpressure in realistic streaming scenarios.\n\n## Key Concepts\n- Lock-free MPMC queues\n- Per-stream ordering guarantees\n- Dynamic worker pool resizing\n- Backpressure signaling and spill-over mechanisms\n\n## Code Example\n```javascript\n// Pseudo-sketch: per-stream ring buffers, atomic counters, steering logic\n```\n\n## Follow-up Questions\n- How do you prevent livelock during extreme traffic bursts?\n- How would you extend this design for cross-node coordination and failure recovery?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "concurrency-q-4",
-        "questionId": "q-13844",
-        "question": "In a high-concurrency feature-flag service, many clients request the value of the same flag keys concurrently. Build a bounded, per-key coalescing cache in Go or Python asyncio that ensures only one upstream fetch per key at a time, serves waiting requests from the in-flight result, preserves per-key FIFO order, and supports cancellation and eviction. Include backpressure signaling, error handling, a minimal runnable example, and a plan for testing correctness, fairness, and failure recovery?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Two-tier queue: each tenant has a bounded local queue (e.g., 4 in-flight). A global semaphore caps total in-flight jobs (e.g., 16). Producers enqueue to their tenant queue; a scheduler dispatches when capacity permits,…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "A two-layer design: per-instrument bounded FIFOs and a global bounded dispatcher. Producers push into an instrument-specific Tokio MPSC with cap; when full, backpressure stalls enqueue. Dispatcher pol",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Leverage a per-key in-flight coalescing map. On request(key): if in cache, return; if in-flight, await the same future; else start a single upstream fetch, then fulfill all waiters, cache the result,",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use a bounded queue channel and a scalable worker pool. Start with minWorkers; a scaler grows workers when queue length crosses a high watermark and shrinks when it falls below a low watermark, bounde",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes advanced concurrency: per-key coalescing, backpressure, and robust error handling in a low-latency path.\n\n## Key Concepts\n- Per-key in-flight coalescing\n- Bounded cache with eviction\n- Backpressure via semaphore\n- Cancellation and failure handling\n\n## Code Example\n```python\n# minimal sketch of request(key) using asyncio\n```\n\n## Follow-up Questions\n- How would you extend to multi-region replication? \n- How do you test eviction correctness and fairness?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "concurrency-q-5",
-        "questionId": "q-8107",
-        "question": "Design a concurrent per-vehicle telemetry processor. N producers emit events with vehicle_id and timestamp into bounded per-vehicle buffers of size B. M workers consume from all buffers, preserving per-vehicle in-order delivery across producers. Support dynamic worker resizing, per-vehicle backpressure, and a lateness policy: drop events with timestamp older than T relative to processing time; otherwise enqueue. Provide data structures and a concrete test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-tenant FIFO queues backed by a lock-free ring and a bounded global queue feeding a dynamic worker pool. Each event carries tenant_id and seq; dispatcher enforces order via per-tenant cursors. Back",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose per-vehicle bounded FIFOs of size B and a shared dispatcher. Producers append to the vehicle queue; workers fetch the heads, maintaining per-vehicle order with per-vehicle sequence numbers. Ba",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Design a beginner-friendly system for an IoT telemetry gateway where many devices publish readings at varying rates. Each device has its own FIFO buffer; a dispatcher feeds a bounded global queue consumed by a small wor…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a three-stage pipeline with per-user session keys, bounded per-key buffers, and a watermark-based event-time model. Propagate backpressure with PAUSE/RESUME tokens from Aggregator to Transforme",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis problem probes practical concurrency control in streaming telemetry, combining per-key ordering with backpressure and dynamic scaling.\n\n## Key Concepts\n- Per-vehicle ordering, bounded buffers\n- Backpressure signaling and dynamic worker pools\n- Late-event policy and exactly-once considerations\n\n## Code Example\n```javascript\n// Skeleton illustrating queues and dispatcher\n```\n\n## Follow-up Questions\n- How would you implement exactly-once semantics with failure recovery?\n- What diagnostics would you add to observe tail latency per vehicle?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "concurrency-q-6",
-        "questionId": "q-7885",
-        "question": "Design a beginner-friendly concurrency dispatcher for a multi-tenant financial alert system: many producers from different tenants emit alert events that must be delivered to downstream processors in per-tenant FIFO order. Use a bounded global queue and per-tenant buffers with a small worker pool. Add a simple dynamic quota that throttles tenants when latency rises, and implement a spillback retry with exponential backoff. Explain fairness, ordering, and a minimal test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design uses a bounded global queue with per-tenant FIFO buffers and a small worker pool. Schedule via round-robin across tenants with a per-tenant token bucket; throttle when latency rises by delaying token acquisition…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use a fixed-size bounded ring buffer for the global queue and per-tenant FIFO subqueues. An arbiter assigns workers to the oldest event from a tenant, guaranteeing per-tenant order while preserving in",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Approach: Bind each device key to a worker shard using a consistent hashing scheme, and implement a versioned topology registry. During reconfiguration, perform a two-phase handoff: (1) pause new events for affected key…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "A two-layer design: per-instrument bounded FIFOs and a global bounded dispatcher. Producers push into an instrument-specific Tokio MPSC with cap; when full, backpressure stalls enqueue. Dispatcher pol",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nExposes understanding of bounded queues, backpressure, per-tenant ordering, and simple dynamic throttling in a realistic setting.\n\n## Key Concepts\n- Bounded queues and backpressure\n- Per-tenant FIFO guarantees\n- Lightweight dynamic quotas based on latency\n- Spillback retries with backoff and idempotence concerns\n\n## Code Example\n```javascript\n// pseudo sketch: queue creation and round-robin scheduler\n```\n\n## Follow-up Questions\n- How would you simulate latency bursts in tests?\n- How would you prove fairness under varying tenant loads?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "concurrency-q-7",
-        "questionId": "q-14353",
-        "question": "Design an intermediate concurrency problem: a bounded, multi‑stage risk‑check pipeline for high‑frequency trading. Ingest trade events from N venues into a global bounded queue. Each trade has symbol, trade_id, and timestamp. Guarantee per-symbol in‑order processing across venues under backpressure. Implement per-symbol bounded buffers of size K, a stateless risk-check stage with M workers, and a dynamic fast-path for volatile symbols that preserves per-symbol order. Provide a runnable sketch and test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Approach: maintain a bounded global queue and per-client FIFO queues. Use a round-robin scheduler that selects the oldest non-empty client queue; workers pull and process. If the global queue is full,",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "## Complete Solution ### Data Structures ```javascript // Concrete implementation in TypeScript-like pseudocode interface Task { id: string; tenant_id: string; priority: number; // 1-10, higher = more urgent deadline: n…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Per-symbol FIFO buffers of size K, a bounded global queue, and per-symbol sequence numbers ensure ordering across venues under backpressure. A pool of M stateless risk-check workers consumes from each per-symbol buffer,…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Implement a bounded global queue with per-user FIFO buffers. A dispatcher mirrors each event into a per-user queue and a small worker pool drains buffers in a controlled round-robin. Enforce per-user",
-            "isCorrect": false
-          }
-        ],
         "explanation": "## Why This Is Asked\nThis question evaluates understanding of per-symbol ordering under backpressure, dynamic path routing, and comprehensive testing strategies for real-time trading systems.\n\n## Key Concepts\n- Per-symbol in-order processing across multiple venues\n- Bounded buffers and global backpressure signaling\n- Dynamic fast-path routing for volatility spikes\n- Testing: bursts, late data arrival, skew scenarios, and graceful shutdown\n\n## Code Example\n```javascript\n// Runnable sketch: enqueue with per-symbol sequence, dispatch to risk-check worker pool\n```\n\n## Follow-up Questions\n- How would you handle symbol reassignment between fast-path and regular workers?\n- What metrics would you monitor for system health?\n- How do you ensure exactly-once processing semantics?",
         "difficulty": "intermediate"
       },
       {
-        "id": "concurrency-q-8",
-        "questionId": "q-30506",
-        "question": "Design a beginner-friendly concurrency exercise: a multi-tenant serverless scheduler. Tenants (A-D) submit function invocations; a global bounded worker pool executes functions. Each tenant's invocations must be processed in arrival order (per-tenant FIFO), while invocations from different tenants are interleaved for parallelism. Implement per-tenant buffers, global backpressure, and a degradation path: when backlog grows, suspend low-priority tenants and let high-priority ones proceed with a best-effort policy. Provide a concrete test plan for per-tenant ordering, backpressure, and degradation fairness?",
+        "id": "concurrency-q-11",
+        "questionId": "q-19243",
+        "question": "Design a beginner-friendly concurrency exercise: multiple regional agents submit tickets concurrently into per-region FIFO buffers. A bounded global queue feeds a small worker pool that allocates tickets to regional queues. Enforce per-region ordering, apply backpressure when the global queue is full, and implement an aging rule that promotes long-waiting tickets to a high-priority path. Explain test plan and provide a minimal reference implementation in Go or Python. Would you write tests that verify ordering, backpressure, aging, and graceful shutdown?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design and implement a global bounded-rate limiter using a central dispatcher with per-customer FIFO queues and a shared token-bucket pool. The dispatcher allocates tokens from a global capacity of R events/sec into per…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Per-tenant FIFO buffers feed a fixed-size worker pool. Each tenant's invocations are serialized before enqueue, preserving order; a global scheduler interleaves across tenants to maximize throughput.",
+            "text": "Use per-region FIFO buffers feeding a bounded global queue consumed by a small worker pool. Enforce per-region order by a round-robin feeder and a non-blocking push when full; apply backpressure when",
             "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use a global bounded queue (capacity N) for new join requests and per-region FIFO buffers. A worker pool dequeues from region buffers, batches 2–4 players, and dispatches to the game server. Enqueue b",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use per-key ordered buffers with a central bounded queue, assign each key a sequence number, and maintain a moving watermark. Workers dequeue ready events by key priority, pushing late events to the c",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "Why This Is Asked\nTests understanding of per-group ordering within a shared pool, dynamic backpressure signaling to producers, and a degradation strategy that preserves essential throughput under load. The scenario mirrors real-world multi-tenant schedulers in serverless platforms.\n\nKey Concepts\n- Per-tenant FIFO buffers\n- Bounded global worker pool\n- Backpressure signaling and propagation\n- Degradation path and fairness under load\n\nCode Example\n```python\nfrom collections import deque\nfrom threading import Lock, Condition\n\nclass Scheduler:\n    pass  # skeleton to implement per-tenant buffers, enqueue, and dispatch\n```\n\nFollow-up Questions\n- How would you handle sudden tenant priority flips or orphaned futures?\n- How would you test starvation guarantees and shutdown behavior?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "concurrency-q-9",
-        "questionId": "q-26708",
-        "question": "Design and implement a real-time fraud-detection pipeline for a multi-tenant e-commerce platform. Each merchant's events must be processed strictly in arrival order, but the system must bound total memory with a global queue and apply dynamic backpressure. Build a central dispatcher that routes to per-merchant FIFO queues; implement an LRU spill store for evicted non-critical events; maintain a per-merchant sequence number for crash recovery and replay to a precise checkpoint. Add a fast-path for high-priority events, support cancellation and graceful shutdown. Provide runnable sketches in Rust (Tokio) or Java and a concrete test plan covering ordering, backpressure, spill behavior, and recovery?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Architect a dispatcher that feeds per-merchant FIFO queues from a global bounded buffer with dynamic backpressure propagation. Each merchant maintains a sequence number and a durable replay log to enable deterministic r…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Per-symbol FIFO buffers of size K, a bounded global queue, and per-symbol sequence numbers ensure ordering across venues under backpressure. A pool of M stateless risk-check workers consumes from each per-symbol buffer,…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use per-device buffers keyed by device_id, each storing windows with running aggregates. Maintain a global watermark; when window_end <= watermark, flush and drop. Cap total buffered windows; on cap,",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a bounded global queue fed by many producers. Implement a dynamic worker pool that scales from minW to maxW based on queue depth (high watermark triggers growth, low watermark triggers shrink).",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Question Is Asked\n\nThis question evaluates understanding of real-time multi-tenant concurrency, strict ordering guarantees, memory-bounded processing, spillover strategies, and crash recovery patterns—all essential skills for building high-throughput fraud detection systems.\n\n## Key Concepts\n\n- **Per-tenant in-order processing**: Each merchant's events must be processed in strict arrival order while maintaining isolation between tenants.\n- **Global bounded buffer with dynamic backpressure**: Prevents unbounded memory growth by applying backpressure when queue depth approaches limits.\n- **LRU spill store**: When the global buffer is full, non-critical events are evicted to secondary storage using least-recently-used semantics, ensuring critical events are always processed.\n- **Sequence numbers for recovery**: Each merchant maintains a monotonically increasing sequence number, enabling precise checkpointing and deterministic replay after failures.\n- **Fast-path for priority events**: Latency-sensitive events like fraud alerts bypass normal queuing to ensure immediate processing.\n\n## Design Trade-offs\n\nThe solution prioritizes ordering guarantees and memory safety over absolute throughput. The LRU spill store introduces a potential performance penalty for evicted events but ensures the system never drops events under load. The per-merchant FIFO queues guarantee ordering within a tenant while the global bounded buffer prevents system-wide memory exhaustion.\n\n## Test Plan\n\n1. **Ordering verification**: Submit events from multiple merchants and assert each merchant's events are processed in sequence.\n2. **Backpressure testing**: Fill the global buffer and verify rejection/spill behavior for non-critical events.\n3. **Spill recovery**: Verify evicted events are retrievable and reprocessed in correct order after spill.\n4. **Crash recovery**: Simulate failure mid-stream, restart, and confirm replay produces identical results.\n5. **Graceful shutdown**: Verify all in-flight events complete processing and no events are lost.\n6. **Fast-path latency**: Measure fraud alert processing time versus normal events to confirm prioritization.",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "concurrency-q-10",
-        "questionId": "q-6884",
-        "question": "In a real-time telemetry pipeline for multi-region IoT devices, design a bounded, region-scoped concurrency model that preserves per-region event order while capping memory usage. Describe data structures, backpressure signaling, and region lifecycle, and provide a runnable prototype outline in Go or Python showing enqueue, per-region dispatch, backpressure, and graceful shutdown. What tests would you add to verify ordering and backpressure?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Propose a bounded queue + per‑stream priority scheduler. Use a global maxsize with producers awaiting when full; a small worker pool drains by always preferring high, then medium, then low; implement",
-            "isCorrect": false
           },
           {
             "id": "b",
@@ -324,207 +354,327 @@
           },
           {
             "id": "c",
-            "text": "Implement region-scoped FIFO queues with a global bounded semaphore for memory control. Each region maintains its own ordered queue; a fixed worker pool drains region queues in round-robin fashion to preserve per-region…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Propose a bounded, multi-tenant task router: a global queue with capacity N, plus per-tenant FIFO buffers. Implement a fair scheduler that prevents starvation under bursts by aging: waiting tenants ga",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests multi-region concurrency, backpressure propagation, and dynamic lifecycle management in realistic telemetry pipelines.\n\n## Key Concepts\n- Region-scoped FIFO queues maintaining strict ordering\n- Global bounded capacity with per-region quotas\n- Fairness across regions via round-robin draining\n- Backpressure signaling with exponential backoff\n- Idle-region retirement and automatic reactivation\n\n## Code Example\n```javascript\n// sketch: region queue management and worker coordination\n```\n\n## Follow-up Questions\n- How would you measure end-to-end latency under burst conditions?\n- What monitoring metrics would you track for system health?\n- How would you handle region-specific priority requirements?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "concurrency-q-11",
-        "questionId": "q-29879",
-        "question": "Design a beginner-friendly concurrency exercise: a distributed event router for an analytics pipeline. Dozens of producers emit events tagged by topic. A central router maintains per-topic FIFO buffers and forwards to a fixed-size worker pool. Ensure per-topic ordering, bounded buffering, and backpressure by delaying incoming events when the global backlog grows, plus graceful producer shutdown and a concrete test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Leverage a bounded global queue and per-image FIFO buffers. Each image_id has a small pending buffer for parts; decode workers assemble parts by part_idx, emitting complete images to analyze workers v",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement per-symbol FIFO queues, a bounded global work queue, and a small worker pool. Preserve per-symbol ordering, use round-robin across symbols for fairness, and backpressure: if the global queue",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design uses a bounded global queue with per-tenant FIFO buffers and a small worker pool. Schedule via round-robin across tenants with a per-tenant token bucket; throttle when latency rises by delaying token acquisition…",
+            "text": "Implement per-room sequence numbers with bounded FIFO buffers (size B) managed by a central dispatcher feeding a global bounded queue (size Q). Workers pull from the global queue and route to room-specific deliverers th…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use per-topic FIFO buffers with a bounded global queue, a small worker pool, and a central dispatcher. Each topic has its own channel; events are enqueued non-blockingly. When backlog exceeds a thresh",
-            "isCorrect": true
+            "text": "In a log-aggregation pipeline, implement per-service FIFO buffers feeding a bounded global worker pool. Each service's logs preserve arrival order; inter-service logs can interleave. On backlog, degra",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests practical understanding of per-topic ordering, bounded buffers, and backpressure in a concurrent router using channels and worker pools.\n\n## Key Concepts\n\n- Per-topic FIFO\n- Bounded buffering\n- Global backpressure\n- Graceful shutdown\n- Testing under burst and steady-state\n\n## Code Example\n\n```go\n// skeleton of dispatcher with per-topic buffers\npackage main\n\ntype Event struct { Topic string; Data interface{} }\n\n// simplified sketch; real impl uses sync.Map and channels\n```\n\n## Follow-up Questions\n\n- How would you ensure fairness across topics under skew?\n- How would you test ordering guarantees with random delays?",
+        "explanation": "## Why This Is Asked\nThe scenario adds per-region fairness with aging and backpressure, offering a realistic beginner task beyond basic queues.\n\n## Key Concepts\n- Bounded channels, per-region FIFOs\n- Fair scheduling and backpressure\n- Aging and priority paths\n- Graceful shutdown tests\n\n## Code Example\n```javascript\n// Skeleton illustrating queues and worker flow\n```\n\n## Follow-up Questions\n- How would you diagnose a deadlock in this setup?\n- How would you adapt for dynamic region scaling?",
         "difficulty": "beginner"
       },
       {
         "id": "concurrency-q-12",
-        "questionId": "q-9974",
-        "question": "Design a beginner-friendly concurrency controller for a log-forwarding system where dozens of microservices emit logs concurrently. Implement a bounded global queue and per-service FIFO buffers to preserve per-service order. Add a time-slice scheduler: the worker pool processes at most a configurable time budget per service per round. When backlog grows beyond a threshold, enable a fast-path sampler that drops non-critical logs to meet SLA while preserving critical services. Explain backpressure, fairness, and provide a concrete test plan?",
+        "questionId": "q-773",
+        "question": "In a Go HTTP server, you maintain a per-user quota counter in memory. Multiple requests for different users should advance concurrently, but updates to the same user must be serialized. Design a striped lock (a fixed set of mutexes) to guard a map[string]int, map userID to a bucket via hashing, and explain how you minimize contention, handle hash collisions, and ensure correctness when entries may be evicted?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use N per-client FIFO queues and a fixed worker pool. Each client has a credit counter; producers enqueue only when credits>0, decrementing atomically. (A) Lock-based: guard each queue with a mutex; a",
-            "isCorrect": false
+            "text": "Use a striped lock: a fixed-size slice of mutexes guards a map[string]int quotas. Hash userID to bucket index, lock bucket, read-modify-write, unlock. This lowers contention vs a global lock. Collisio",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Implement per-tenant FIFO lanes using fixed-capacity lock-free queues. Route events from the global queue to corresponding tenant lanes via deterministic partitioning on tenant_id. Assign tenant shards to each worker fo…",
+            "text": "In a log-aggregation pipeline, implement per-service FIFO buffers feeding a bounded global worker pool. Each service's logs preserve arrival order; inter-service logs can interleave. On backlog, degra",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement a bounded global queue with per-service FIFO buffers, and a round-robin time-slice scheduler giving each service a fixed time budget per round. Enforce a per-round cap on processed work. Whe",
-            "isCorrect": true
+            "text": "Propose a per-symbol partitioned, bounded ring-buffer with credit-based flow. Producers atomically decrement a per-partition credit counter to enqueue, avoiding locks; consumers advance a per-partitio",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a bounded global queue plus per-document FIFO queues. Edits carry document_id, user_id, op_id, and a vector clock. A dispatcher routes edits to the per-document queue only after all causal predece",
+            "text": "In Go, use a bounded global channel and per-service FIFOs feeding it. Backpressure by blocking producers when the global queue is full (or returning retriable errors). Implement a partial-aggregation",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to reason about bounded resources, ordering guarantees, and gradual degradation under load in a realistic log-forwarding scenario.\n\n## Key Concepts\n- Bounded queues and per-service buffers\n- Time-slice scheduling and round-robin fairness\n- Backpressure and fast-path degradation\n- Priority/fairness guarantees for critical services\n\n## Code Example\n```javascript\n// Sketch of a time-slice scheduler pseudocode\nclass Scheduler {\n  constructor(budgetMs){...}\n  schedule(tasks) { ... }\n}\n```\n\n## Follow-up Questions\n- How would you adapt this for multi-machine deployment and failure modes?\n- How would you measure fairness and SLA under bursty traffic?",
+        "explanation": "## Why This Is Asked\n\nTests understanding of fine-grained synchronization and practical trade-offs for high-concurrency in-memory state.\n\n## Key Concepts\n\n- Striped locking for reduced contention\n- Lock granularity vs global lock\n- Handling hash collisions with buckets\n- Eviction strategies and correctness\n\n## Code Example\n\n```javascript\n// Go-like pseudocode demonstrating striped locks\ntype Striped struct {\n  locks []sync.Mutex\n  quotas map[string]int\n}\nfunc NewStriped(n int) *Striped { ... }\nfunc (s *Striped) Inc(id string) { idx := hash(id) % len(s.locks); s.locks[idx].Lock(); defer s.locks[idx].Unlock(); s.quotas[id]++ }\n```\n\n## Follow-up Questions\n\n- What happens if bucket count is too small? how to resize safely?\n- How would you extend to support read-heavy workloads (readers-writer locks)?",
         "difficulty": "beginner"
       },
       {
         "id": "concurrency-q-13",
-        "questionId": "q-8215",
-        "question": "Design a real-time fraud-processing task scheduler with many per-account streams. Use a global bounded queue and per-account FIFO buffers. Each task has a deadline; implement a deadline-aware scheduler that prioritizes high-SLA tasks, preempts or stalls lower-SLA tasks as deadlines approach, and applies backpressure when the global queue is full. Provide runnable Go pseudocode and a concrete test plan?",
+        "questionId": "q-13228",
+        "question": "Design an intermediate concurrency problem: implement a dynamic, lock-free bounded multi-producer multi-consumer scheduler for a streaming analytics pipeline. Each input event has stream_id and event_id. Guarantee per-stream in-order processing across a worker pool that can resize at runtime. Use per-stream bounded queues, a global balancer, and a backpressure signal when thresholds are hit. Provide a runnable sketch and concrete test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a global bounded intake channel feeding per-tenant FIFO queues. A dispatcher allocates work to a fixed worker pool using a round-robin over active tenants, preserving order via next_seq per tenant",
+            "text": "Use a central bounded bus feeding a dispatcher that writes into per-tenant FIFO queues (ring buffers). Block enqueue when a tenant queue hits capacity; workers drain queues round-robin to preserve order.",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a deadline-aware scheduler with a global bounded queue and per-account FIFO buffers; ensure high-SLA streams are prioritized, allow preemption or stall of lower-SLA tasks as deadlines near, and",
-            "isCorrect": true
+            "text": "Design a publish-subscribe event bus with a bounded global queue, topic-tagged messages, and a pool of broadcaster workers. Preserve per-topic FIFO in subscriber queues, enforce cross-topic fairness,",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use a Lock around the increment: with lock: counter += 1 in each thread. Spawn 4 threads, each loops 1000 times. Final value should be 4000. Without the lock, race conditions may yield a final value l",
+            "text": "Propose a streaming dataflow with per-window bounded queues and a dynamic worker pool. Map events to fixed 1s windows; maintain a watermark. If a late event arrives past the watermark, cancel the corr",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design a per-user FIFO pipeline with a global bounded queue and per-user local buffers. Route events by user_id to dedicated worker queues, maintain per-user sequence ordering, support dynamic worker",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nExamines real-time scheduling with strict deadlines, multi-tenant fairness, and dynamic backpressure under load—common at fraud detection systems.\n\n## Key Concepts\n\n- Deadline-aware scheduling\n- Global vs per-account queues\n- Preemption and backpressure\n- SLA-focused testing and cancellation handling\n\n## Code Example\n\n```go\ntype Task struct {\n  ID       string\n  Account  string\n  Deadline time.Time\n  Payload  interface{}\n  Cancel   <-chan struct{}\n}\ntype Scheduler struct {\n  Global   chan *Task\n  PerAcct  map[string]chan *Task\n}\nfunc (s *Scheduler) Run() {\n  // simplified: pick next by earliest deadline from ready queues\n}\n```\n\n## Follow-up Questions\n\n- How would you test for starvation under mixed SLA values?\n- How would you extend to dynamic priority boosts for urgent tasks?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "concurrency-q-14",
-        "questionId": "q-29945",
-        "question": "Design an intermediate concurrency problem: implement a three-stage streaming pipeline that guarantees exactly-once per-record processing without external transactions. Ingress: N producers emit (record_id, key, ts, value). Stage1: M stateless transformers; Stage2: K per-key in-order aggregators; Stage3: durable sink. Requirements: bounded buffers with backpressure, dynamic worker resizing, per-key in-order across all stages, and an in-memory dedup/commit buffer to handle replays. Provide data structures, a runnable sketch, and a test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-tenant FIFO queues with a global bounded backlog B. Each tenant's producer feeds its queue; a fixed pool of workers pops from tenants in round-robin while preserving per-tenant order. Backpressure is applied to all…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "An in-memory, three-stage streaming pipeline with exactly-once semantics. Ingress: N producers emit (record_id, key, ts, value). Stage1: M stateless transforms emit (record_id, key, ts, value'). Stage",
+            "text": "Approach: Implement per-stream FIFO ring buffers with configurable capacity (K) using stream_id sharding. A lock-free dispatcher distributes streams to workers via atomic steering tables; idle workers perform work steal…",
             "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Propose a two-stage pipeline with per-user ordering and dynamic rebalancing. Map user_id to a worker using a consistent-hash ring; when load rises, rebalance a subset of users to less-busy workers whi",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement: per-device FIFO buffers feeding a bounded global queue; producers block when full. Degrade when backlog exceeds threshold by dropping older items for low-priority devices and keeping only t",
-            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design a resilient three-stage pipeline with exactly-once semantics, per-key ordering across stages, backpressure handling, and dynamic scaling without external transactions.\n\n## Key Concepts\n- Exactly-once processing without external transactions\n- Per-key in-order delivery across multiple stages\n- Bounded queues and backpressure propagation\n- In-memory dedup/commit buffers and lightweight checkpoints\n- Dynamic worker resizing and deadlock avoidance\n\n## Code Example\n```java\nclass Record { long recordId; String key; long ts; String value; }\n```\n\n## Follow-up Questions\n- How would you implement dedup with TTL and memory budgeting? \n- How would you detect and recover from partial failures during resize?",
+        "explanation": "## Why This Is Asked\nThis tests mastery of lock-free data structures, per-key ordering guarantees, and dynamic resizing under backpressure in realistic streaming scenarios.\n\n## Key Concepts\n- Lock-free MPMC queues\n- Per-stream ordering guarantees\n- Dynamic worker pool resizing\n- Backpressure signaling and spill-over mechanisms\n\n## Code Example\n```javascript\n// Pseudo-sketch: per-stream ring buffers, atomic counters, steering logic\n```\n\n## Follow-up Questions\n- How do you prevent livelock during extreme traffic bursts?\n- How would you extend this design for cross-node coordination and failure recovery?",
         "difficulty": "intermediate"
       },
       {
-        "id": "concurrency-q-15",
-        "questionId": "q-19319",
-        "question": "Design a beginner-friendly concurrency controller for a video ingest system with thousands of streams (producers) sending chunks tagged by stream-id into a bounded global queue consumed by a small worker pool. Preserve per-stream FIFO order, apply backpressure when full, and implement a compaction path that drops late chunks for inactive streams under backlog pressure. How would you test per-stream ordering, backpressure behavior, and compaction correctness?",
+        "id": "concurrency-q-14",
+        "questionId": "q-21693",
+        "question": "Design a bounded, per-customer FIFO dispatch system for a rideshare platform where thousands of drivers subscribe to their own queues; producers publish ride requests; the dispatcher must route to per-customer queues, ensure per-customer order, apply backpressure to producers when queues fill, support dynamic worker pools, and provide a runnable minimal Python asyncio sketch?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement a bounded dispatch system that ingests events with subscriber_id and event_id; guarantee per-subscriber order across a dynamic worker pool; provide sticky routing so each subscriber's events",
+            "text": "Maintain per-tenant, per-session FIFO buffers and a global bounded queue. Each buffer holds events ordered by event_id; a scheduler ensures only the head of each buffer is dispatched, guaranteeing per",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use per-stream FIFO buffers keyed by stream-id, backed by a single bounded global queue consumed by a small worker pool. Producers enqueue chunks into per-stream buffers; a scheduler drains each stream's buffer in round…",
+            "text": "Implement a central broker with a bounded global queue and per-customer FIFO queues. Producers enqueue ride requests to the global queue; a dispatcher assigns tasks to the corresponding per-customer q",
             "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Implement per-tenant FIFO queues and a shared bounded queue. Each tenant has a token-bucket budget to permit bursts; enqueue blocks when budget is exhausted to apply backpressure. Dispatcher uses a mi",
+            "text": "Per-cell bounded FIFOs and a dispatcher using consistent hashing route events to workers. Each worker keeps a per-cell last_seq and only processes a message if its seq is last_seq+1; gaps are buffered",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Represent tasks as nodes with in-degrees and adjacency lists. Each worker owns a local queue; when a task’s in-degree becomes 0, enqueue to a worker. On completion, atomically decrement children and e",
+            "text": "Use per-tenant circular buffers and a sequencer to preserve per-tenant order. Maintain a global token bucket for backpressure; route to workers with a stable hash of tenant_id; lock-free structures (e",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question tests the ability to design a practical scheduler with per-stream ordering, backpressure, and a degradation path under backlog. It evaluates understanding of idleness handling and compaction strategies.\n\n## Key Concepts\n- **Per-stream FIFO buffers**: Maintain insertion order for each stream\n- **Global bounded queue**: Enforce capacity limits and trigger backpressure\n- **Scheduling policy**: Fair drainage across streams (e.g., round-robin, weighted fair queuing)\n- **Compaction/dropping policy**: Graceful degradation under backlog (e.g., drop late chunks for inactive streams)\n\n## Testing Approach\n- **Per-stream ordering**: Verify chunks from each stream-id are processed in insertion order using sequence numbers or timestamps\n- **Backpressure behavior**: Monitor producer blocking when the global queue reaches capacity; verify resumed processing after space frees\n- **Compaction correctness**: Simulate inactive streams under backlog; confirm late chunks are dropped while maintaining reasonable throughput for active streams",
+        "explanation": "## Why This Is Asked\nThis question tests ability to design a scalable, low-latency dispatcher that preserves per-key ordering while handling bursts and worker pool dynamics. It also probes failure handling and backpressure reasoning in a distributed system.\n\n## Key Concepts\n- Bounded queues and backpressure propagation\n- Per-customer FIFO ordering (per-key sequencing)\n- Dispatcher design and worker pool fairness\n- Acks, retries, cancellation, and shutdown\n\n## Code Example\n```python\n# Minimal sketch of dispatcher and queues\nimport asyncio\n\nasync def demo():\n    global_q = asyncio.Queue(2)\n    per_customer = {}\n\n    async def producer(cid, item):\n        await global_q.put((cid, item))\n\n    async def dispatcher():\n        while True:\n            cid, item = await global_q.get()\n            q = per_customer.setdefault(cid, asyncio.Queue(4))\n            await q.put(item)\n            global_q.task_done()\n\n    async def worker(cid):\n        q = per_customer[cid]\n        while True:\n            it = await q.get()\n            # process(it)\n            q.task_done()\n\n    # startup omitted for brevity\n```\n\n## Follow-up Questions\n- How would you test per-customer ordering under bursty Producer load?\n- How would you handle graceful shutdown with in-flight tasks?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "concurrency-q-15",
+        "questionId": "q-14201",
+        "question": "Design a beginner-friendly concurrency exercise: a chat moderation pipeline where thousands of client events arrive concurrently; implement a bounded global queue feeding a small moderator pool, with per-chat-room FIFO buffers to preserve order, a per-room rate limiter to curb bursts, and a 'soft-drop' path that drops messages from least-active rooms when backlog exceeds a threshold while guaranteeing at least one message per active room. How would you approach testing and correctness?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a fixed-size bounded ring buffer for the global queue and per-tenant FIFO subqueues. An arbiter assigns workers to the oldest event from a tenant, guaranteeing per-tenant order while preserving in",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Approach: a bounded global ring buffer with per-room FIFO queues inside workers; use CAS-based handoffs to avoid locks; maintain an LRU of active rooms to guide eviction. Overflow discards oldest mess",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "A beginner-friendly concurrency router for media encoding: producers publish jobs tagged by format (mp4, webm, gif) into a bounded global queue. A per-format dispatcher feeds dedicated worker pools wi",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a bounded global queue fed by a small moderator pool, with per-chat-room FIFO buffers to preserve order. Implement a per-room rate limiter (token bucket) and a soft-drop path that drops messages f",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of backpressure, fairness, and state management in a practical concurrency task, focusing on per-room buffering and degradation path in a streaming-like workload.\n\n## Key Concepts\n- Bounded queues and backpressure\n- Per-room FIFO buffers\n- Per-room rate limiting\n- Soft-drop degradation\n- Graceful shutdown and in-flight handling\n\n## Code Example\n```javascript\n// Simple token bucket rate limiter\nclass TokenBucket {\n  constructor(rate, capacity) {\n    this.rate = rate;\n    this.capacity = capacity;\n    this.tokens = capacity;\n    this.last = Date.now();\n  }\n  allow() {\n    const now = Date.now();\n    const delta = (now - this.last) / 1000;\n    this.tokens = Math.min(this.capacity, this.tokens + delta * this.rate);\n    this.last = now;\n    if (this.tokens >= 1) {\n      this.tokens -= 1;\n      return true;\n    }\n    return false;\n  }\n}\n```\n\n## Follow-up Questions\n- How would you test per-room ordering under concurrent producers?\n- How would you determine backlog thresholds and verify graceful shutdown?",
         "difficulty": "beginner"
       },
       {
         "id": "concurrency-q-16",
-        "questionId": "q-21789",
-        "question": "Design a bounded, partitioned queue system for a real-time channel moderation pipeline that must preserve per-channel order while scaling to millions of channels. Propose a bounded queue where each channel has its own FIFO subqueue and a fixed-size dispatcher/worker pool drains them fairly. Include per-channel backpressure, SLA-based spill policies, and cancellation support. Provide a runnable Go sketch and a testing plan?",
+        "questionId": "q-10210",
+        "question": "Design a per-app partitioned streaming processor for real-time analytics: dozens of mobile apps emit events at high velocity. Build a bounded, backpressured pipeline with per-app queues, a small worker pool, and dynamic rebalancing when a partition lags. Guarantee per-app event ordering, at-least-once ingestion, and exactly-once sinks with idempotent writes. Include a runnable scaffold in Go or Python and a testing plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use per-tenant sequence clocks and per-tenant in-flight buffers. Route by tenant to a dynamic pool of workers while preserving per-tenant FIFO across stages. Implement a bounded global queue to apply",
+            "text": "Build per-tenant FIFO queues behind a bounded global queue. A dispatcher drains across tenants with fairness, while producers block when the global queue is full to apply backpressure. If backlog stay",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "## Solution Design ### Architecture Overview A partitioned queue system with per-channel FIFO subqueues, a dispatcher pool, and SLA-based spill policies. ### Core Components 1. **Channel Queues**: Each channel maintains…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
             "text": "Design a per-room broadcast system for a real-time chat platform. N producers publish events with fields room_id, event_id, type, and payload into a bounded global queue. A distributor routes events to per-room worker p…",
             "isCorrect": false
           },
           {
+            "id": "c",
+            "text": "Partition events by app, each with a bounded per-app queue and a small worker pool. Producers backpressure when queues fill; a lag detector triggers dynamic rebalancing across partitions. Guarantee pe",
+            "isCorrect": true
+          },
+          {
             "id": "d",
-            "text": "Use a per-tenant FIFO queue and a single bounded backlog. Each tenant gets a dynamic quota updated by a central scheduler (token buckets that adjust to burstiness). A dispatcher drains queues in weigh",
+            "text": "Implement per-room sequence numbers with bounded FIFO buffers (size B) managed by a central dispatcher feeding a global bounded queue (size Q). Workers pull from the global queue and route to room-specific deliverers th…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question evaluates the ability to design scalable, fair, low-latency concurrency systems that must respect per-channel ordering while handling bursty traffic and backpressure in a real-time moderation pipeline.\n\n## Key Concepts\n\n- **Partitioned queues with per-channel FIFO**: Isolate channel traffic to guarantee ordering within each channel while enabling horizontal scaling\n- **Bounded capacity and global fairness**: Prevent memory exhaustion through global limits and ensure no channel starves others\n- **Per-channel credits and SLA-aware spill**: Implement backpressure signals and configurable spill policies based on message age or priority\n- **Context-based cancellation**: Support graceful shutdown and per-message cancellation for responsive system termination\n\n## What This Tests\n\n- System design under constraints\n- Concurrency patterns in Go (channels, mutexes, wait groups)\n- Understanding of tradeoffs between throughput, latency, and memory usage\n- Production thinking: graceful degradation, observability, and fault tolerance",
+        "explanation": "## Why This Is Asked\n\nTests expertise in building robust streaming pipelines with real-world constraints: per-partition ordering, bounded buffers, backpressure, dynamic rebalancing, and exactly-once sinks. It also probes fault tolerance, replay semantics, and test strategy.\n\n## Key Concepts\n\n- Per-app partitioning and ordering\n- Bounded buffers and backpressure\n- Lag detection and dynamic rebalancing\n- Exactly-once sinks and idempotence\n- Checkpointing and replay\n\n## Code Example\n\n```javascript\n// Pseudo-scaffold: bounded per-app queue with workers\nclass Partition {\n  constructor(id) { this.id=id; this.q=[]; this.workers=2; }\n  enqueue(ev){ if(this.q.length>MAX) throw 'backpressure'; this.q.push(ev); }\n  async run(){\n    while(this.q.length){ const e=this.q.shift(); await this.process(e); }\n  }\n  async process(e){ /* write to sink atomically; ensure idempotence */ }\n}\n```\n\n## Follow-up Questions\n\n- How would you test ordering guarantees during dynamic rebalancing?\n- How to pick MAX queue sizes for skewed apps?\n- How would you implement exactly-once with a non-transactional sink?",
         "difficulty": "advanced"
       },
       {
         "id": "concurrency-q-17",
-        "questionId": "q-23791",
-        "question": "Design a real-time, multi-tenant task dispatcher with a bounded global queue. Producers publish tasks labeled by tenant_id and task_id into capacity-1000 queue. Dispatcher must preserve per-tenant FIFO, use a dynamic worker pool, and apply backpressure to producers when full. Add a degradation path: if backlog exceeds 85% for > 2s, redirect new tasks of slow tenants to a late-queue with looser ordering. Provide runnable sketch and test plan?",
+        "questionId": "q-25952",
+        "question": "Design a beginner-friendly concurrency exercise: many producers publish events into a bounded global queue consumed by a small worker pool. Each event includes user_id and priority (HIGH/LOW). Preserve per-user FIFO ordering, enforce backpressure when the queue is full, and implement a degradation path that drops LOW priority events beyond a threshold while still logging metrics. Describe a practical test plan for per-user ordering, backpressure, and degradation?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Per-user bounded queues (user_id -> ring buffer size B) with next_expected_seq[user]. A dispatcher marks ready users; M workers consume in-order sequences across keys. Support dynamic resizing by reba",
+            "text": "Implement a bounded global backlog with per-topic FIFO buffers and a round-robin worker dispatcher. Producers enqueue into a shared bounded channel; a central dispatcher forwards items to per-topic queues, which are dra…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Per-tenant queues + a bounded global queue. A scheduler assigns tenants to workers; Stage 1 enriches with simulated latency; Stage 2 updates per-tenant aggregates. Preserve per-tenant in-order across",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a bounded global queue (size N) with per-user FIFO buffers. Producers publish events into their user-specific buffer, ensuring per-user FIFO ordering. A dispatcher pulls events from user buffers in round-robin…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use per-client FIFO queues and a global bounded backlog. A single batcher selects the oldest requests across clients, fills batches of 32, and sends to the GPU; results route to the originating client",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "This question assesses understanding of core concurrency concepts: bounded queues with backpressure, ordering guarantees across multiple producers, and graceful degradation under load. It requires balancing fairness (round-robin dispatching) with priority (degradation policy), and observing system behavior through metrics. Candidates should also discuss blocking versus non-blocking backpressure strategies and their trade-offs.",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "concurrency-q-18",
+        "questionId": "q-7089",
+        "question": "Design a latency-sensitive, per-tenant fair scheduler for a multi-tenant streaming job system: N tenants, each with a dynamic quota and an independent FIFO queue; M workers pull jobs from any tenant queue, preserving per-tenant ordering, enforcing quotas via token buckets, and applying backpressure to tenants when global queue fills. How would you implement data structures, dynamic tenant changes, and a concrete test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a two-layer scheduler: per-tenant FIFO queues guarded by a token-bucket quota, and a central arbiter that assigns M workers via deficit-round-robin to preserve per-tenant order while ensuring f",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Per-user sharded queues with a central sequencer. Each user tracks expected sequence; out-of-order events are buffered until the missing seq arrives, ensuring in-order processing. Use a bounded dispat",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Approach: use per-room bounded buffers and a dispatcher that polls buffers in a round-robin fashion, forwarding to a shared outbound queue with a fixed capacity. Guarantee room ordering by never reord",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a bounded global queue with per-user FIFO buffers. A dispatcher mirrors each event into a per-user queue and a small worker pool drains buffers in a controlled round-robin. Enforce per-user",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nAssesses ability to design a low-latency, fair concurrency system with per-tenant isolation, dynamic tenant management, and practical backpressure.\n\n## Key Concepts\n\n- Per-tenant FIFO ordering\n- Token-bucket quotas and dynamic tuning\n- Deficit-round-robin scheduling for fairness\n- Global spill/backpressure buffer\n- Dynamic tenant registry and safe rebalancing\n\n## Code Example\n\n```javascript\n// Pseudocode sketch\nclass TenantQueue { constructor(id){...} enqueue(t){...} }\nclass Arbiter { /* assigns slots to tenants */ }\n```\n\n## Follow-up Questions\n\n- How to detect deadlocks under skew and recover?\n- How to test with bursty tenant loads and dynamic churn?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-19",
+        "questionId": "q-17825",
+        "question": "Design a dynamic, multi-tenant task scheduler with bounded memory that ingests tasks from many tenants into a shared pool. Enforce per-tenant fairness via a credit-based budget, process per-tenant earliest-deadline-first tasks within budget, support real-time worker scaling up/down, and emit backpressure signals when buffers near limits. Provide a runnable sketch and a test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a bounded queue with capacity N; producers await when full and consumers await when empty to enforce backpressure and bounded memory. For shutdown, push a sentinel or close the queue so workers ex",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Approach: Bind each device key to a worker shard using a consistent hashing scheme, and implement a versioned topology registry. During reconfiguration, perform a two-phase handoff: (1) pause new events for affected key…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "A multi-tenant bounded-memory scheduler with per-tenant credits, EDF within quotas, dynamic worker scaling, and backpressure signaling. Use per-tenant FIFO queues, a global arbiter allocating time sli",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use asyncio with a fixed-size worker pool and a global semaphore for total in-flight bytes. Each chunk is enqueued with its index; workers fetch concurrently, storing results by index. An ordered writ",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nReal-world schedulers must handle multi-tenant fairness, backpressure, and dynamic scaling. This probes scheduling theory, memory budgeting, and resilience under burst traffic.\n\n## Key Concepts\n- Per-tenant fairness with budgets\n- EDF within quotas\n- Bounded memory and backpressure signaling\n- Dynamic worker scaling and safe rebalancing\n- Observability and test plan\n\n## Code Example\n```javascript\n// Sketch: data structures\nclass TenantQueue { /*...*/ }\nclass Scheduler { /*...*/ }\n```\n\n## Follow-up Questions\n- How would you handle stuck tasks or misbehaving tenants?\n- What metrics and tests ensure SLA compliance?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "concurrency-q-20",
+        "questionId": "q-4669",
+        "question": "In a real-time ingestion service, dozens of producers emit per-tenant events into a fixed-size global queue. Implement a bounded, multi-tenant queue that guarantees per-tenant in-order processing and fair sharing while allowing dynamic partition rebalancing without pausing producers. Provide a runnable minimal sketch in Go or Rust showing enqueue/dequeue and a basic test plan for backpressure, ordering, and rebalancing?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Approach: implement a global bounded queue feeding per-campaign FIFO buffers. Each campaign has a budget and a nextSeq; workers pull from the campaign buffer to preserve order, with dynamic resizing b",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a central bounded channel for in-flight messages, a map of per-room FIFO buffers, and a small worker pool. Producers enqueue into the room buffer, a router forwards to the global bound, and wor",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Two-level queue: a bounded global ring buffer plus per-tenant FIFO subqueues. Each event includes tenantId and a monotonic sequence. Producers push to the ring; a dispatcher forwards to the tenant’s q",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement a bounded submission system using a dual-layer rate-limiting approach: per-key leaky buckets for API key limits (2 req/s with burst 4) combined with a global token bucket for the 40 req/s cap. Each client requ…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design a bounded, multi-tenant pipeline with ordering guarantees, backpressure, and dynamic rebalancing, reflecting real-world multi-tenant systems.\n\n## Key Concepts\n- Bounded queues and backpressure\n- Per-tenant in-order processing\n- Dynamic partitioning and rebalancing\n- Memory visibility and race conditions in concurrent code\n\n## Code Example\n```go\n// Minimal sketch: global bounded channel + per-tenant queues\npackage main\nimport (\n  \"fmt\"\n)\n\ntype Event struct{ Tenant string; Seq uint64; Data string }\n\nfunc main() {\n  global := make(chan Event, 8) // bounded global queue\n  tenants := map[string]chan Event{\n    \"tA\": make(chan Event, 4),\n    \"tB\": make(chan Event, 4),\n  }\n  // enqueue example (producer)\n  go func(){ global <- Event{Tenant:\"tA\", Seq:1, Data:\"x\"} }()\n  // dispatcher (simplified)\n  go func(){ for e := range global { tenants[e.Tenant] <- e } }()\n  // worker (consumer)\n  go func(){ for e := range tenants[\"tA\"] { fmt.Println(\"work\", e) } }()\n}\n```\n\n## Follow-up Questions\n- How would you test for starvation during bursty tenant loads?\n- How would you ensure monotonic sequencing across partition rebalancing?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "concurrency-q-21",
+        "questionId": "q-30339",
+        "question": "Design a beginner-friendly concurrency controller for a real-time telemetry pipeline from edge devices to cloud analytics. Each device sends readings that must be processed in device order. A bounded global worker pool processes readings in parallel across devices. Add per-device rate limiting and a global degradation path: when backlog crosses a threshold, switch to sampling mode that processes only every Nth reading per device. Explain backpressure, per-device ordering, and provide a concrete test plan for ordering, degradation behavior, and shutdown?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use per-directory FIFO buffers and a bounded global queue; a small worker pool updates a mock index. Implement coalescing: for each file, merge rapid edits within 100ms into a single update before enq",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Per-client bounded FIFO buffers (size K) + a global scheduler that orders by arrival time and tracks per-client progress. Dispatch the oldest ready event to any worker across stages ingest→filter→enco",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "I’d implement per-device FIFO buffers feeding a bounded global queue with per-device token-bucket rate limiters. A fair scheduler preserves per-device order while enabling cross-device parallelism. On",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Map tenant_id to a per-tenant queue and a fixed-size worker pool fed by a bounded global queue. Enqueue under a tenant lock to preserve order; workers pull events by tenant sequence to maintain per-te",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question probes practical concurrency control topics: per-source ordering with cross-source parallelism, explicit backpressure, dynamic degradation, and test planning.\n\n## Key Concepts\n\n- Per-device FIFO buffers\n- Bounded global queue\n- Per-device rate limiting (token bucket)\n- Fair scheduling across devices\n- Degradation path via sampling\n- Backpressure and graceful shutdown\n\n## Code Example\n\n```javascript\n// Pseudocode sketch\nclass DeviceQueue {\n  enqueue(reading) { /* per-device lock-free FIFO */ }\n}\n```\n\n## Follow-up Questions\n\n- How would you ensure fairness under sudden bursts without starving low-volume devices?\n- What test strategy would you use to verify degradation triggers and graceful shutdown?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "concurrency-q-22",
+        "questionId": "q-7692",
+        "question": "Design a bounded, multi-tenant task router for a real-time telemetry ingest service. Producers submit per-tenant event batches; implement a global queue with max capacity N, plus per-tenant FIFO buffers. Build a fair, backpressure-aware scheduler that prevents starvation, supports dynamic tenant creation, and a small worker pool. Provide core data structures and a runnable minimal example?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Map tenant_id to a per-tenant queue and a fixed-size worker pool fed by a bounded global queue. Enqueue under a tenant lock to preserve order; workers pull events by tenant sequence to maintain per-te",
             "isCorrect": false
           },
           {
@@ -534,231 +684,81 @@
           },
           {
             "id": "c",
-            "text": "Build per-tenant FIFO queues behind a bounded global queue. A dispatcher drains across tenants with fairness, while producers block when the global queue is full to apply backpressure. If backlog stay",
-            "isCorrect": true
+            "text": "Proposed approach: implement per-agent FIFO buffers plus a bounded global queue feeding a small worker pool. Add a sampling mode activated when backlog exceeds a threshold: forward only every Kth event to the worker poo…",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Propose per-vehicle bounded FIFOs of size B and a shared dispatcher. Producers append to the vehicle queue; workers fetch the heads, maintaining per-vehicle order with per-vehicle sequence numbers. Ba",
-            "isCorrect": false
+            "text": "Propose a bounded, multi-tenant task router: a global queue with capacity N, plus per-tenant FIFO buffers. Implement a fair scheduler that prevents starvation under bursts by aging: waiting tenants ga",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests mastery of bounded queues, per-tenant FIFO guarantees, dynamic worker pools, and practical backpressure strategies. The degradation path probes tolerance to bursty workloads and starvation avoidance, plus testing and observability concerns.\n\n## Key Concepts\n\n- Bounded queues, backpressure, per-tenant FIFO, fairness across tenants, degradation paths, observability.\n\n## Code Example\n\n```go\n// High-level sketch\npackage main\n\ntype Task struct { Tenant string; ID string; Payload []byte }\nvar global = make(chan Task, 1000)\n// Dispatcher routes to per-tenant FIFO queues and a worker pool\n```\n\n## Follow-up Questions\n\n- How would you verify per-tenant ordering under bursty input?\n- How would you tune backlog thresholds and evaluate degradation behavior under line-rate load?",
+        "explanation": "## Why This Is Asked\nTests practical design of multi-tenant concurrency with backpressure and fairness under bursty loads.\n\n## Key Concepts\n- Bounded queues and backpressure\n- Per-tenant FIFO and aging-based fairness\n- Deadlock avoidance and clean shutdown\n- Dynamic tenant creation and worker orchestration\n\n## Code Example\n```python\n# Skeleton\nclass Router:\n    pass\n```\n\n## Follow-up Questions\n- How would you adapt to heterogeneous task sizes?\n- How to measure and guarantee latency bounds?",
         "difficulty": "advanced"
-      },
-      {
-        "id": "concurrency-q-18",
-        "questionId": "q-11135",
-        "question": "Design a beginner-friendly concurrency controller for a shared print-spooler: thousands of users submit print jobs concurrently. Implement a global bounded queue with per-user FIFO buffers and a small worker pool. Each job has a deadline; if backlog jeopardizes the deadline, divert to a late-queue with a draft PDF and a notification. Explain backpressure, fairness, and provide a test plan for deadline adherence, per-user ordering, late-path behavior, and graceful shutdown?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "An in-memory, three-stage streaming pipeline with exactly-once semantics. Ingress: N producers emit (record_id, key, ts, value). Stage1: M stateless transforms emit (record_id, key, ts, value'). Stage",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a per-team log ingestion pipeline with a bounded global queue and per-team FIFO buffers. Each log item carries team_id and severity (INFO/WARN/ERROR). Downstream analyzers process per-team logs in arrival order,…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a bounded global queue with per-user FIFO buffers and a small worker pool. Each print job carries a deadline; if backlog risks missing it, divert to a late-queue that generates a draft PDF a",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a beginner-friendly concurrency exercise for a real-time analytics dashboard: dozens of producers publish user interaction events (clicks, scrolls) to a bounded global queue. Implement per-user FIFO buffers and a…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nInterviews benefit from tasks with deadlines and per-source fairness, which tests understanding of scheduling, backpressure, and graceful degradation.\n\n## Key Concepts\n\n- Bounded queues\n- Per-user FIFO buffers\n- Deadline-aware scheduling\n- Late-path escalation\n- Graceful shutdown\n\n## Code Example\n\n```python\nclass Job:\n    def __init__(self, user_id, payload, deadline):\n        self.user_id = user_id\n        self.payload = payload\n        self.deadline = deadline\n```\n\n## Follow-up Questions\n\n- How would you test deadline misses under bursty load?\n- How would you ensure no user starves?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "concurrency-q-19",
-        "questionId": "q-26364",
-        "question": "Design a real-time telemetry enrichment pipeline for autonomous fleets: N vehicles stream time-stamped events as (vehicle_id, ts, payload). Stage 1 performs stateless enrichment (lookups from a cache); Stage 2 applies per-vehicle stateful fusion (e.g., smoothing position/velocity) within a bounded window; Stage 3 computes a per-vehicle anomaly score and emits alerts. Guarantee per-vehicle in-order delivery across all stages under backpressure, support dynamic worker resizing, and define a policy for late or out-of-order data. Provide data structures, a runnable sketch, and a test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Leverage per-document DAG frontier; each edit has id, deps, and position. Schedule ready edits on a worker pool; detect conflicts by (position, client-version). On conflict, rollback to last committed",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a dynamic DAG scheduler with per component topological ordering. Each task stores in-degree and a dependency bitset. Ready tasks go to bounded per-subgraph queues; workers pull, execute, and",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Per-vehicle FIFO queues with sequence numbers ensure strict in-order delivery, while a dispatcher routes each vehicle's stream to a dedicated sub-pipeline. Each stage maintains per-vehicle state windows and uses per-veh…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a per-flag ordered broker with a bounded input queue and per-flag version tracking. Each flag maintains a `current_version` and a queue of pending updates. Clients waiting for a specific version receive updates i…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question tests the ability to design a real-time, per-vehicle ordered pipeline with backpressure, dynamic scaling, and robust late-data handling—crucial for fleet telemetry and safety-critical systems.\n\n## Key Concepts\n\n- Per-vehicle ordering guarantees across all pipeline stages\n- Watermarks and late-arrival handling for correct windowed fusion\n- Bounded buffers with upstream backpressure propagation\n- Dynamic worker pool resizing with safe rebalancing\n- Stateless enrichment versus stateful fusion versus anomaly scoring\n\n## Data Structures\n\n```javascript\nclass VehiclePipeline {\n  constructor(vehicleCount, bufferSize, allowedLateness) {\n    this.queues = new Map(); // vehicle_id -> PriorityQueue\n    this.buffers = new Map(); // vehicle_id -> CircularBuffer\n    this.watermarks = new Map(); // vehicle_id -> timestamp\n    this.sequenceNumbers = new Map(); // vehicle_id -> counter\n    this.allowedLateness = allowedLateness;\n  }\n\n  enqueue(vehicleId, event) {\n    const seq = this.sequenceNumbers.get(vehicleId) || 0;\n    event.seq = seq;\n    this.queues.get(vehicleId).push(event);\n    this.sequenceNumbers.set(vehicleId, seq + 1);\n    this.updateWatermark(vehicleId);\n  }\n\n  updateWatermark(vehicleId) {\n    const processed = this.buffers.get(vehicleId).latest();\n    const watermark = processed ? processed.ts : Date.now();\n    this.watermarks.set(vehicleId, watermark - this.allowedLateness);\n  }\n\n  isLate(vehicleId, event) {\n    const watermark = this.watermarks.get(vehicleId);\n    return event.ts < watermark;\n  }\n\n  backpressure(source) {\n    const pressureLevel = this.getBufferUtilization();\n    source.throttle(pressureLevel);\n  }\n}\n\nclass StatefulFusion {\n  constructor(windowSize) {\n    this.windowSize = windowSize;\n    this.state = new Map(); // vehicle_id -> WindowState\n  }\n\n  process(vehicleId, event) {\n    let state = this.state.get(vehicleId) || new WindowState();\n    state.add(event);\n    state.evictOlderThan(this.windowSize);\n    return this.smooth(state);\n  }\n\n  smooth(state) {\n    const positions = state.events.map(e => e.position);\n    return this.kalmanFilter(positions);\n  }\n}\n\nclass AnomalyScorer {\n  score(vehicleId, fusedState) {\n    const velocity = fusedState.velocity;\n    const threshold = this.baseline.get(vehicleId) * 1.5;\n    return Math.abs(velocity) > threshold ? 'ALERT' : 'NORMAL';\n  }\n}\n```\n\n## Policy for Late and Out-of-Order Data\n\n| Scenario | Policy |\n|----------|--------|\n| Within allowed lateness | Hold in buffer until watermark advances |\n| Exceeds allowed lateness | Route to dead-letter queue with reason |\n| Duplicate sequence number | Discard, log for monitoring |\n| Gap in sequence | Request replay from upstream, pause pipeline |\n\n## Dynamic Worker Resizing\n\nWorkers register with a coordinator. When scaling:\n1. Coordinator drains current buffers\n2. Partitions reassigned using consistent hashing\n3. Workers resume with restored watermarks\n4. Health checks verify ordering guarantees post-rebalance\n\n## Test Plan\n\n| Test | Expected Result |\n|------|----------------|\n| In-order events | All processed, alerts correct |\n| Out-of-order within window | Held, processed in correct order |\n| Late events | Dropped or DLQ'd per policy |\n| Backpressure simulation | Upstream throttled, no data loss |\n| Worker scale-up | No ordering violations |\n| Worker scale-down | All buffers drained, resumes correctly |\n| Gap detection | Replay triggered, pipeline pauses |\n| Duplicate events | Discarded without reprocessing |",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "concurrency-q-20",
-        "questionId": "q-22206",
-        "question": "You manage a multi-tenant analytics ingest service with a shared worker pool (8 workers) and a global bounded queue (max 1024). Build a fairness-aware scheduler that guarantees per-tenant latency <= 300ms during bursts (up to 100 tasks per tenant) and prevents starvation. Implement a credit-based aging policy with per-tenant FIFO and backpressure when the queue fills. Provide a runnable Go sketch using channels and a test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a two-stage log pipeline with N tenants feeding a bounded global queue; M workers parse/enrich; K workers perform per-tenant windowed aggregation in timestamp order. Preserve per-tenant order a",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "## Concurrency Controller Design ### Core Architecture ```python from dataclasses import dataclass from collections import defaultdict from queue import Queue, PriorityQueue import threading import time import random @d…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement per-stream bounded buffers keyed by partition, with a watermark-driven window and per-key queues for A and B. Use M workers to join when both sides have matching timestamps within window W;",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use per-tenant subqueues and a central arbiter with a credit/aging scheme. Enqueue grants a tenant credit; the scheduler selects the tenant by a best (credit, age) ratio to limit latency and avoid sta",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nExplores advanced fairness and backpressure in a bounded, multi-tenant pipeline. A realistic system must bound per-tenant latency under bursts while preventing starvation, requiring careful scheduling and observability.\n\n## Key Concepts\n\n- Per-tenant FIFO within a bounded global queue\n- Credit-based aging to enforce latency bounds while preventing starvation\n- Backpressure semantics when queue is full\n- Race-free dispatcher and worker coordination in Go or Python asyncio\n- Test plan: latency under burst, fairness across tenants, shutdown behavior\n\n## Code Example\n\n```go\npackage main\n\nimport (\n  \"sync\"\n  \"time\"\n)\n\ntype Task struct{ Tenant string; Run func() }\n\ntype Scheduler struct {\n  global chan Task\n  perTenant map[string]chan Task\n  mu sync.Mutex\n  // simplified: in production, add priority queue, aging metrics, and a watchdog\n}\n\nfunc main() {\n  // sketch: create scheduler, 8 workers, dispatch loop, aging ticker\n  // real implementation would handle enqueue, backpressure, and per-tenant fairness\n}\n```\n\n## Follow-up Questions\n\n- How would you adapt this for dynamic worker counts or heterogeneous task costs?\n- What metrics and tracing would you add to verify latency guarantees in production?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "concurrency-q-21",
-        "questionId": "q-735",
-        "question": "Design a concurrency-safe per-channel message queue for a Discord-like chat service: multiple producers push messages, a single consumer persists them to storage; implement bounded capacity, preserve per-channel order, and handle backpressure. Which synchronization primitives would you use and how would you test edge cases?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a three-stage real-time video pipeline (demux → encode → archive) using per-video FIFO queues and a global per-user token bucket for backpressure. Implement bounded per-video asyncio.Queues with small worker pool…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Partition events by shard; each shard maintains a bounded queue with a dedicated worker to preserve strict per-shard ordering. Map producers to shards using consistent hashing, and implement backpressure through per-sha…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a per-channel bounded queue (ring buffer) guarded by a mutex, with two condition variables: notFull and notEmpty. Producers block on full; a single consumer dequeues in arrival order and persists",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use a global buffered channel as backpressure, and maintain a per-user FIFO channel to guarantee order. A single dispatcher reads from the global queue and forwards each payload to the user’s dedicate",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nConcurrency is central to both Discord-like chat and Snowflake-like storage. This question probes ability to map a real production pattern (per-channel queues) to concrete synchronization, backpressure, and ordering guarantees.\n\n## Key Concepts\n- Producer-consumer pattern\n- Bounded buffers and backpressure\n- Mutexes and condition variables\n- Per-channel ordering and fault handling\n\n## Code Example\n\n```javascript\nclass BoundedQueue {\n  constructor(capacity) {\n    this.capacity = capacity;\n    this.buf = new Array(capacity);\n    this.head = 0;\n    this.tail = 0;\n    this.size = 0;\n    this.mux = new Mutex();\n    this.notFull = new ConditionVariable();\n    this.notEmpty = new ConditionVariable();\n  }\n  enqueue(item) {\n    // acquire mutex; wait while size === capacity; store at tail; tail=(tail+1)%capacity; size++; notEmpty.signal();\n  }\n  dequeue() {\n    // acquire mutex; wait while size === 0; read from head; head=(head+1)%capacity; size--; notFull.signal();\n  }\n}\n```\n\n## Follow-up Questions\n- How would you test backpressure and ordering across bursty producers?\n- How would you extend to multiple consumers while preserving per-channel order?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "concurrency-q-22",
-        "questionId": "q-804",
-        "question": "You're building a video-frame ingestion service where frames from thousands of users arrive on a shared input channel. Design a bounded, concurrent dispatcher that routes frames to per-user in-order queues, enabling parallel processing across users. Provide backpressure handling when the global buffer fills, a strategy for reordering out-of-order frames, and a graceful shutdown. Sketch the core data structures and synchronization in Rust or C++ and explain trade-offs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a bounded global queue fed by a small moderator pool, with per-chat-room FIFO buffers to preserve order. Implement a per-room rate limiter (token bucket) and a soft-drop path that drops messages f",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Approach: a bounded global input buffer fans frames to per-user in-order queues. Each frame carries user_id and seq. A per-user sequencer buffers out-of-order frames in a small heap until gaps close,",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use a global bounded queue (capacity N) for new join requests and per-region FIFO buffers. A worker pool dequeues from region buffers, batches 2–4 players, and dispatches to the game server. Enqueue b",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Partition events by app, each with a bounded per-app queue and a small worker pool. Producers backpressure when queues fill; a lag detector triggers dynamic rebalancing across partitions. Guarantee pe",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nExplores practical concurrency challenges in real-time ingestion: per-key in-order delivery, bounded buffers, reordering, and safe shutdown.\n\n## Key Concepts\n- Bounded buffers and backpressure\n- Per-user in-order delivery with out-of-order buffering\n- Per-key sequencing and memory visibility\n- Graceful shutdown and drain guarantees\n\n## Code Example\n```rust\nstruct Frame { user_id: u64, seq: u64, payload: Vec<u8> }\nstruct PerUserQueue { next_seq: u64, pending: std::collections::BinaryHeap<Frame> }\n```\n\n## Follow-up Questions\n- How would you test under jitter and loss?\n- How would you scale to 100k active users with limited memory?",
-        "difficulty": "intermediate"
       },
       {
         "id": "concurrency-q-23",
-        "questionId": "q-24819",
-        "question": "Design a bounded, multi-source stock feed processor: N producers emit Trade events {symbol, ts, seq}, into a central bounded queue. M workers apply trades to per-symbol state; global ordering must be by ts (not per symbol), and we must preserve per-symbol order for downstream outputs. Implement a mechanism to replay out-of-order trades when late events arrive, with a configurable canary window W. Support dynamic worker resizing and a backpressure policy (stall producers or drop oldest to make room). Provide data structures and a runnable sketch and a test plan?",
+        "questionId": "q-27552",
+        "question": "Design a bounded, per-tenant ordered dispatcher for a multi-tenant event stream. Each tenant’s events must reach its dedicated worker in strict order, while memory is globally bounded. Implement a credit-based flow control: producers enqueue only when the tenant has credits; when credits run out, spill non-critical events to a per-tenant spill store (LRU) and retry later. Provide runnable sketches in Go or Python, including data structures, backpressure, cancellation, and restart recovery, plus a concrete test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a per-topic multi-stage streaming pipeline with dynamic worker pools and per-topic in-order guarantees. Producers publish topic-labeled messages to a bounded input queue. Workers route messages",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a bounded reorder buffer using a global min-heap keyed by ts for ready Trade events, plus per-symbol FIFO queues to ensure in-symbol order. Use a watermark that advances as the earliest unpr",
+            "text": "Use a global bounded memory pool with per-tenant FIFO queues and a credit ledger. Producers enqueue only when the tenant has credits; when credits are exhausted, non-critical events spill to a per-ten",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "Implement a telemetry ingest with per-sensor FIFO buffers feeding a bounded global worker pool. Preserve arrival order within each sensor; process sensors in parallel. When backlog crosses a threshold",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "Use region-local per-device FIFOs feeding a small worker pool. A central bounded queue enforces backpressure; per-device order is preserved with sequence numbers and a local reorder buffer. Regional o",
+            "text": "Use N per-sensor queues feeding a bounded central queue; workers pop from central queue and emit in increasing timestamp order. Implement a late-data path by routing packets with timestamp older than",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design and implement a bounded ingress -> worker pool -> per-key in-order processor. Each event carries (key, seq, payload). A central scheduler assigns tasks to workers while each key has its own FIF",
+            "text": "Strategy: partition by key hash; per-partition workers hold per-key sliding windows in bounded maps. Join when both sides have a matching key within the window; emit with per-key sequence for in-order",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of multi-source concurrency with global time-ordering, backpressure, and dynamic workers. It requires combining per-key ordering with global sequencing and late-event handling.\n\n## Key Concepts\n- Global time-ordering via ts and a watermark\n- Bounded central queue with per-symbol buffers\n- Reordering window and late-event replay\n- Dynamic worker resizing and backpressure policies\n- Testing with synthetic traces (late/out-of-order bursts)\n\n## Code Example\n```javascript\nclass Trade { constructor(symbol, ts, seq, payload) { this.symbol = symbol; this.ts = ts; this.seq = seq; this.payload = payload; } }\nclass ReorderBuffer {\n  constructor(limit) {\n    this.limit = limit; // bound\n    // min-heap by ts\n    this.heap = new MinHeap((a,b)=> a.ts-b.ts);\n    this.perSymbol = new Map();\n    this.watermark = -Infinity;\n  }\n  push(trade) { /* ... */ }\n  emitReady(upTo) { /* ... */ }\n}\n```\n\n## Follow-up Questions\n- How would you test late events and tie-breakers?\n- How would you adjust window size under bursty feeds?\n- How would you measure and enforce per-trade latency and ordering guarantees?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests ability to reason about per-tenant ordering under global memory bounds, with explicit backpressure and spillover paths. It probes correctness, fault-tolerance, and recoverability in a realistic multi-tenant system.\n\n## Key Concepts\n- Bounded global memory with per-tenant FIFO queues\n- Credit-based flow control and spill-to-store mechanism\n- Per-tenant ordering guarantees and dynamic worker scaling\n- Cancellation and restart recovery paths, testability\n\n## Code Example\n```go\n// skeleton: types and dispatcher outline\ntype Event struct{ TenantID string; Seq int; Payload []byte }\ntype SpillStore struct{ /* LRU map per tenant */ }\n```\n\n## Follow-up Questions\n- How would you test fairness, latency under burst, and recovery after crash?\n- What metrics would you collect and how would you tune credits and spill thresholds?",
+        "difficulty": "advanced"
       },
       {
         "id": "concurrency-q-24",
-        "questionId": "q-726",
-        "question": "Design a concurrent event broker for a live chat service that guarantees per-user in-order delivery while allowing parallel processing across users, using a bounded buffer; describe backpressure handling when the buffer fills, and compare locking versus lock-free approaches in your language of choice?",
+        "questionId": "q-682",
+        "question": "In a service handling image uploads, each file triggers a resize and thumbnail generation pipeline. Design a bounded producer-consumer queue in Python using asyncio. Use a Queue with maxsize, a fixed number of worker coroutines, and backpressure so producers await when full. Include clean shutdown and error handling. Provide a runnable minimal example showing enqueue, worker loop, and cancellation?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Approach: use per-client in-order routing with bounded per-client buffers and a central sequencer. Upstream producers push into per-client queues; workers pull by client in round-robin to preserve ord",
+            "text": "Use two bounded channels, one per task type (critical, normal). A small front-end fan-in goroutine enqueues tasks into their channel; workers select in a round-robin fashion to prevent starvation. Bac",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use per-customer lanes with a central arbiter and per-customer credits to throttle producers when queues grow. Track a monotonic per-customer sequence to ensure stage boundaries do not reorder events. Implement a credit…",
+            "text": "Use a central dispatcher routing edits to per-user FIFOs backed by bounded buffers; map users to workers with consistent hashing; on rebalance transfer a user’s queue via an atomic hand-off token and",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Design uses per-user FIFO queues feeding a shared dispatcher with a fixed-size worker pool. Each user has a bounded queue; producers enqueue non-blockingly and back off or drop messages when full. Dis",
-            "isCorrect": true
+            "text": "Implement per-tenant token buckets and in-flight limits, with a central fairness-driven dispatcher. Each tenant has a bucket (capacity, refill rate) and a per-tenant in-flight cap. The dispatcher non-",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Per-tenant FIFO buffers feed a fixed-size worker pool. Each tenant's invocations are serialized before enqueue, preserving order; a global scheduler interleaves across tenants to maximize throughput.",
-            "isCorrect": false
+            "text": "Use an asyncio.Queue(maxsize=128) with 4 worker coroutines. Producers await queue.put(task) to apply backpressure. Each worker pops tasks, processes image transforms, then calls queue.task_done(). On",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\n\nReal-world chat backends require per-user ordering with high throughput and minimal tail latency. This question probes ability to design scalable concurrency primitives, reason about backpressure, and compare locking vs lock-free trade-offs.\n\n## Key Concepts\n\n- Per-user FIFO ordering\n- Bounded buffers and backpressure\n- Lock granularity vs lock-free structures\n- Throughput vs latency under saturation\n- Testing strategies for tails and fairness\n\n## Code Example\n\n```go\ntype Message struct { UserID int; Payload []byte }\nfunc enqueue(q chan Message, m Message) bool {\n  select { case q <- m: return true; default: return false }\n}\n```\n\n## Follow-up Questions\n\n- How would you extend for fairness across many users with bursty traffic?\n- What backpressure policy would you adjust in production and why?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nAssesses practical concurrency skills: bounded queues, worker pools, backpressure, and robust shutdown in a real feature like image processing.\n\n## Key Concepts\n\n- asyncio.Queue(maxsize) and backpressure\n- fixed-size worker pool\n- graceful shutdown and cancellation\n- error handling and observability\n\n## Code Example\n\n```python\n# Minimal outline of the pattern (not a full solution)\nimport asyncio\n\nclass Task:\n    def __init__(self, data): self.data = data\n\nasync def worker(q):\n    while True:\n        t = await q.get()\n        try:\n            # process t\n            pass\n        finally:\n            q.task_done()\n\nasync def main():\n    q = asyncio.Queue(maxsize=128)\n    workers = [asyncio.create_task(worker(q)) for _ in range(4)]\n    # enqueue tasks\n    for item in range(10):\n        await q.put(Task(item))\n    await q.join()\n    for w in workers: w.cancel()\n\nasyncio.run(main())\n```\n\n## Follow-up Questions\n\n- How would you adjust for burst traffic without starving producers?\n- How can you monitor queue depth and worker latency in production?",
+        "difficulty": "beginner"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-06-14T11:21:01.157Z",
+    "createdAt": "2026-06-15T07:21:43.068Z",
     "version": 1
   }
 ]
