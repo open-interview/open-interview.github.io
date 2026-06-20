@@ -8,546 +8,636 @@
     "questions": [
       {
         "id": "unix-q-0",
-        "questionId": "q-7675",
-        "question": "Scenario: Logs are stored under /logs/tenants/*/services/*/*.log and rotated hourly into .log and .log.gz. Each line is either \"[YYYY-MM-DD HH:MM:SS] LEVEL: message\" or a JSON object {\"ts\": \"2026-01-26T14:23:05Z\", \"lvl\": \"ERROR\", \"host\": \"host-01\", \"msg\": ...}. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints a per-host, per-minute histogram of ERROR events for the last 30 minutes, across all files and compressed archives, skipping unreadable files. Output: host:YYYY-MM-DDTHH:MM:SSZ count per line, sorted by time. How would you implement this?",
+        "questionId": "q-20078",
+        "question": "On a Linux host, logs of multiple services live under /logs/** with hourly rotation into .log and .log.gz. Some events are plain text lines, others are JSON lines, and multi-line ERROR blocks start with a line 'ERROR:' followed by indented lines. Propose a robust, production-grade approach (no external deps) to continuously harvest the latest 24 hours of ERROR events across all log files, including gz archives, while handling rotation and unreadable files. Provide the exact command or script snippet you would rely on in production and explain how you ensure idempotence and resilience?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "find /data -type f -perm -0002 -mtime -7 -not -path '*/.git/*' -printf '%h\\n' | sed 's|/data/||' | cut -d'/' -f1 | sort | uniq -c | awk '{print $2, $1}' | sort",
-            "isCorrect": false
+            "text": "A lightweight daemon that tracks per-file offsets in a state store, uses inotify to detect rotation, and streams .log/.log.gz via zcat. It normalizes timestamped plain-text and JSON lines to a common event format. The d…",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Use a single Bash pipeline: glob /logs/app-logs/service-*/log-*.log{,.gz}, pipe through a decompressing step (zcat/ gzcat), and feed lines to awk that detects JSON vs plain lines, extracts ts, svc, lv",
+            "text": "A portable approach scans /proc for numeric PIDs, counts entries in /proc/[pid]/fd, filters for high counts (>100), reads the cmdline, and prints pid, count, and command. Then sort and take top 5. Use",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Propose a script that (1) finds /logs matching *.log or *.log.gz altered in last 15 minutes, skipping unreadable; (2) streams with zcat for gz, parses both formats (text lines 'YYYY-MM-DD HH:MM:SS LEV",
+            "text": "Proposed one-liner: enumerate /logs/**, extract both formats, normalize messages to lowercase and strip punctuation, hash fingerprints as host|msg, filter by timestamps within the last 8 hours, and deduplicate per host.",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a streaming pipeline: collect all .log and .log.gz under the path, read gz with zcat -f, parse both formats in awk, extract timestamp (text or ts), derive host from JSON host or path, count ERROR",
-            "isCorrect": true
+            "text": "I would implement a single-CLI pipeline that streams all log files (gzipped too) per host, normalizes each event to a key (host, minute, service, lowercased_message), deduplicates per minute, and trac",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to unify mixed log formats, streaming aggregation, and robust file handling.\n\n## Key Concepts\n- Mixed-format parsing (text timestamps vs JSON ts)\n- Minute-level bucketing and 30-minute sliding window\n- On-the-fly decompression (zcat -f) and handling unreadable files\n- Deriving host from path or JSON field, multi-tenant logs\n\n## Code Example\n```bash\n# Sketch pipeline (high-level, not a complete one-liner)\nzcat -f /logs/tenants/*/services/*/*.log.gz /logs/tenants/*/services/*/*.log 2>/dev/null |\nawk '/* simple placeholder for parsing timestamps and JSON fields to extract host, ts and status */' \n```\n\n## Follow-up Questions\n- How would you test correctness with clock skew or missing fields?\n- How would you scale this for petabytes of logs across many hosts?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests practical skills in building real-world log handling systems with rotation, multi-format parsing, and resilience. Probes process design, tooling choices, and failure mode handling.\n\n## Key Concepts\n- **inotify** for rotation event detection\n- **zcat** for decompressing .gz archives\n- Mixed-format parsing (plain text and JSON)\n- Deduplication by message content per hour\n- Multi-line ERROR block handling with graceful skipping of unreadable files\n\n## Production-Grade Approach\n```bash\n#!/bin/bash\n# Continuous ERROR log harvester (24h window)\n\nSTATE_FILE=\"/var/lib/log-harvester/state.json\"\nLOG_DIR=\"/logs\"\nOUTPUT_DIR=\"/var/log/harvested-errors\"\n\nmkdir -p \"$(dirname \"$STATE_FILE\")\" \"$OUTPUT_DIR\"\n\nload_state() {\n  if [[ -f \"$STATE_FILE\" ]]; then\n    cat \"$STATE_FILE\"\n  else\n    echo '{}'\n  fi\n}\n\nsave_state() {\n  echo \"$1\" > \"$STATE_FILE\"\n}\n\nprocess_file() {\n  local file=\"$1\"\n  local offset=\"$2\"\n  \n  if [[ ! -r \"$file\" ]]; then\n    echo \"Warning: Cannot read $file\" >&2\n    return 0\n  fi\n  \n  local ext=\"${file##*.}\"\n  local cmd\n  \n  case \"$ext\" in\n    gz)  cmd=\"zcat\"   ;;\n    log) cmd=\"cat\"    ;;\n    *)   return 0      ;;\n  esac\n  \n  $cmd \"$file\" 2>/dev/null | tail -c +$((offset + 1))\n}\n\ninotifywait -m -r -e create,modify,delete \"$LOG_DIR\" 2>/dev/null | \\\nwhile read -r directory events filename; do\n  state=$(load_state)\n  \n  for log in \"$LOG_DIR\"/**/*.log*; do\n    [[ -f \"$log\" ]] || continue\n    \n    inode=$(stat -c '%i' \"$log\" 2>/dev/null)\n    offset=$(echo \"$state\" | jq -r --arg f \"$log\" --arg i \"$inode\" '.[$f // empty] // 0')\n    \n    errors=$(process_file \"$log\" \"$offset\")\n    \n    if [[ -n \"$errors\" ]]; then\n      echo \"$errors\" | grep -E '^ERROR:|^\\s.*ERROR' >> \"$OUTPUT_DIR/errors-$(date +%Y%m%d).log\"\n    fi\n    \n    new_offset=$(stat -c '%s' \"$log\" 2>/dev/null || echo 0)\n    state=$(echo \"$state\" | jq --arg f \"$log\" --arg i \"$inode\" --arg o \"$new_offset\" '.[$f] = ($o | tonumber)')\n  done\n  \n  save_state \"$state\"\ndone\n```\n\n## Ensuring Idempotence and Resilience\n- **Offset tracking**: State file records byte offsets per file, ensuring we never re-process already-harvested data\n- **Rotation handling**: inotify detects file modifications and deletions; new files trigger fresh offset tracking\n- **Graceful degradation**: Unreadable files are skipped with warnings; missing state defaults to offset 0\n- **Restart safety**: On restart, daemon reads persisted offsets and resumes seamlessly",
+        "difficulty": "advanced"
       },
       {
         "id": "unix-q-1",
-        "questionId": "q-20382",
-        "question": "On a Unix host, logs are under /var/log/containers/** and rotate hourly into .log and .log.gz. Each line is either 'YYYY-MM-DD HH:MM:SS LEVEL: text' or JSON {ts, level, code, msg}. Some lines lack code. Write a robust one-liner (no external deps) that prints, for each container (directory name), the count of distinct ERROR codes observed in the last 60 minutes. If missing code, derive surrogate as 'TEXT-' + first 40 chars of msg. Include gz files and unreadable files should be skipped, across nested dirs?",
+        "questionId": "q-19529",
+        "question": "Write a robust one-liner (POSIX shell, no external deps) that lists PIDs of processes with more than 100 open file descriptors on a Unix host, printing 'PID USER CMD FDS'. The command should skip unreadable entries under /proc and work across all /proc/[pid] entries. Include handling for permission errors and PID namespaces?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a single snapshot of /proc to count fds per PID, map UID to user via /proc/$pid/status, emit user and per-process fd count, then awk to compute per-user average fd count (sum/num_procs) and sort d",
+            "text": "Enumerate /proc/[0-9]*/fd, count entries per pid, map pid to uid via /proc/[pid]/status, resolve the executable via readlink /proc/[pid]/exe, and aggregate with awk to produce per-user totals and the",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Maintain a 5-minute rolling histogram of unique ERROR messages by exact text across /logs/app-*/events.log[.gz]. Pipe all files through zcat (ignoring unreadable files). Use a compact awk script that recognizes both tim…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "I would implement a one-liner that finds all .log and .log.gz, streams each file (zcat for gz), extracts code from JSON or derives a surrogate from text when missing, filters by time window (60m) usin",
+            "text": "POSIX one-liner idea: iterate /proc/[0-9]*/fd, count entries, map pid->user with ps, read /proc/[pid]/cmdline (NULs to spaces), print pid user cmd fds when fds > 100. Use 2>/dev/null to skip unreadabl",
             "isCorrect": true
           },
           {
+            "id": "c",
+            "text": "Propose a pipeline that streams all relevant logs (cat for .log, zcat for .log.gz) from /logs/traffic/**, filters by the last 2 hours, extracts latency from either duration=NNN ms or latency_ms, norma",
+            "isCorrect": false
+          },
+          {
             "id": "d",
-            "text": "Use a single GNU awk one-liner that streams all /logs/**/*.log and /logs/**/*.log.gz, computes start=$(date -u +%s -d 'now-3 hours'), and tests each line against two parsers: a plain-text timestamp an",
+            "text": "Use a single shell pipeline traversing /var/log/app/*.log* (incl .gz), streaming with zcat/cat, normalizing plaintext and JSON into a single message, filtering by timestamp in the last 12 hours, colla",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nNew angle tests robustness of a single shell one-liner across mixed formats, compressed files, and per-container aggregation within a time window.\n\n## Key Concepts\n- Mixed-format logs (text/JSON) and time filtering\n- Traversal of nested dirs and compressed files\n- Per-container deduplication of events with normalization\n\n## Code Example\n```javascript\n# Pseudocode outline of approach\nfind /var/log/containers -type f -name '*.log*' -print0 | while IFS= read -r -d '' f; do\n  if gzip -t \"$f\" 2>/dev/null; then\n    zcat \"$f\"\n  else\n    cat \"$f\"\n  fi | awk '...'\ndone\n```\n\n## Follow-up Questions\n- How would you test with synthetic logs and edge cases (missing fields, corrupted lines)?\n- How would you adapt if the time window varied per request or required real-time streaming?",
+        "explanation": "## Why This Is Asked\n\nTests practical UNIX troubleshooting: /proc inspection, FD counting, and portable shell logic.\n\n## Key Concepts\n\n- /proc/[pid]/fd enumerates open FDs; 2>/dev/null handles perms\n- /proc/[pid]/cmdline uses NUL separators; convert to spaces\n- Map pid to user with ps; handle missing data gracefully\n\n## Follow-up Questions\n\n- How would you adapt for containers/namespaces?\n- How would you optimize for systems with thousands of PIDs?",
         "difficulty": "intermediate"
       },
       {
         "id": "unix-q-2",
+        "questionId": "q-19945",
+        "question": "On a Unix host, scan for world-writable regular files under /, excluding /proc and /sys. What one-liner would print each file path and its owner on its own line, in sorted order, using only standard tools?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Stream plain and gz logs; normalize to a common minute bucket; extract service and level; count total lines and ERRORs per (minute, svc); prune to last 10 minutes; emit err_rate as errors/total for ea",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a single pipeline: enumerate readable files with find, decompress .gz via zcat, or cat otherwise; feed to awk that normalizes text to lowercase, extracts messages from both formats, filters lines",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Proposed one-liner: find / -path /proc -prune -o -path /sys -prune -type f -perm -002 -printf '%p %u ' 2>/dev/null | sort. This finds world-writable regular files, skips /proc and /sys, prints path an",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use a single command: find /home -type f -mtime -1 -print0 2>/dev/null | while IFS= read -r -d '' f; do u=$(stat -c '%U' \\\"$f\\\" 2>/dev/null); sz=$(du -sk \\\"$f\\\" 2>/dev/null | cut -f1); [ -n \\\"$sz\\\" ]",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests practical Unix familiarity with file permissions, traversal, and portable commands.\n\n## Key Concepts\n- World-writable bits (o+w)\n- find pruning of /proc and /sys\n- -printf formatting to show path and owner\n- portability with POSIX tools\n\n## Code Example\n```bash\nfind / -path /proc -prune -o -path /sys -prune -type f -perm -002 -printf '%p %u\\n' 2>/dev/null | sort\n```\n\n## Follow-up Questions\n- How would you adjust to show only files owned by a specific user?\n- What are the risks of world-writable files and how would you mitigate them?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "unix-q-3",
+        "questionId": "q-21427",
+        "question": "On a Unix host with log directories grouped by service under /logs (eg /logs/serviceA, /logs/serviceB). Logs rotate hourly into *.log and *.log.gz. Write a new, beginner-friendly one-liner that checks for missing hourly logs in the last 12 hours for every service, treating both .log and .log.gz as valid. Output format: <service>: missing_hours=YYYY-MM-DD-HH for hours with no file. Skip unreadable files?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "for s in /logs/*; do [ -d \\\"$s\\\" ] || continue; svc=$(basename \\\"$s\\\"); miss=(); for h in $(seq 11 -1 0); do t=$(date -u \\\"+%Y-%m-%d-%H\\\" -d \\\"$h hours ago\\\"); if [ -f \\\"$s/$t.log\\\" ] || [ -f \\\"$s/$t.",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use a streaming one-liner: for each file under /logs/** (including .log.gz); decompress gz with zcat, extract either JSON ts or text timestamp, map to UTC hour via date -u -d, buffer multi-line ERROR",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "find /var/log /home -type f -mtime -1 -perm -002 -printf '%p %M\\n' 2>/dev/null",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Aggregate per-container, last 4 hours, unique ERROR events by message. Normalize both text and JSON messages to lowercase, merge multiline blocks by detecting 'Traceback' or 'Exception' at the start of a line followed b…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "Tests hourly rotation coverage across services, supports gz archives, and gracefully skips unreadable files; exercises basic Bash loops, date arithmetic, and simple file existence checks.",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "unix-q-4",
+        "questionId": "q-18807",
+        "question": "On a Unix host with logs under /var/log and per-user logs under /home/*/logs, some files are world-writable due to misconfig. Without external tools, write a robust one-liner that lists all regular files touched in the last 24 hours with world-writable permissions, printing per line: <path> <permissions> and skipping unreadable files and symlinks?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Find all /logs/*.{log,log.gz} modified in last 4h, decode gz with a standard tool, parse lines as text or JSON, lowercase, and normalize to the first two words after an ERROR: as a category. Track mul",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "One practical approach is to filter the last 24h files, extract the user, and count actions. Example: find /var/log/app/*.log -type f -mtime -1 -print0 | xargs -0 cat | awk -F'|' 'NF>=4{cnt[$2]++} END",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "find /var/log /home -type f -mtime -1 -perm -002 -printf '%p %M\\n' 2>/dev/null",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "I would craft a single pipeline using find, sh -c with a tiny awk script. Steps: gather .log and .log.gz, decompress .gz with zcat, parse both formats to extract ts and app (JSON: app; text: App= or s",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests the ability to craft a robust, space-safe one-liner that combines time-based filtering with permission checks while handling unreadable files and symlinks.\n\n## Key Concepts\n- `find -type f`: Selects only regular files, automatically skipping symlinks\n- `find -mtime -1`: Matches files modified within the last 24 hours\n- `find -perm -002`: Matches files with world-writable permissions (any write bit set for \"other\")\n- `find -printf`: Safely handles spaces in paths; %p prints the path, %M prints symbolic permissions (e.g., rw-r--r--)\n- `2>/dev/null`: Silently suppresses errors for unreadable files or directories",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "unix-q-5",
+        "questionId": "q-17324",
+        "question": "Advanced Unix diagnostic: on a multi-user host, sporadic CPU spikes stem from short-lived jobs started in the last 30 minutes. Without external tools, write a robust one-liner that, for each Linux user, sums the total CPU time (utime+stime) seconds used by processes started within 30 minutes and still running. Output: user:seconds, sorted desc. Skip zombies and dead PIDs; handle missing entries gracefully?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement a one-liner that finds all .log and .log.gz, streams each file (zcat for gz), extracts code from JSON or derives a surrogate from text when missing, filters by time window (60m) usin",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Idea: loop /proc, for each pid read /proc/$pid/stat to get utime (14), stime (15) and starttime (22); compute age = (uptime - starttime/CLK_TCK) with awk; if age <= 1800, read UID from /proc/$pid/stat",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Find all *.log and *.log.gz under /var/log/services, stream each file (zcat for gz); normalize both formats to a timestamp and a message, treat multi-line WARN blocks as a single event, then with awk",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a single pipeline that normalizes both formats to an error-message stream, filters for ERROR, and tallies by content. One robust one-liner: find /logs/cluster -type f \\( -name '*.log' -o -name '*.",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to crunch per-user CPU by inspecting /proc and time windows without extra tools; emphasizes robustness against churn, missing entries, and zombie processes.\n\n## Key Concepts\n- /proc/pid/stat fields (utime, stime, starttime)\n- CLK_TCK and /proc/uptime for age\n- per-pid /proc/$pid/status UID and /proc/$pid/fd\n- getent for username mapping; error handling\n\n## Code Example\n```bash\n# One-liner sketch (illustrative)\nfor p in /proc/[0-9]*; do\n  # extract uid, utime, stime, start; compute age; if recent, count fds and accumulate by uid\n done\n```\n\n## Follow-up Questions\n- How would you adapt for containerized workloads with cgroups?\n- How would you validate accuracy under high churn?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "unix-q-6",
+        "questionId": "q-15580",
+        "question": "Scenario: You maintain a Unix host where logs live under /logs/** and rotate hourly into *.log and *.log.gz. Each line is either 'YYYY-MM-DD HH:MM:SS LEVEL: text' or JSON {\"ts\":\"...\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Multi-line ERROR blocks begin with 'ERROR:' and subsequent lines are indented. Write a robust one-liner (no external deps beyond standard UNIX tools) that reports, for every service directory under /logs, the list of hours (YYYY-MM-DD HH) in the last 48 hours that had ZERO ERROR events. Include gz archives; skip unreadable files?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "find /var/run -name '*.pid' -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do pid=$(head -n1 \\\"$f\\\" 2>/dev/null | tr -d '[:space:]'); if [ -n \\\"$pid\\\" ] && [ ! -d \\\"/proc/$pid\\\" ]; then svc",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Stream all logs per service, reading both .log and .log.gz; extract the hour from either the timestamp or the JSON ts field; fold multi-line ERROR blocks (starter 'ERROR:' and indented lines) into a s",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "One-liner: find /srv/backups -name 'backup-*.tar.gz' -mtime -7 -print0 2>/dev/null | xargs -0 -I{} sh -c 'tar -tzf \"{}\" --wildcards \"*.log\" 2>/dev/null' | sort -u | wc -l. This uses tar to enumerate l",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Touch the file to ensure it exists, then lock and append atomically: bash -lc 'touch /var/log/cleanup.log; flock /var/log/cleanup.log -c '\\''printf \"%s\\n\" \"$(date +%F %T) - cleanup\" >> /var/log/cleanu",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design a compact, robust log-scanning pipeline across mixed formats, multi-line blocks, and rotated archives; also exercises per-service scoping and edge cases like unreadable files.\n\n## Key Concepts\n- Cross-format log parsing (text vs JSON)\n- Handling multi-line ERROR blocks as single events\n- Per-service hourly bucketing for last 48 hours\n\n## Code Example\n```bash\n# Example approach (not the full one-liner)\nfind /logs -type f \\( -name '*.log' -o -name '*.log.gz' \\) -print0 | xargs -0 -I{} sh -lc 'echo parsing {}'\n```\n\n## Follow-up Questions\n- How would you adapt this for a distributed cluster with remote hosts?\n- How would you test correctness for edge cases (clock drift, missing timestamps)?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "unix-q-7",
+        "questionId": "q-2738",
+        "question": "In a Unix host, per-job logs are under /srv/ci/jobs/<job_id>/logs, rotated daily with filenames log-YYYYMMDD.log. A symlink log-current.log points to the current day’s log file for each job. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints the count of lines containing 'STATUS=FAILED' across all current-day log files for all jobs, gracefully handling missing files and broken links?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a compact single awk pipeline that reads both .log and .log.gz files via gzip -dc, derives the host from the file path, parses both JSON lines and timestamped text formats, collapses multi-line ERROR blocks st…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "I would implement a one-liner that finds all .log and .log.gz, streams each file (zcat for gz), extracts code from JSON or derives a surrogate from text when missing, filters by time window (60m) usin",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "One robust approach is: find -L /srv/ci/jobs -name log-current.log -type f -print0 | xargs -0 -r grep -h 'STATUS=FAILED' | wc -l. This follows symlinks, ignores missing files, and counts only lines wi",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Single pipeline traverses the last 48 hours with find, streams both .log and .log.gz via zcat (or cat for plain logs), then uses awk to parse text or JSON, extract svc and the message, filter for ERRO",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "The candidate should propose a pipeline that safely traverses job dirs, follows symlinks where needed, and uses null-separated streams to handle spaces in paths. They should justify using -L with find to follow log-current.log, and using -print0/xargs -0 to prevent tokenization issues, culminating in wc -l for a total.",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "unix-q-8",
+        "questionId": "q-11202",
+        "question": "On a Linux host, logs live under /var/logs/service-*/apps/*.log and *.log.gz. Each line is either 'YYYY-MM-DD HH:MM:SS LEVEL: text' or JSON {\"ts\":\"YYYY-MM-DDTHH:MM:SSZ\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Write a robust one-liner (no external deps beyond standard UNIX tools) that outputs, for every service and every minute in the last 60 minutes, the count of unique ERROR messages observed across all files and formats. Skip unreadable files and gz archives. Output format: <service>::<YYYY-MM-DD HH:MM> : <count>?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "find /data/upload -type f -mtime -7 -print0 | while IFS= read -r -d '' f; do stat -c '%U' \"$f\"; done | sort | uniq -c | awk 'BEGIN{OFS=\"\\t\"} {print $2, $1}' | sort -nr -k2",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use `lsof -p <PID>` to see open files and `strace -p <PID>` to identify blocked system calls. Check `/proc/<PID>/fd` for file descriptors. For safe termination, send SIGTERM first: `kill -15 <PID>`, wait for graceful sh…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose a single GNU coreutils pipeline: enumerate *.log and *.log.gz, stream through zcat/cat, parse both formats to extract timestamps, convert to epoch, deduplicate ERROR messages per service per m",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Plan: locate all /logs files, read .log and .log.gz with zcat, parse lines into hour buckets via timestamp or ts, normalize messages to lowercase and collapse whitespace, then count distinct events pe",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests robust multi-format parsing, streaming, and per-minute aggregation across nested paths. It validates handling of compressed formats and unreadable files without external tools.\n\n## Key Concepts\n- Multi-format log parsing (text + JSON)\n- Streaming processing with minimal memory\n- Per-service per-minute aggregation and de-duplication\n- Handling gzipped files and unreadable lines\n\n## Code Example\n```javascript\n// Sketch: not the target language; demonstrates the approach\n// 1) collect files, 2) stream, 3) parse timestamps, 4) dedupe per service/minute\n```\n\n## Follow-up Questions\n- How would you adapt for millisecond granularity?\n- How would you test this in CI with synthetic logs?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "unix-q-9",
+        "questionId": "q-6075",
+        "question": "Scenario: A Unix host stores logs under /logs/global/** and /logs/app-logs/** with hourly rotation into .log and .log.gz. Lines are either 'YYYY-MM-DD HH:MM:SS <LEVEL>: <text>' or JSON {ts, svc, msg, lvl}. A live stream via a named pipe at /var/log/live.err.log also feeds JSON. Provide a robust one-liner (no external deps beyond standard UNIX tools) that prints a per-service count of unique ERROR messages observed in the last 24 hours, across files and live input, tolerant of unreadable files and gz archives, deduplicating by (svc, msg)?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "One-liner (illustrative, no deps): for d in /home/*; do u=$(basename \"$d\"); [ -d \"$d/logs\" ] || continue; today=$(date +%F); ( for f in \"$d/logs\"/app.log*; do [ -e \"$f\" ] || continue; if [[ \"$f\" == *.",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "One-liner: find /data/uploads -L -type f -mtime -1 -size +0 -printf '%s\\t%p\\n' 2>/dev/null | awk 'BEGIN{FS=\"\\\\t\"} {split($2,pp,\"/\"); f=pp[length(pp)]; split(f,extParts,\".\"); ext=extParts[length(extPar",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "find /logs/global /logs/app-logs -name '*.log' -o -name '*.log.gz' 2>/dev/null | while read f; do if [[ $f == *.gz ]]; then gunzip -c \"$f\" 2>/dev/null || continue; else cat \"$f\" 2>/dev/null || continue; fi; done & tail…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "One-liner approach: stream all log files (text and gz) via cat/zcat, normalize to a per-event key combining minute-of-event and message, parse both formats (text: extract timestamp and 'ERROR', JSON:",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to reason about mixed log formats, streaming input, and dedup logic for production telemetry. It gauges robustness to unreadable files and gz archives, and requires a compact pipeline.\n\n## Key Concepts\n- Unified parsing of two log formats without external parsers\n- Streaming input from files and a named pipe\n- Sliding window timestamps, 24h filter\n- De-duplication of (svc,msg) across streams\n- Performance implications with many files\n\n## Code Example\n```bash\nfind /logs/global /logs/app-logs -name '*.log' -o -name '*.log.gz' 2>/dev/null | while read f; do if [[ $f == *.gz ]]; then gunzip -c \"$f\" 2>/dev/null || continue; else cat \"$f\" 2>/dev/null || continue; fi; done & tail -F /var/log/live.err.log 2>/dev/null | awk -v cutoff=$(date -d '24 hours ago' +%s) '/^{/{gsub(/\"/, \"\"); if(match($0, /ts\": *([0-9]+)/, ts)) {if(ts[1] >= cutoff && match($0, /lvl\": *\"ERROR\"/) && match($0, /svc\": *\"([^\"]+)/, svc) && match($0, /msg\": *\"([^\"]+)/, msg)) print svc[1] \"\\t\" msg[1]}} else if(match($0, /^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}) +ERROR: +(.+)/, m)) {cmd=\"date -d \\\"\" m[1] \"\\\" +%s\"; cmd | getline ts; close(cmd); if(ts >= cutoff) print \"unknown\\t\" m[2]}}' | sort -u | awk -F'\\t' '{svc[$1]++} END{for(s in svc) print s \": \" svc[s]}'\n```\n\n## Follow-up Questions\n- How would you test against clock skew?\n- How would you adapt for per-minute granularity?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "unix-q-10",
+        "questionId": "q-564",
+        "question": "You're debugging a production system where processes are hanging. Using only Unix tools, how would you identify which processes are stuck in uninterruptible sleep (D state) and what could be causing this?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Identify open FD leaks with /proc. Get top offenders: for d in /proc/[0-9]*/fd; do p=$(basename $(dirname $d)); c=$(ls -1 $d 2>/dev/null | wc -l); [ $c -gt 200 ] && echo \"$p $c\"; done | sort -k2 -nr |",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a Bash one-liner that iterates /proc/[0-9]*, resolves UID to username from /proc/[pid]/status, reads /proc/[pid]/comm for the name, counts total FDs with ls -1 /proc/[pid]/fd 2>/dev/null | wc -l,",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a small Python daemon that tails /logs for new/rotated files and reads /logs/ingest.pipe. For each line, normalize to timestamp and message (support both text and JSON), ignore non-ERROR. Maintain",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use `ps aux | awk '$8 ~ /^D/ {print $2, $11}'` to identify processes in uninterruptible sleep state. Examine `/proc/<pid>/stack` for kernel stack traces to understand what system calls are blocking. Common causes includ…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Identifying D-State Processes\n- Use `ps aux | awk '$8 ~ /^D/ {print $2, $11}'` to filter processes in uninterruptible sleep\n- Check `/proc/<pid>/status` for detailed process state information\n- Monitor system-wide D-state processes with `top` or `htop` filtered by state\n\n## Root Cause Analysis\n- Examine `/proc/<pid>/stack` to identify the specific kernel functions blocking the process\n- Use `dmesg | grep -i error` to detect hardware or driver-related issues\n- Monitor I/O statistics with `iostat -x 1` to identify storage bottlenecks\n- Check `lsblk` and `smartctl` for disk health and controller issues\n\n## Common Causes\n- NFS server unavailability or network connectivity issues\n- Faulty disk controllers, RAID arrays, or storage drivers\n- Hardware failures in storage subsystem (bad sectors, failing drives)\n- Memory pressure causing excessive swap activity\n- Kernel bugs or incompatible device drivers\n- Storage system saturation or filesystem corruption",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "unix-q-11",
+        "questionId": "q-14249",
+        "question": "On a Unix host, logs live under /logs/app-*/ and rotate hourly into *.log and *.log.gz. Each line is either a text line like 'YYYY-MM-DD HH:MM:SS LEVEL: text' or a JSON line like {\"ts\":\"...\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Multi-line ERROR blocks start with a line 'ERROR:' followed by indented lines. Write a robust one-liner (no external deps beyond standard UNIX tools) that, for the last 15 minutes, prints per host the number of distinct ERROR events per minute, counting multi-line traces as a single event, across both formats and archives. Output: host|YYYY-MM-DD HH:MM|count per line. Unreadable files should be skipped?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I’d implement a streaming one-liner that tails all logs, decompresses gzipped ones on the fly, and parses both formats in a single awk script. It derives service from the file path, buckets by minute",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "One-liner approach: stream all log files (text and gz) via cat/zcat, normalize to a per-event key combining minute-of-event and message, parse both formats (text: extract timestamp and 'ERROR', JSON:",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Find all /logs/*.{log,log.gz} modified in last 4h, decode gz with a standard tool, parse lines as text or JSON, lowercase, and normalize to the first two words after an ERROR: as a category. Track mul",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "One-liner: host=$(hostname); find /logs -type l -newermt '6 hours ago' -print0 2>/dev/null | while IFS= read -r -d '' l; do t=$(readlink -f \"$l\" 2>/dev/null); if [ -n \"$t\" ] && [[ \"$t\" != /logs* ]]; t",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to unify parsing of mixed log formats, handle multi-line errors, and maintain a precise rolling window across compressed archives.\n\n## Key Concepts\n- Unified parsing of text and JSON log lines\n- Handling gzipped files without external tools\n- Per-minute rolling window with epoch math\n- Deduplication of multi-line events\n- Fault tolerance for unreadable or missing files\n\n## Code Example\n```javascript\n// Implementation code here (conceptual)\n```\n\n## Follow-up Questions\n- How would you verify correctness with synthetic logs and edge cases (rotation gaps, missing hours)?\n- How would you scale this for thousands of hosts and integrate with a centralized metric sink?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "unix-q-12",
+        "questionId": "q-3573",
+        "question": "You are deploying a per-host log-tailer for thousands of services across a fleet. Logs live under /var/log/services/<svc>/*.log and rotate daily; older files may be *.log.gz. The on-host agent must stream new lines to a central sink with at-least-once delivery, tolerate missing/unreadable files, and stay correct during concurrent rotations. Describe design, data flow, and failure modes; outline an implementation strategy using only standard UNIX tools?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "find /var/log /home -type f -mtime -1 -perm -002 -printf '%p %M\\n' 2>/dev/null",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a per-host log-tailer using inotify/fanotify to monitor new and rotated files, track per-file offsets (inode+offset) in a local manifest, decompress *.log.gz files on-the-fly with gzip -d or zcat, and implement a…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use find over /home to locate regular files with world-writable perms (-type f -perm -0002), not owned by root (-not -user root), print path and mode (-printf '%p:%m\\n'), suppress unreadables (2>/dev/",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a single POSIX shell one-liner that traverses /logs/**, reads both .log and .log.gz files (using zcat for compressed archives while gracefully skipping unreadable files), extracts client IP addresses from both struc…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nEvaluates practical OS knowledge: file watching, log rotation, compression, and reliable delivery at scale.\n\n## Key Concepts\n- inotify and fanotify for file system monitoring\n- Per-file inode and offset tracking for state persistence\n- Handling gzipped rotations (zcat/gzip)\n- Buffering and backpressure to sink\n- Idempotent replay and deduplication on restart\n\n## Code Example\n```bash\n# Minimal sketch of watch loop (not a full solution)\ninotifywait -m -e create,close_write,move /var/log/services\n```\n\n## Follow-up Questions\n- How to test rotation edge cases?\n- How to scale the agent across thousands of services?\n- What monitoring and alerting would you implement?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "unix-q-13",
+        "questionId": "q-29847",
+        "question": "On a Unix host, logs are under /var/log/microservices/**, rotated hourly into .log and .log.gz. Each log line is either 'YYYY-MM-DD HH:MM:SS LEVEL: message' or a JSON object like {\"ts\":\"...\",\"service\":\"NAME\",\"level\":\"ERROR\",\"msg\":\"...\"}. Multi-line ERROR blocks start with 'ERROR:' and are followed by indented lines. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints, per host and per service, the top 2 normalized ERROR messages observed in the last 6 hours, deduplicating by content; counts multi-line blocks as a single event; includes gz files and skips unreadable files?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would stream all logs (text and JSON) from all hosts/services, normalize messages to lowercase with collapsed whitespace, treat multi-line ERROR blocks as a single event, filter by a 6-hour window,",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Loop through each service directory under /logs, read both .log and .log.gz files, extract ERROR messages from text lines and JSON lines (including multi-line ERROR blocks), deduplicate by lowercased message text, bucke…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "One robust approach is: find -L /srv/ci/jobs -name log-current.log -type f -print0 | xargs -0 -r grep -h 'STATUS=FAILED' | wc -l. This follows symlinks, ignores missing files, and counts only lines wi",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose a pipeline that streams all logs (zcat for .gz, cat otherwise), extracts the hour bucket from either the plain timestamp or the JSON ts field, and tallies INFO/WARN/ERROR counts per hour using an awk associative…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests the ability to design a compact, robust one-liner that handles mixed formats, gzipped logs, multi-line blocks, and cross-host/service aggregation within a time window.\n\n## Key Concepts\n- Mixed log formats: text and JSON\n- Timestamp parsing and 6-hour window filtering\n- Multi-line blocks counted as single events\n- gzipped files via zcat/zgrep\n- Per-host per-service aggregation with deduplication by content\n\n## Code Example\n```bash\n# Conceptual approach (not production-ready)\n```\n\n## Follow-up Questions\n- How would you test edge cases like corrupted lines or missing timestamps?\n- How would you scale this to many hosts/services without high memory usage?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "unix-q-14",
+        "questionId": "q-9524",
+        "question": "In a Unix host, per-service logs live at /srv/logs/<service>/ and rotate hourly into service-YYYYMMDDHH.log and .log.gz. Lines are either 'YYYY-MM-DD HH:MM:SS <LEVEL>: <text>' or JSON {\"ts\":\"...\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints, for each service, the count of unique ERROR messages observed in the last 2 hours across all rotated files, gzipped or plain, skipping unreadable files. Output: <service>:<count>?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Proposed approach: enumerate files under /srv/logs, decompress gz with zcat, parse lines with a single awk that recognizes either plain text or JSON, filter by timestamp (last 2 hours) and level ERROR",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "One-liner approach: enumerate numeric PIDs under /proc, examine each /proc/$pid/fd/*, resolve targets with readlink -f, filter regular files, compute mtime via stat -c %Y, and emit lines for files old",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "shopt -s globstar; zcat /logs/**/*.log.gz /logs/**/*.log 2>/dev/null | awk ' /^\\{/ { if ($0 ~ /\"lvl\"[[:space:]]*:[[:space:]]*\"ERROR/) { proc=\"\"; msg=\"\" if (match($0, /\"proc\"[[:space:]]*:[[:space:]]*\"([^\"]+)\"/, a)) proc=…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Proposed one-liner: find /logs/app -type f -mtime -7 -print0 2>/dev/null | while IFS= read -r -d '' f; do svc=$(basename \"$(dirname \"$f\")\"); s=$(stat -c%s \"$f\" 2>/dev/null); [ -n \"$s\" ] && echo \"$svc:",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n- Tests ability to integrate log formats and rotation schemes\n- Evaluates robust streaming with gzip, in-file timestamps, and dedup across files\n\n## Key Concepts\n- File globbing, gzip handling, JSON and text parsing, timestamp filtering, per-service aggregation, dedup\n\n## Code Example\n```bash\n# Example skeleton (not a full solution)\nfor f in /srv/logs/*/*.{log,log.gz}; do\n  svc=$(basename \"$(dirname \"$f\")\")\n  zcat \"$f\" 2>/dev/null | awk -v s=\"$svc\" 'BEGIN{FS=\"\"} {print $0}'\ndone\n```\n\n## Follow-up Questions\n- How would you adapt for 1-minute granularity? \n- How would you parallelize across many services?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "unix-q-15",
         "questionId": "q-28241",
         "question": "On a Unix host, logs live under /logs/** with hourly rotation into *.log and *.log.gz. Each line is either a plain timestamped entry like YYYY-MM-DD HH:MM:SS LEVEL: message or a JSON object like {\"ts\":\"...\",\"service\":\"svc\",\"level\":\"ERROR\",\"msg\":\"...\"}. Multi-line stack traces start with 'STACK:' and subsequent lines are indented. Write a robust one-liner (no external deps beyond standard UNIX tools) that, for every service, reports the maximum per-minute error rate in the last 10 minutes, aggregating across formats, including gz files, skipping unreadable files, and deduplicating by normalized message. Ensure multi-line blocks count as a single event?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Approach: stream all logs via find -type f -name '*.log*' and zcat for gz; feed to awk that uses mktime to parse [YYYY-MM-DD HH:MM:SS] or a JSON ts; derive tenant and service from the path, bucket by",
+            "text": "Parse both text and JSON log lines from .log and .log.gz with a stream, extract ts/msg and user, normalize messages to lowercase with collapsed whitespace, collapse multi-line ERROR blocks into a sing",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Find all /logs/*.{log,log.gz} modified in last 4h, decode gz with a standard tool, parse lines as text or JSON, lowercase, and normalize to the first two words after an ERROR: as a category. Track mul",
+            "text": "find /data/projects -type f -mtime -2 -printf '%p\\t%s\\n' 2>/dev/null | awk -F'\\t' '{sum+=$2; print $1\"\\t\"$2} END {print \"TOTAL\\t\" sum}'",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use a single pipeline that reads both plain and JSON log lines from /logs/**, including .log.gz via gzip -dc. For each line with ERROR, extract ts (or derive from file when missing), normalize the mes",
-            "isCorrect": true
+            "text": "Approach: Use `find /logs -type f -mmin -30 -print0` to locate recently modified files; process each file with appropriate streaming (`zcat` for *.gz, `cat` otherwise); parse both formats in `awk` (plain text with times…",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "find /data/projects -path '*/.git/*' -prune -o -path '*/.svn/*' -prune -o -type f -perm /0222 -print0 | while IFS= read -r -d '' f; do stat -c '%n\\t%a' \"$f\"; done",
-            "isCorrect": false
+            "text": "Use a single pipeline that reads both plain and JSON log lines from /logs/**, including .log.gz via gzip -dc. For each line with ERROR, extract ts (or derive from file when missing), normalize the mes",
+            "isCorrect": true
           }
         ],
         "explanation": "## Why This Is Asked\nTests parsing of mixed log formats (text and JSON), handling multi-line blocks, time-windowed aggregation, per-service bucketing, and deduplication with normalization. It also probes robustness with gzipped archives and unreadable files in a compact shell one-liner.\n\n## Key Concepts\n- Mixed-format log parsing (text + JSON)\n- Time-windowed per-service bucketing\n- De-duplication by normalized content\n- Handling gzipped archives with no external deps\n- Multi-line block handling and normalization\n\n## Code Example\n```bash\n# Sample approach outline (not a full one-liner):\n# zgrep -h --no-filename 'ERROR' /logs/**/*.log{,.gz} | \\\n#   awk '...parse JSON or text...'; \\\n#   normalize(msg); dedupe per minute; tally by service; \\\n#   compute max per-minute rate in last 10m\n```\n\n## Follow-up Questions\n- How would you validate correctness on very large logs?\n- How would you adapt if timestamps may be missing or out-of-order?",
         "difficulty": "intermediate"
       },
       {
-        "id": "unix-q-3",
-        "questionId": "q-29073",
-        "question": "On a Unix host, logs live under /var/log/app/** rotating hourly into .log and .log.gz. Each line is either 'YYYY-MM-DD HH:MM:SS LEVEL: message' or JSON {\"ts\":\"...\",\"user\":\"<uid>\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Multi-line ERROR blocks start with 'ERROR:' and are indented. Write a robust one-liner (no external deps beyond standard UNIX tools) that, for the last 6 hours, prints the top 5 unique error messages involving a user, deduplicated by normalized content, across both formats and across compressed files. Include gz archives and skip unreadable files?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a Bash one-liner that iterates /proc/[0-9]*, resolves UID to username from /proc/[pid]/status, reads /proc/[pid]/comm for the name, counts total FDs with ls -1 /proc/[pid]/fd 2>/dev/null | wc -l,",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "A strong answer would provide a single shell pipeline using find, zcat/gunzip, and grep/awk to traverse both /var/logs and /srv/logs, handle both .log and .log.gz files, parse mixed text and JSON formats, aggregate mult…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "POSIX one-liner idea: iterate /proc/[0-9]*/fd, count entries, map pid->user with ps, read /proc/[pid]/cmdline (NULs to spaces), print pid user cmd fds when fds > 100. Use 2>/dev/null to skip unreadabl",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Parse both text and JSON log lines from .log and .log.gz with a stream, extract ts/msg and user, normalize messages to lowercase with collapsed whitespace, collapse multi-line ERROR blocks into a sing",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "Demonstrates ability to design robust log analysis one-liner that spans formats and compression, handles multi-line blocks, time-windowing, deduping by normalized content, and error handling. It also tests knowledge of POSIX tools and portability.",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "unix-q-4",
-        "questionId": "q-11430",
-        "question": "In a Unix host, logs sit under /logs/service-*/logs/ with hourly rotation into .log and .log.gz. Each line is either a text line 'YYYY-MM-DD HH:MM:SS LEVEL: message' or a JSON {ts, lvl, msg}. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints for every service the error rate in the last 24 hours, defined as (number of lines with ERROR) divided by total lines for that service. Output: <service>:<ratio> per line. Skip unreadable files; handle nested dirs and gz files?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "One-liner solution: find /etc/configs -type f -name '*.yaml' -mtime -1 -printf '%h\\n' 2>/dev/null | awk -F'/' '{env=$4; c[env]++} END{for (e in c) print e\":\", c[e]}'",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Plan: Use find to locate /logs/service-*/logs/*.log and *.log.gz files modified within the last 24 hours. Stream contents through zcat for gzipped files and cat for plain files. Parse each line with awk to extract times…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Stream all relevant logs in one pass: read both plain and JSON lines from /var/log/services and gzipped archives, plus per-service live streams; normalize timestamps (text: [YYYY-MM-DD HH:MM:SS], JSON",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a compact single awk pipeline that reads both .log and .log.gz files via gzip -dc, derives the host from the file path, parses both JSON lines and timestamped text formats, collapses multi-line ERROR blocks st…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests parsing across mixed formats and gzipped archives, plus per-service aggregation within a time window.\n\n## Key Concepts\n- find/xargs for cross-format log collection\n- zcat vs cat for .gz vs plain files\n- awk for mixed-format parsing without external dependencies\n- per-service aggregation from file paths\n- 24-hour window via file mtime and timestamp filtering\n\n## Code Example\n```bash\n# Illustrative snippet: not the complete one-liner\nfind /logs -type f \\( -name \"*.log\" -o -name \"*.log.gz\" \\) -mtime -1 -print0 | xargs -0 sh -c '...'\n```\n\n## Follow-up Questions\n- How would you handle log rotation with missing timestamps?\n- What optimizations would you apply for millions of log lines?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "unix-q-5",
-        "questionId": "q-9856",
-        "question": "On a Unix host, logs are stored under /logs/app-*/services/** with hourly rotation into .log and .log.gz. Each line is either [YYYY-MM-DD HH:MM:SS] LEVEL: message or JSON {\"ts\":\"...\",\"level\":\"ERROR\",\"msg\":\"...\"}. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints the top 5 most frequent ERROR messages observed in the last 12 hours across all files, including gz archives and nested directories. Skip unreadable files and preserve message integrity (messages may contain spaces but not newlines)?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Plan: enumerate /logs with find for *.log and *.log.gz, pipe through zcat/cat, parse both formats in awk (text: [YYYY-MM-DD HH:MM:SS] LEVEL: msg; JSON: {\"ts\":...,\"level\":\"ERROR\",\"msg\":...\"}). Convert timestamps to epoch…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "One robust one-liner: stream every log file under /logs (including .log.gz) and map each line to an hour key; for text lines take the first 13 chars (YYYY-MM-DD HH); for JSON parse ts and derive its h",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Approach: derive a 24-hour window, collect hours from both filename patterns (app-YYYYMMDD-HH.log/.log.gz) and the first non-empty timestamp line, decompress gz with gzip -dc when present, and feed in",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Proposed one-liner approach: gather all log files from /logs/ops modified in the last 8 hours (including .log and .log.gz); stream through with zcat or cat; parse both formats with a small awk to extr",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to parse mixed log formats, traverse hierarchical logs, handle gz archives, and enforce a time window with robust aggregation. It also exercises building production-like one-liners and validating correctness across edge cases.\n\n## Key Concepts\n- File traversal with find\n- On-the-fly decompression (gz)\n- Dual-format parsing (text and JSON)\n- Time-window filtering with epoch conversion\n- Top-N aggregation\n\n## Code Example\n```bash\nfind /logs -type f \\( -name \"*.log\" -o -name \"*.log.gz\" \\) -print0 | \\\n  xargs -0 -I{} sh -c 'case \"{}\" in *.gz) zcat \"{}\" ;; *) cat \"{}\" ;; esac' | \\\n  awk -v cutoff=$(date -d '12 hours ago' +%s) '\n  match($0, /^\\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\\] ([^:]+): (.*)/, a) {\n    cmd = \"date -d \\\"\" a[1] \"\\\" +%s\"\n    cmd | getline ts\n    close(cmd)\n    if (ts >= cutoff && a[2] == \"ERROR\") { messages[a[3]]++ }\n  }\n  match($0, /\"ts\":\"([^\"]+)\".*\"level\":\"ERROR\".*\"msg\":\"([^\"]+)\"/, a) {\n    cmd = \"date -d \\\"\" a[1] \"\\\" +%s\"\n    cmd | getline ts\n    close(cmd)\n    if (ts >= cutoff) { messages[a[2]]++ }\n  }\n  END {\n    for (msg in messages) print messages[msg], msg\n  }' | sort -nr | head -5\n```",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "unix-q-6",
-        "questionId": "q-1809",
-        "question": "Scenario: A Linux host logs auth events into /var/log/auth/{service}/*.log and rotates hourly to *.log.gz. Each line is JSON like {\"ts\":\"YYYY-MM-DDTHH:MM:SSZ\",\"user\":\"alice\",\"action\":\"LOGIN\",\"result\":\"FAIL\"}. Propose a robust one-liner (no external deps beyond standard UNIX tools) to print the top 5 users by failed login rate in the last 2 hours, aggregated across all services, tolerant of missing files and gz archives, and resilient to malformed lines?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Plan: Use a single shell pipeline to read the last 120 minutes of logs from /logs/app/**, decompressing .log.gz with zcat and skipping unreadable files. Parse two formats with a compact awk script tha",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "find /opt/app -maxdepth 6 -type d -perm -002 -print0 | xargs -0 -r stat -c '%n %U:%G %a' This prints path, owner:group, and octal mode for audit.",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "find /var/log/app-logs -type f -name 'app-*-*.log' -mtime -3 -print0 2>/dev/null | xargs -0 cat 2>/dev/null | awk '/ERROR/ {c++} END {print c+0}'",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "zcat -f /var/log/auth/*/*.log.gz /var/log/auth/*/*.log 2>/dev/null | awk -F'\"' '{for(i=1;i<=NF;i++){if($i==\"ts\"){ts=$(i+2)};if($i==\"user\"){user=$(i+2)};if($i==\"result\"&&$(i+2)==\"FAIL\"){fail=1}};if(fail&&ts&&user){gsub(/…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis tests real-world log aggregation with mixed rotation and JSON parsing using canonical UNIX tools.\n\n## Key Concepts\n- **zcat -f**: The `-f` flag forces zcat to read multiple files including both .log.gz and .log, handling decompression transparently while passing plain files through unchanged\n- **awk-based JSON extraction**: Using field separator `\"` to parse JSON without external dependencies; iterates through fields to find ts, user, and result\n- **mktime()**: Converts the ISO timestamp to epoch seconds for comparison against the 2-hour window (7200 seconds)\n- **systime()**: Returns current epoch time; cutoff calculated as systime()-7200\n- **2>/dev/null**: Silences errors from missing files or directories\n- **Robustness**: Variables reset per line to handle malformed JSON gracefully\n\n## Code Example\n```awk\nBEGIN { cutoff = systime() - 7200 }\n{\n    fail = 0; ts = \"\"; user = \"\"\n    for(i=1; i<=NF; i++) {\n        if($i == \"ts\")      ts = $(i+2)\n        if($i == \"user\")    user = $(i+2)\n        if($i == \"result\" && $(i+2) == \"FAIL\") fail = 1\n    }\n    if(fail && ts && user) {\n        gsub(/[TZ]/, \"\", ts)\n        gsub(/:/, \" \", ts)\n        if(mktime(ts) >= cutoff) counts[user]++\n    }\n}\nEND {\n    n = asort(counts, sorted, \"@ind_num_desc\")\n    for(i=1; i<=5 && i<=n; i++) print i\": \"sorted[i]\" \"k[i]\n}\n```\n\n## Follow-up Questions\n- **Per-minute windows**: Use `strftime(\"%Y-%m-%d %H:%M\", mktime(ts))` as a key instead of just incrementing a counter\n- **Synthetic test logs**: Generate test files with `echo '{\"ts\":\"2026-02-20T12:00:00Z\",\"user\":\"test\",\"result\":\"FAIL\"}' | gzip > test.log.gz` and verify output\n\n## Critical Fixes from Original\n1. Provided actual executable one-liner instead of just pseudocode\n2. Fixed field name mismatch: JSON uses `result`, not `status`\n3. Used `zcat -f` for proper handling of both .log and .log.gz files\n4. Added proper epoch conversion using mktime() for timestamp comparison",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "unix-q-7",
-        "questionId": "q-9282",
-        "question": "Scenario: A server stores user uploads under /srv/assets with per-user directories named user-<id>. Write a robust one-liner (no external deps beyond standard UNIX tools) that lists the top 5 user directories updated in the last 24 hours by total size. Output format: <directory>|<size>KB per line. Ensure handling spaces in directory names?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Proposed one-liner approach: for each host directory under /logs, scan both .log and .log.gz, decompressing as needed, extract timestamps from both formats (text or JSON), collapse multi-line ERROR bl",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "One-liner: find /srv/assets -maxdepth 1 -type d -name 'user-*' -mtime -1 -print0 | xargs -0 du -sk 2>/dev/null | sort -nr | head -n5 | awk '{print $2 \"|\" $1 \"KB\"}'",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Propose a single GNU coreutils pipeline: enumerate *.log and *.log.gz, stream through zcat/cat, parse both formats to extract timestamps, convert to epoch, deduplicate ERROR messages per service per m",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Touch the file to ensure it exists, then lock and append atomically: bash -lc 'touch /var/log/cleanup.log; flock /var/log/cleanup.log -c '\\''printf \"%s\\n\" \"$(date +%F %T) - cleanup\" >> /var/log/cleanu",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "Why: practical check of per-user quota pressure with minimal tooling. Key points: use -mtime -1 to limit to last 24h, -print0/xargs -0 for spaces, du -sk for stable KB sizes, sort to get top N, and clean output with a simple print. Robust against unreadable dirs via 2>/dev/null.",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "unix-q-8",
-        "questionId": "q-1224",
-        "question": "Scenario: In a Unix cluster, logs are emitted as JSON lines under /var/log/cluster/*/*.log and rotated hourly to *.log.gz. Each line contains {\"ts\":\"YYYY-MM-DDTHH:MM:SSZ\",\"tenant\":\"tenant-id\",\"svc\":\"service\",\"lvl\":\"LEVEL\",\"msg\":\"...\"}; Propose a robust one-liner (no external deps beyond standard UNIX tools) to identify the top 3 tenants by error rate (ERROR / total events) for the last 6 hours, aggregated across all services, tolerant of missing files and gz archives?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Stream all logs (including .log.gz), extract ts and tenant via awk regex, filter lines within the last 6 hours using START/END timestamps from date -u, accumulate per-tenant total and ERROR counts, th",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Approach: read both .log and .log.gz with zcat, parse text lines and JSON lines to extract timestamps, normalize to epoch, and per-host track last_seen. Define outage as a gap >120s within the last 6",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a single POSIX shell one-liner that traverses /logs/**, reads both .log and .log.gz files (using zcat for compressed archives while gracefully skipping unreadable files), extracts client IP addresses from both struc…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Last 6 hours: print per-service the percentage of hours containing at least one ERROR, across /var/log/app/** (.log and .log.gz files). Each line is either plain text ('YYYY-MM-DD HH:MM:SS LEVEL: msg') or JSON object ({…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n- Assesses ability to build robust, single-line data pipelines over multi-file logs, including compressed files, without external dependencies. \n- Tests time-window handling, cross-service aggregation, and per-tenant bucketing under rotation. \n\n## Key Concepts\n- Stream processing with standard UNIX tools (find, xargs, zcat, awk). \n- JSON field extraction via regex in awk; resilient to line variations. \n- Time-window filtering using START/END derived from date; cross-file aggregation. \n- Sorting by computed metric (error rate) without extra tools.\n\n## Code Example\n```javascript\nSTART=$(date -u -d \"-6 hours\" +\"%Y-%m-%dT%H\")\nEND=$(date -u +\"%Y-%m-%dT%H\")\nfind /var/log/cluster -type f \\( -name '*.log' -o -name '*.log.gz' \\) -print0 | \\\n  xargs -0 -I{} sh -lc 'case \"{}\" in *.gz) zcat \"{}\" ;; *) cat \"{}\" ;; esac' | \\\n  awk -v s=\"$START\" -v e=\"$END\" '{\n    if (match($0, /\"ts\":\"([^\"]+)\"/, a)) ts=a[1]; hour=substr(ts,1,13); gsub(/T/,\" \",hour); hour_key=hour;\n    if (match($0, /\"tenant\":\"([^\"]+)\"/, b)) tenant=b[1];\n    if (match($0, /\"lvl\":\"([^\"]+)\"/, c)) lvl=c[1];\n    if (hour_key && tenant && hour_key>=s && hour_key<=e) {\n      total[tenant] += 1; if (lvl==\"ERROR\") errors[tenant] += 1;\n    }\n  }\n  END { for (t in total) { rate = total[t] ? errors[t] / total[t] : 0; printf \"%s\\t%.6f\\n\", t, rate } }\n``` \n\n## Follow-up Questions\n- How would you adapt this to include per-hour breakdowns in addition to the overall top 3? \n- How would you handle non-UTC timestamps or malformed JSON lines?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "unix-q-9",
-        "questionId": "q-18888",
-        "question": "Scenario: In a Unix fleet, a latency daemon writes per-process metrics into /var/log/latency/** with hourly rotation into .log and .log.gz. Lines come as JSON {\"ts\":\"...\",\"pid\":1234,\"lat_ms\":56,\"cmd\":\"...\"} or text like [YYYY-MM-DD HH:MM:SS] latency=56ms pid=1234 cmd=... . Write a robust one-liner (no external deps beyond standard UNIX tools) that prints per-hour bucket the top-3 PIDs by average latency over the last 2 hours, across both formats, skipping unreadable files and gz archives. If a PID appears multiple times in an hour, average its latency. Output: <YYYY-MM-DD HH>: PID1 avg, PID2 avg, PID3 avg?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "find /opt/apps -type f -mtime -1 -perm /6000 -print0 2>/dev/null | while IFS= read -r -d '' f; do stat -c '%A %U:%G %n' \"$f\"; done",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use zgrep to scan /var/log/auth.log and *.gz; extract sudo lines, normalize the user and command fields, bucket by hour using the timestamp, and accumulate unique (user, command) pairs in an awk assoc",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "One robust one-liner: find /var/log -type f -perm -002 -print0 2>/dev/null | xargs -0 -r stat -c '%s %n' 2>/dev/null | sort -nr | awk '{print $2\" \"$1}'",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Parse both formats in a streaming one-liner: stream each file with zcat for .gz and cat for .log, extract hour, PID, and latency, then accumulate per-hour, per-PID sums and counts, compute averages, sort by average late…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "This question validates parsing mixed log formats, handling gzip archives, streaming aggregation, and per-hour ranking under real-world constraints.\n\nKey concepts:\n- Robust multi-format parsing with standard UNIX tools (grep/awk/sed/cat/zcat)\n- Time bucketing by hour with a rolling window\n- Per-PID aggregation and top-N selection with stable ordering\n\nCode Example\n```javascript\n// Illustrative one-liner skeleton (not production-ready)\nconst cmd = `zcat /var/log/latency/**/*.log.gz /var/log/latency/**/*.log 2>/dev/null`; // parse JSON or text, bucket by hour, compute averages, print top-3 per hour\n```",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "unix-q-10",
-        "questionId": "q-16583",
-        "question": "On a Unix host, logs reside under /logs/app/<service>/ with both .log and .log.gz archives. For the last 7 days, identify the top 5 services by total bytes written across both formats; emit lines as <service>:<bytes> and skip unreadable files. How would you implement a robust one-liner (no external deps beyond standard UNIX tools) to accomplish this?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Proposed approach: filter last 15 minutes with find -mmin, read both formats (plain: 'YYYY-MM-DD HH:MM:SS LEVEL: svc: msg', JSON: {\"ts\":\"...\",\"svc\":\"name\",\"lvl\":\"ERROR\",\"msg\":\"...\"}). Use a two-path p",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "I would construct a robust one-liner that recursively traverses /logs for *.log and *.log.gz files, processes each readable line, extracts timestamps and service names from either plain text or JSON format, converts tim…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Proposed one-liner: find /logs/app -type f -mtime -7 -print0 2>/dev/null | while IFS= read -r -d '' f; do svc=$(basename \"$(dirname \"$f\")\"); s=$(stat -c%s \"$f\" 2>/dev/null); [ -n \"$s\" ] && echo \"$svc:",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Plan: stream /var/log/app/**, using gzip -cd for .log.gz and cat for .log. An awk script extracts ts and msg from both formats; ERROR blocks start with 'ERROR:' and indent lines are part of the event.",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to compose robust pipelines over mixed file formats, with error handling and per-service aggregation.\n\n## Key Concepts\n- File discovery with find; safe handling of unreadable files\n- Per-object aggregation with awk\n- Sorting and limiting results\n\n## Code Example\n```bash\nfind /logs/app -type f -mtime -7 -print0 2>/dev/null | \\\n  while IFS= read -r -d '' f; do \\\n    svc=$(basename \"$(dirname \"$f\")\"); \\\n    s=$(stat -c%s \"$f\" 2>/dev/null); \\\n    [ -n \"$s\" ] && echo \"$svc:$s\"; \\\n  done | awk -F':' '{sum[$1]+=$2} END{for (k in sum) print k\":\"sum[k]}' | \\\n  sort -t: -k2 -nr | head -n 5\n```\n\n## Follow-up Questions\n- How would you adapt this to include or exclude certain subdirectories?\n- How would you port to macOS where stat differs?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "unix-q-11",
-        "questionId": "q-23368",
-        "question": "On a Unix server, config trees sit under /var/app/config. Some files have world-readable or world-writable permissions (others read 004 or others write 002). Provide a portable one-liner (no external deps) that finds such files and prints: permissions, owner, group, path, one per line, with paths that may contain spaces?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "One-liner: find /var/app/config -type f \\( -perm -004 -o -perm -002 \\) -printf '%m %U %G %p\\n' 2>/dev/null. This lists world-readable or world-writable files, printing permissions, owner, group, and p",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "A strong answer would provide a single shell pipeline using find, zcat/gunzip, and grep/awk to traverse both /var/logs and /srv/logs, handle both .log and .log.gz files, parse mixed text and JSON formats, aggregate mult…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a per-file streaming parser in awk with gzcat to scan /var/log/app/**. Compute threshold with date -d '6 hours ago' +%s. For each line, extract timestamp/text or ts/msg, handle multi-line stacks s",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Plan: Use a single shell pipeline to read the last 120 minutes of logs from /logs/app/**, decompressing .log.gz with zcat and skipping unreadable files. Parse two formats with a compact awk script tha",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests familiarity with Unix permissions, robust one-liners, and portability across environments; ensures candidate can craft precise find predicates and formatting without external tools.\n\n## Key Concepts\n- File permission bits\n- find command -perm syntax\n- Output formatting with printf\n- Handling spaces in paths\n\n## Code Example\n```bash\nfind /var/app/config -type f \\( -perm -004 -o -perm -002 \\) -printf '%m %U %G %p\\n'\n```\n\n## Follow-up Questions\n- How would you adapt for macOS BSD find lacking -printf?\n- How would you log those results to a file with timestamps?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "unix-q-12",
-        "questionId": "q-5717",
-        "question": "Scenario: A Unix host maintains multi-tenant logs under /logs/tenant-*/service-*.log, rotated hourly into .log and .log.gz. Lines may be plain text 'YYYY-MM-DD HH:MM:SS LEVEL: message' or JSON {\"ts\":\"...\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Provide a robust, self-contained UNIX pipeline (no external deps beyond standard tools) that emits a per-tenant, per-service, per-minute COUNT of ERROR events for the last 15 minutes, across both formats and file types, tolerating missing/unreadable files and gz archives, in a streaming fashion?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a compact POSIX shell script that streams per-tenant/service-minute ERROR counts for the last 15 minutes. Iterate /logs/tenant-*/service-*.log(.gz); skip unreadable files. Decompress with zcat,",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "I would construct a robust one-liner that recursively traverses /logs for *.log and *.log.gz files, processes each readable line, extracts timestamps and service names from either plain text or JSON format, converts tim…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Strategy: Stream both .log and .log.gz files with a single one-liner using `gzip -cd`; parse both formats in awk, extracting timestamp (from JSON or timestamp line), host, service, and message. Normalize the message (lo…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "for pid in /proc/[0-9]*; do p=$(basename \"$pid\") [ -r \"$pid/cmdline\" ] && [ -s \"$pid/cmdline\" ] || continue state=$(awk '/^State:/ {print $2}' \"$pid/status\" 2>/dev/null) [ \"$state\" = \"Z\" ] && continue fd_cnt=$(ls -1 \"$p…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design a robust streaming log pipeline on UNIX, handling multi-tenant namespaces, mixed line formats, and rotated/compressed files, using standard tools only.\n\n## Key Concepts\n- Log normalization across text and JSON formats\n- Time-windowing and per-bucket aggregation\n- Handling gzip archives without external deps\n- Fault tolerance for unreadable files and missing data\n- Streaming output with incremental updates\n\n## Code Example\n```bash\n#!/usr/bin/env bash\n# Skeleton: collect, decompress, normalize timestamps, bucket by tenant/service/minute, count ERRORs in last 15m\n```\n\n## Follow-up Questions\n- How would you adapt this to a distributed collector with fault tolerance and backpressure?\n- What tests would you add to verify correctness with mixed formats and rotations?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "unix-q-13",
-        "questionId": "q-4649",
-        "question": "Context: A multi-tenant Unix host under heavy load shows sporadic 'Too many open files' errors. Without external tooling, design a robust approach (one or two small scripts) using only standard UNIX utilities to identify the top 5 processes by open file descriptors in the last 60 minutes. Output must include: PID, user, CMD, fd count, and a sample FD target path (including deleted files). Address unreadable /proc entries and long paths?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Proposed one-liner: enumerate top-level dirs with find -print0, loop per-dir to run du -sk, suppress unreadable errors, sort by size, take 5, and format as dir: sizeK with awk. Handles spaces in names",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Parse both formats, detect ERROR blocks, strip timestamps/indent, normalize multi-line blocks into a signature, and tally per host for the last 2 hours. Read .log and .log.gz with zcat/cat, use awk to",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Approach: snapshot /proc every minute for 60 minutes, count /proc/<pid>/fd entries, map PID to user from /proc/<pid>/status and CMD from /proc/<pid>/cmdline, resolve fd targets with readlink -f, and f",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "for pid in /proc/[0-9]*/; do c=0; for fd in \"$pid\"/fd/* 2>/dev/null; do t=$(readlink \"$fd\" 2>/dev/null); case \"$t\" in /logs/app/*) c=$((c+1));; esac; done; echo \"$(basename \"$pid\")\" \"$c\"; done 2>/dev/null | sort -k2 -rn…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests deep Unix familiarity with /proc, process accounting, and resilient scripting. Candidates must propose a robust, low-overhead approach that remains accurate under unreadable entries and deleted file targets.\n\n## Key Concepts\n- /proc fs navigation and permissions\n- Open file descriptor counting per pid\n- Handling deleted/inaccessible targets\n- Producing CSV-friendly, production-safe output\n\n## Code Example\n```bash\n# Snapshot loop (conceptual)\nfor pid in /proc/[0-9]*; do\n  [ -d \"$pid/fd\" ] || continue\n  count=$(ls -1 \"$pid/fd\" 2>/dev/null | wc -l)\n  user=$(ps -o user= -p \"${pid##*/}\" 2>/dev/null)\n  cmd=$(tr '\\0' ' ' < \"$pid/cmdline\" 2>/dev/null)\n  echo \"$pid,$user,$cmd,$count\"\ndone\n```\n\n## Follow-up Questions\n- How would you centralize results across many hosts?\n- How would you adapt for containers with PID namespaces?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "unix-q-14",
-        "questionId": "q-12481",
-        "question": "On a Unix host, logs live under /logs/** rotated hourly into .log and .log.gz. Each line is either 'YYYY-MM-DD HH:MM:SS LEVEL: text' or JSON {'ts':'...','lvl':'ERROR','msg':'...'}; multi-line traces start with 'ERROR:' and subsequent indented lines. For the last 24 hours, write a robust one-liner using only standard UNIX tools that outputs a per-hour histogram of unique ERROR messages across all files, counting multi-line traces as a single message. Include archives and nested dirs; skip unreadable files?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Touch the file to ensure it exists, then lock and append atomically: bash -lc 'touch /var/log/cleanup.log; flock /var/log/cleanup.log -c '\\''printf \"%s\\n\" \"$(date +%F %T) - cleanup\" >> /var/log/cleanu",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use zcat for .log.gz and cat for .log; feed into awk that filters lines with ERROR (text: after the timestamp) or JSON with lvl=ERROR. Normalize messages (lowercase) and detect multi-line traces start",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Across /var/log/ssh/*.log and *.log.gz, I would read both with zcat, feed to a single awk script that: parses ts (ISO8601 or embedded), derives hour bucket, on failed login events captures the IP, use",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "find /logs/app -name '*.log*' -mmin -360 | xargs -I{} zcat -f {} 2>/dev/null | awk ' /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} / { match($0, /^([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to handle multiple log formats, gzipped archives, multi-line events, and per-hour aggregation with deduplication in a single pipeline.\n\n## Key Concepts\n- Text vs JSON log parsing\n- gzip streaming with zcat\n- multi-line event delimiting\n- deduplication by normalized message\n- time bucketing by hour across a glob of files\n\n## Code Example\n```bash\n# A representative approach (not the exact one-liner):\nfind /logs -type f \\( -name '*.log' -o -name '*.log.gz' \\) -mtime -1 -print0 | xargs -0 -I{} sh -c '\n  case \"${1##*.}\" in\n    gz) zcat \"$1\" ;; *) cat \"$1\" ;; esac\n' _ {} | awk '...'\n```\n\n## Follow-up Questions\n- How would you adapt the solution to exclude startup or heartbeat lines?\n- How would you scale this across multiple hosts collecting into a centralized store?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "unix-q-15",
-        "questionId": "q-24120",
-        "question": "On a Unix host, logs live under /logs/** with hourly rotation into .log and .log.gz. Each line is either a timestamped text 'YYYY-MM-DD HH:MM:SS LEVEL: text' or a JSON object {\"ts\":...,\"lvl\":... ,\"msg\":...}. Multi-line blocks start with \"ERROR:\" or \"STACK:\" and are indented. For the last 6 hours, craft a robust script (no external deps) that outputs a digest per host: the 3 most recently seen distinct error messages, where distinct is based on the normalized message (lowercase, collapse whitespace, trim). Output lines as \"<host>|<last_seen_ts>|<message>\". Include gz archives and unreadable files should be skipped. Use streaming, bounded memory, and handle nested dirs and gz archives?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Approach: enumerate the 12 hourly buckets per host, scan both formats, and mark buckets with at least one ERROR. Print host|YYYY-MM-DD HH for buckets with zero events. Use a single shell pipeline with",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Proposed approach: a streaming Bash pipeline that recursively reads /logs, uses zcat for .log.gz and cat for .log, and a single awk script that can parse both formats, collects multiline blocks, norma",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "I would implement a single AWK-based pipeline (no deps) that streams both formats, uses zcat for gz, extracts hour from ts or file time, and builds a fingerprint as: src_or_tag + ':' + lower(trimmed(m",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Approach: stream all logs under /var/log/app/**, decompress *.gz with zcat, parse both line types in a single AWK one-liner. Build per-host per-incident state: incident_id as key, min(ts) and max(ts)",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nAssesses streaming log parsing across mixed formats, gz handling, and memory-bounded dedup in real time.\n\n## Key Concepts\n- Text vs JSON parsing\n- Multiline block handling\n- Normalization\n- Streaming memory bounds\n- gz support and unreadable file skipping\n\n## Code Example\n\n```bash\n# sketch: awk script to normalize and dedupe\n```\n\n## Follow-up Questions\n- How would you test with large gz dumps?\n- How would you adapt to longer windows or more fields?",
-        "difficulty": "advanced"
-      },
-      {
         "id": "unix-q-16",
-        "questionId": "q-2520",
-        "question": "In a fleet of Linux hosts, log files sit under /var/log/relay/*/*.log and rotated to *.log.gz. Each line is a JSON object with fields ts (YYYY-MM-DDTHH:MM:SSZ), svc, lat_ms. Write a robust one-liner (no external deps beyond standard UNIX tools) that outputs each service's 95th percentile latency over the last 15 minutes, aggregating across all files and rotations, tolerant of missing/unreadable files and out-of-order lines?",
+        "questionId": "q-12265",
+        "question": "On a Unix host, multiple services log under /var/log/serv-*/access-logs; hourly rotation to *.log and *.log.gz. Each line is either a traditional log line with an IP or a JSON line {\"ts\":...,\"ip\":...,\"method\":...,\"url\":...,\"status\":...}. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints the top 3 client IPs by distinct request count in the last 6 hours, across formats and archives. Skip unreadable files?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "I would stream all logs (text and JSON) from all hosts/services, normalize messages to lowercase with collapsed whitespace, treat multi-line ERROR blocks as a single event, filter by a 6-hour window,",
+            "text": "find /data/uploads -type f -mtime -1 -print0 2>/dev/null | while IFS= read -r -d '' f; do u=$(stat -c%U \"$f\" 2>/dev/null); s=$(stat -c%s \"$f\" 2>/dev/null); [ -n \"$u\" ] && echo \"$u|$s\"; done | awk -F'|",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use a time-window watchdog: every 2s for 10m, scan /proc to map PID to State and accumulate seconds in D state. After the window, restart offenders with backoff (5s, 15s, 30s) using the process cmdlin",
-            "isCorrect": false
+            "text": "Use a single pipeline that recursively finds all .log and .log.gz under /var/log/serv-*/access-logs, decompress gz with zcat, normalize both formats by extracting the IP and timestamp (JSON ts or brac",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Use a single shell pipeline that finds files touched in the last 48h under /logs, streams each file, and uses an awk state machine to count per-entry errors. Detect entry starts from lines matching a",
+            "text": "Traverse /proc, for each numeric pid, count fd entries that reference deleted files, resolve UID from /proc/[pid]/status to a username, and print PID:USER:COUNT. Ignore inaccessible PIDs. Pipe to sort",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Stream all logs through a single awk script that reads plain and gzipped files, parses ts with date -d, keeps only lines within the last 15 minutes, collects lat_ms by svc, and on END sorts and emits",
-            "isCorrect": true
+            "text": "A robust one-liner streams logs for the last hour, extracts IPs from both formats, converts IPv6-mapped IPv4 to pure IPv4, deduplicates per-host, and prints host:count. It uses zcat for .gz, ignores u",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question probes the ability to perform robust, cross-file, cross-rotation log analysis using only standard UNIX tools. It requires handling both plain and gzipped inputs, time-window filtering, and percentile aggregation per service, all while tolerating malformed data.\n\n## Key Concepts\n\n- Streaming log processing across rotated files\n- Reading gzipped and plain logs without external deps\n- Time-window filtering with date parsing\n- Percentile computation in awk\n\n## Code Example\n\n```javascript\n// illustrative skeleton: the actual one-liner would embed in a script or be a longer one-liner\nconst sample = 'Parse and aggregate lat_ms per svc within 15m window';\n```\n\n## Follow-up Questions\n\n- How would you extend to multiple percentile targets (e.g., 95th and 99th)?\n- How would you test correctness with synthetic logs and randomized rotations?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests ability to handle mixed log formats, compression, time-window filtering, and robust file handling in production-like Unix environments.\n\n## Key Concepts\n- Recursive file discovery and safe error handling\n- Decompressing gzip on-the-fly with zcat\n- Parsing mixed line formats (plain text vs JSON)\n- Time window calculations using epoch timestamps\n- Aggregation by IP with awk and final sorting\n\n## Code Example\n```bash\nfind /var/log/serv-*/access-logs -type f \\( -name '*.log' -o -name '*.log.gz' \\) -print0 |\n  xargs -0 -I{} sh -lc 'case \"$1\" in *.gz) zcat \"$1\" ;; *) cat \"$1\" ;; esac' -- {} |\n  awk 'BEGIN{now=systime()}'\n```\n\n## Follow-up Questions\n- How would you adapt for a sliding 24h window with overlapping rotations?\n- How would you test correctness with synthetic logs and corrupted lines?\n- How would you optimize for very large log sets across multiple files and hosts?",
+        "difficulty": "intermediate"
       },
       {
         "id": "unix-q-17",
+        "questionId": "q-24296",
+        "question": "On a Unix host, logs live under /logs/app/** rotated hourly into .log and .log.gz. Each line is either a plain line like 2026-03-11 12:34:56 SERVICE latency=123ms: ... or a JSON line like {\"ts\":\"...\",\"service\":\"svc\",\"latency_ms\":123,\"msg\":\"...\"}. Multi-line TRACE blocks begin with TRACE: and include indented lines. For the last 6 hours, write a robust one-liner (no external deps beyond standard UNIX tools) that prints, per host and per service, the average latency in ms. Skip unreadable files and gz archives; host is the system hostname?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "One-liner approach: read both plain logs and gzips, parse lines for either JSON {'ts':'...','svc':'...','lvl':'ERROR',...} or text containing 'ERROR', normalize timestamp to epoch, filter last 60 minu",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Loop over /home/*, extract the user from the directory name, and count world-writable files owned by that user using find. Example: for d in /home/*; do [ -d \"$d\" ] && u=$(basename \"$d\"); printf '%s:'",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Strategy: locate last 6 hours of logs with find -mmin -360, decompress gz with zcat, parse both formats for latency and service, aggregate sums and counts per host-service, and print host|service|avg_",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "One-liner: find / -path /proc -prune -o -path /sys -prune -o -path /dev -prune -o -type f \\( -perm -4000 -o -perm -2000 -o -perm -0002 \\) -print 2>/dev/null | while read -r p; do stat -c '%A %U %G %p'",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests realistic log parsing with mixed formats, rotation, and multi-line blocks.\n\n## Key Concepts\n- Cross-format parsing (plain + JSON)\n- Time-window filtering with -mmin\n- Per-host per-service aggregation\n- Robustness to unreadable/gz files\n\n## Code Example\n```javascript\n// raw solution sketch (not full one-liner)\n```\n\n## Follow-up Questions\n- How to compute percentile latency? \n- How to validate on large datasets?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "unix-q-18",
+        "questionId": "q-12827",
+        "question": "In a Unix host, logs live under /logs/** and rotate hourly into .log and .log.gz. Lines are either 'YYYY-MM-DD HH:MM:SS <LEVEL>: <text>' or JSON {\"ts\":\"...\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints all hours within the last 24 hours (format: YYYY-MM-DD HH) for which NO log entry was observed across any file or archive. Ignore unreadable files, must traverse nested dirs and gz archives, and treat both formats as sources. If all hours have activity, print nothing?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "One robust one-liner: stream every log file under /logs (including .log.gz) and map each line to an hour key; for text lines take the first 13 chars (YYYY-MM-DD HH); for JSON parse ts and derive its h",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "I’d implement a rolling 10-minute per-tenant-per-service error counter in a single awk pipeline fed by all logs under /logs/tenants/**/services/**. Use zcat for *.gz and cat for *.log, extract tenant/",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Strategy: locate last 6 hours of logs with find -mmin -360, decompress gz with zcat, parse both formats for latency and service, aggregate sums and counts per host-service, and print host|service|avg_",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Single pipeline traverses the last 48 hours with find, streams both .log and .log.gz via zcat (or cat for plain logs), then uses awk to parse text or JSON, extract svc and the message, filter for ERRO",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n- Tests command-line mastery with standard Unix tools (find, zcat, awk)\n- Exercises handling mixed log formats and compressed files\n- Checks ability to produce exact hourly coverage across a large, nested log tree\n\n## Key Concepts\n- Time bucketing by hour across formats\n- Handling gzipped files transparently\n- Robust stream processing with 2>/dev/null for unreadable files\n- Aligning to a strict 24-hour window (UTC or local as configured)\n\n## Code Example\n```javascript\n# Illustrative approach (not a full working script)\nstart=$(date -u -d '24 hours ago' '+%F %H'); end=$(date -u '+%F %H')\n# Pseudo: expand files, zcat for gz, extract hour keys, mark seen, print missing\n```\n\n## Follow-up Questions\n- How would you adapt for multiple time zones?\n- How would you scale this for terabytes of logs without latency spikes?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "unix-q-19",
         "questionId": "q-7067",
         "question": "In a Unix host, log files live under /logs/app*/{service1,service2}/*.log and *.log.gz. Each line is either [YYYY-MM-DD HH:MM:SS] <LEVEL>: <text> or JSON {\"ts\":\"YYYY-MM-DDTHH:MM:SSZ\",\"svc\":\"name\",\"lvl\":\"ERROR\",\"msg\":\"...\"}. Provide a robust one-liner (no external deps beyond core UNIX tools) that prints, for every service, a per-minute COUNT of ERROR events in the last 15 minutes, aggregating across both formats and archives, while tolerating unreadable files and gz archives, and streaming as new lines arrive?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Streaming approach: use zcat -f to read both .log and .log.gz files, lower-level lines go through an AWK parser that normalizes to fields ts, svc, lvl. If lvl is ERROR and ts is within the last 15 min",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
             "text": "One-liner: find /home -type f -mtime -7 -printf '%U\\\\t%s\\\\n' | awk -F'\\\\t' '{sum[$1]+=$2} END {for (u in sum) print u\"\\\\t\"sum[u]}' | sort -k2 -nr | head -3",
             "isCorrect": false
           },
           {
+            "id": "b",
+            "text": "find /var/run -maxdepth 2 -name '*.pid' -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do pid=$(cat \"$f\" 2>/dev/null); [ -n \"$pid\" ] && [ ! -d \"/proc/$pid\" ] && age=$(($(date +%s) - $(stat -c %Y \"$f\" 2>/dev/n…",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "Stream all sources (gz via zcat, plain logs via cat, plus tail -F ingest.log) into a single awk script. The awk detects text or JSON, extracts ts, tenant, and msg, converts ts to epoch, discards older",
+            "text": "Stream plain and gz logs; normalize to a common minute bucket; extract service and level; count total lines and ERRORs per (minute, svc); prune to last 10 minutes; emit err_rate as errors/total for ea",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design a single SSH-per-host one-liner that streams /logs/app/**.{log,log.gz}, uses zcat for .gz files, and awk to handle two formats: plain 'YYYY-MM-DD HH:MM:SS LEVEL: text' and JSON {\"ts\":\"...\",\"lvl\":\"...\",\"msg\":\"...\"…",
-            "isCorrect": false
+            "text": "Streaming approach: use zcat -f to read both .log and .log.gz files, lower-level lines go through an AWK parser that normalizes to fields ts, svc, lvl. If lvl is ERROR and ts is within the last 15 min",
+            "isCorrect": true
           }
         ],
         "explanation": "## Why This Is Asked\nTests ability to build a robust streaming analysis over mixed log formats, compressed archives, and rotating files without extra deps.\n\n## Key Concepts\n- Streaming pipelines using zcat, awk, date\n- Parsing both text and JSON lines\n- Time-windowed, per-key aggregation\n- Resilience to unreadable files and mixed rotations\n\n## Code Example\n```javascript\n// Conceptual sketch (not runnable as-is)\n```\n\n## Follow-up Questions\n- How would you adapt for dynamic window sizes? 5/30/60 minutes?\n- How would you detect and handle clock skew across hosts?",
         "difficulty": "intermediate"
       },
       {
-        "id": "unix-q-18",
+        "id": "unix-q-20",
+        "questionId": "q-21340",
+        "question": "On a Unix host fleet, logs live under /logs/app/** with hourly rotation into .log and .log.gz. Lines are either 'YYYY-MM-DD HH:MM:SS LEVEL: text' or JSON {'ts':'...','msg':'...'}, with multi-line ERROR blocks starting 'ERROR:' and indented. Write a robust one-liner (no external deps) that detects clock skew between formats by matching messages across both formats within the same hour for the last 6 hours, and outputs per host: <YYYY-MM-DD HH>:<max_skew_seconds> (positive means text format is ahead). Include gz archives and skip unreadable files?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would build a single shell pipeline that scans /var/log/microservices/** for the last 2 hours (gzip and plain), extracts messages from both formats (plain: YYYY-MM-DD HH:MM:SS LEVEL: text; JSON: {\"t",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Approach: enumerate the 12 hourly buckets per host, scan both formats, and mark buckets with at least one ERROR. Print host|YYYY-MM-DD HH for buckets with zero events. Use a single shell pipeline with",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "find /logs/app -name '*.log*' -mmin -360 | xargs -I{} zcat -f {} 2>/dev/null | awk ' /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} / { match($0, /^([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "find /projects -type f -mtime -1 -perm -0002 -printf \"%p %U %m\\n\"",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests the ability to fuse data from heterogeneous log formats and reason about clock skew, a common production issue. It demonstrates regex parsing, epoch math, streaming aggregation, and handling compressed files—core skills for production engineering.\n\n## Key Concepts\n- **Cross-format parsing**: Handling both timestamped text lines and JSON logs without external dependencies\n- **Time parsing**: Using awk's mktime for both 'YYYY-MM-DD HH:MM:SS' and ISO 8601 timestamps\n- **Compressed file handling**: Using zcat -f to transparently process both .log and .log.gz files\n- **Multi-line ERROR blocks**: The regex pattern matches the start of lines, so indented ERROR continuations are naturally skipped (they don't match the timestamp pattern)\n- **Per-host/hour aggregation**: Building min/max epoch maps keyed by host and hour to detect skew\n\n## Code Walkthrough\nThe solution uses GNU awk's match with arrays to extract timestamp components:\n1. For text format: extracts YYYY-MM-DD HH:MM:SS, converts to epoch via mktime\n2. For JSON format: extracts ISO ts field, parses T-separated timestamp, converts to epoch\n3. Tracks min/max timestamps per host-hour for both formats\n4. Computes skew as difference between format extremes within same hour\n5. Outputs positive skew where text format timestamp exceeds JSON timestamp\n\n## Follow-up Questions\n- **How would you scale this across 10k hosts?** Consider distributed processing with tools like GNU parallel, or batch process samples then aggregate results. MapReduce-style aggregation would work well.\n- **How would you account for daylight saving time?** Use UTC throughout, or ensure timezone awareness in timestamp parsing. The mktime function assumes local timezone unless UTC is explicitly specified.\n- **How would you handle message matching between formats?** This implementation tracks skew via min/max timestamps; for true message correlation, you'd hash message content and match across format keys.",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "unix-q-21",
         "questionId": "q-10821",
         "question": "In a Unix host, logs live under /logs/tenants/*/services/** and rotate hourly into .log and .log.gz. Each line is either 'YYYY-MM-DD HH:MM:SS LEVEL: text' or JSON with ts, lvl, msg, tenant, service. Write a robust one-liner (no external deps beyond standard UNIX tools) that emits a rolling, per-minute count of ERROR events for the last 10 minutes, grouped by tenant and service. Output format: <tenant>/<service>:<YYYY-MM-DDTHH:MM>:<count> per line, as time advances. Skip unreadable files and gz archives?",
         "type": "single",
@@ -559,17 +649,17 @@
           },
           {
             "id": "b",
-            "text": "Approach: Stream all logs (.log and .log.gz), decompress as needed, then use awk to parse, convert TIMESTAMP to epoch with date -d, keep only entries from the last 24h, and increment counts[BUILDID][hour] where STATUS !…",
+            "text": "Use a single command: find /home -type f -mtime -1 -print0 2>/dev/null | while IFS= read -r -d '' f; do u=$(stat -c '%U' \\\"$f\\\" 2>/dev/null); sz=$(du -sk \\\"$f\\\" 2>/dev/null | cut -f1); [ -n \\\"$sz\\\" ]",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Proposed approach: use find to collect files under /logs with names *.log or *.log.gz, modified within 24h, skip unreadable, derive service name from the first-level directory under /logs, and count p",
+            "text": "Proposed one-liner approach: gather all log files from /logs/ops modified in the last 8 hours (including .log and .log.gz); stream through with zcat or cat; parse both formats with a small awk to extr",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Stream all logs (gzipped and plain) with gzip -cd, normalize to minute, extract latency from lat_ms, latency_ms, or lat, and use awk to track per-minute per-service max latency; print minute, svc, max",
+            "text": "Use zcat for .log.gz and cat for .log; feed into awk that filters lines with ERROR (text: after the timestamp) or JSON with lvl=ERROR. Normalize messages (lowercase) and detect multi-line traces start",
             "isCorrect": false
           }
         ],
@@ -577,188 +667,98 @@
         "difficulty": "intermediate"
       },
       {
-        "id": "unix-q-19",
-        "questionId": "q-17288",
-        "question": "On a Unix host with multiple user homes, world-writable files pose a security risk. Write a simple one-liner to locate all world-writable regular files under /home and print their paths, safely ignoring unreadable files and handling spaces in names?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "One-liner: find /home -type f -perm -0002 -print 2>/dev/null. This lists regular files whose mode includes others-writable (0002), printing one path per line and silencing unreadable-dir errors. To na",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Serialize with flock to ensure a single instance, tail -F to follow the file through rotation, and a persistent offset file to resume where left off. Process in small batches, updating the offset atom",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a per-host log-tailer using inotify/fanotify to monitor new and rotated files, track per-file offsets (inode+offset) in a local manifest, decompress *.log.gz files on-the-fly with gzip -d or zcat, and implement a…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "find /logs/trace/ -type f \\( -name '*.log' -o -name '*.log.gz' \\) 2>/dev/null | while read -r f; do case \"$f\" in *.gz) zcat \"$f\" 2>/dev/null;; *) cat \"$f\" 2>/dev/null;; esac; done | awk -v cutoff=$(date -d '2 hours ago'…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests comfort with Unix permissions, portable tool usage, and safe error handling in one-liners.\n\n## Key Concepts\n- find -type f -perm -0002\n- 2>/dev/null for hiding permission errors\n- handling spaces in file names\n\n## Code Example\n````text\nfind /home -type f -perm -0002 -print 2>/dev/null\n````\n\n## Follow-up Questions\n- How would you detect ACL-based world-writability?\n- How would you scope this to a single filesystem with -xdev?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "unix-q-20",
-        "questionId": "q-13662",
-        "question": "On a Unix host, logs live under /logs/app/** rotated hourly into .log and .log.gz. Each line is either 'YYYY-MM-DD HH:MM:SS LEVEL: text' or JSON {'ts':'...','lvl':'ERROR'|'INFO','msg':'...'}, and multi-line ERROR blocks begin with 'ERROR:' and include indented lines. Write a robust one-liner (no external deps beyond standard UNIX tools) that, for the last 6 hours, prints per host and per hour the ratio of ERROR events to total events observed. A multi-line ERROR block counts as one event; skip unreadable files. Output: <host> <YYYY-MM-DD HH>:<ratio> (rounded to 2 decimals)?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a single Bash pipeline that streams both plain and JSON logs (using gzip -cd for *.log.gz files) and normalizes timestamps to hourly buckets. Track in awk: per-host, per-hour total events and ERROR events, counting…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Proposed approach: a streaming Bash pipeline that recursively reads /logs, uses zcat for .log.gz and cat for .log, and a single awk script that can parse both formats, collects multiline blocks, norma",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Strategy: Capture PID, state, elapsed time (seconds), and full command from ps. Filter for D-state processes older than 300 seconds, preserve the command with spaces, then sort by age and output the top 5. Command: `ps…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Propose a single robust one-liner that streams all /logs/auth/**.{log,log.gz}, decompressing gz with zcat, extracts usernames either from plain lines 'YYYY-MM-DD HH:MM:SS USER ACTION' or from JSON lin",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "Tests parsing of multi-format logs, correct handling of multi-line blocks, time bucketing for the last 6 hours, and per-host aggregation. Candidates should discuss a state machine in awk or equivalent, robust timestamp parsing, and resilience to unreadable files or malformed JSON.",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "unix-q-21",
-        "questionId": "q-15775",
-        "question": "On a fleet of Unix hosts, logs live under /logs/**, rotated hourly into .log and .log.gz. Each line is either a timestamped line 'YYYY-MM-DD HH:MM:SS <ACTION>' or a JSON line like {\"ts\":\"...\",\"src_ip\":\"...\",\"action\":\"FAILED\"}. Some failed logins are multi-line blocks that start with 'FAILED:' followed by indented details. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints, for each host, the top 5 source IPs by count of FAILED login attempts in the last 48 hours across both formats, including gz archives and nested directories; skip unreadable files and ignore private IP ranges. Output format: <host> <ip>:<count> per line, ordered by count desc?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "For each host, stream files under /logs, reading plain (.log) or gzipped (.log.gz) with zcat, extract host from the path, parse times (YYYY-MM-DD HH:MM:SS) or JSON ts, filter last 48h, collect FAILED",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Plan: use a single shell pipeline that (1) collects logs under /logs recursively (both .log and .log.gz) with find and zcat/cat, (2) parses both formats: text lines 'YYYY-MM-DD HH:MM:SS USER: msg' and",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Proposed approach: a streaming Bash pipeline that recursively reads /logs, uses zcat for .log.gz and cat for .log, and a single awk script that can parse both formats, collects multiline blocks, norma",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a time-window watchdog: every 2s for 10m, scan /proc to map PID to State and accumulate seconds in D state. After the window, restart offenders with backoff (5s, 15s, 30s) using the process cmdlin",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to craft a single robust shell pipeline that handles multiple log formats, gz files, and per-host aggregation under a time window.\n\n## Key Concepts\n\n- Mixed log formats (text and JSON)\n- gzipped files (zcat) and nested dirs\n- Time-window filtering (48h) via date arithmetic\n- IP extraction and private IP filtering\n- De-dup across multi-line events and per-host grouping\n\n## Code Example\n\n```bash\n# Sketch of approach (not a full working one-liner)\nlogglob=/logs/**/**/*.log*\n# Pseudo pipeline: iterate files, extract host, decode, filter by 48h, accumulate counts per host/ip, then print top 5 per host\n```\n\n## Follow-up Questions\n\n- How would you adapt to different time zones?\n- How would you implement unit tests for this pipeline?",
-        "difficulty": "intermediate"
-      },
-      {
         "id": "unix-q-22",
-        "questionId": "q-3443",
-        "question": "In a Unix host, logs live under /var/log/trace/* with hourly rotation; some files end in .log, others .log.gz. Each line is either [YYYY-MM-DD HH:MM:SS] svc: duration=NNNms or JSON {\"ts\":\"YYYY-MM-DDTHH:MM:SSZ\",\"svc\":\"name\",\"dur_ms\":NNN}. Propose a robust one-liner (no external deps beyond standard UNIX tools) to produce a per-service histogram of total request duration binned into 2-minute intervals for the last 60 minutes, aggregating across all files and rotations, tolerant of missing/unreadable files and out-of-order timestamps?",
+        "questionId": "q-24837",
+        "question": "Scenario: On a Unix host, logs live under /logs/** with hourly rotation into .log and .log.gz. Some hours may be missing or unreadable. Write a robust one-liner (no external deps) that, for the last 24 hours, reports per-host the list of hours with no log entries across both formats; consider a line valid if it contains a timestamp in that hour (text 'YYYY-MM-DD HH:MM:SS' or JSON with ts). Include gz archives; skip unreadable files?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "find /projects -type f -mtime -1 -perm -0002 -printf \"%p %U %m\\n\"",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Loop over /var/log/trace/*.{log,log.gz}, decompress with zcat when needed, parse either [YYYY-MM-DD HH:MM:SS] or JSON ts, extract dur_ms, compute bucket = int(epoch(ts)/120), accumulate totals per svc",
+            "text": "Per-host health check of log rotation over last 24h. Build expected hourly buckets with date -u; search both .log and .log.gz files for either 'YYYY-MM-DD HH:MM:SS' or JSON ts field; use zgrep to cove",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "One-liner: find /etc/app /usr/local/etc/app -type f \\( -name '*.conf' -o -name '*.ini' \\) -mtime -30 -print0 | while IFS= read -r -d '' f; do if file -b --mime-type \"$f\" | grep -qi 'text/'; then if gr",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "I would craft a single pipeline using find, sh -c with a tiny awk script. Steps: gather .log and .log.gz, decompress .gz with zcat, parse both formats to extract ts and app (JSON: app; text: App= or s",
+            "text": "Use a pipeline that collects all logs (find /logs/app -type f -name '*.log*' -print0), pipes through gzip -dc where available, extracts messages from both formats, tracks timestamps to the last 3 hour",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a single pipeline: traverse /logs/app/**, zcat for *.log.gz, cat *.log; parse either text lines with a UTC timestamp or JSON lines, normalize to hour bucket via date -u -d, or equivalent; for each",
+            "text": "Propose a pipeline that streams all logs (zcat for .gz, cat otherwise), extracts the hour bucket from either the plain timestamp or the JSON ts field, and tallies INFO/WARN/ERROR counts per hour using an awk associative…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design a robust, real-world log analysis task across mixed formats and rotated archives.\n\n## Key Concepts\n- Parsing plain and JSON logs\n- Handling gzipped rotated files without extra deps\n- Time bucketing and out-of-order events\n- Resilience to missing/unreadable files\n\n## Code Example\n```javascript\n// Implementation outline (not the full solution)\n```\n\n## Follow-up Questions\n- How would you scale this for millions of logs?\n- How would you test with synthetic data and verify correctness?",
+        "explanation": "## Why This Is Asked\nAssesses ability to reason about log reliability, cross-format parsing, and gz handling in production.\n\n## Key Concepts\n- Robust cross-format parsing (text and JSON)\n- Handling gzipped archives with standard tools\n- Time bucketing and missing data detection\n- Per-host aggregation and resilience to unreadable files\n\n## Code Example\n```bash\n# (conceptual) for host in /logs/*; do\n#   for hour in last 24 hours; do\n#     if no matching timestamp in any file for that hour; then echo host missing hour\n#   done; done\n```\n\n## Follow-up Questions\n- How would you adapt for time zone drift across hosts?\n- How would you scale this across thousands of hosts?",
         "difficulty": "intermediate"
       },
       {
         "id": "unix-q-23",
-        "questionId": "q-19529",
-        "question": "Write a robust one-liner (POSIX shell, no external deps) that lists PIDs of processes with more than 100 open file descriptors on a Unix host, printing 'PID USER CMD FDS'. The command should skip unreadable entries under /proc and work across all /proc/[pid] entries. Include handling for permission errors and PID namespaces?",
+        "questionId": "q-24333",
+        "question": "You’re a junior UNIX admin faced with intermittent SSH login failures. Write a single one-liner (no external deps) that scans both active and rotated SSH login logs under /var/log/auth.log and /var/log/auth.log.*.gz, counts successful logins per user in the last 60 minutes, and prints lines like USER:count, sorted by count desc. Include gz archives and unreadable files skipped?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "POSIX one-liner idea: iterate /proc/[0-9]*/fd, count entries, map pid->user with ps, read /proc/[pid]/cmdline (NULs to spaces), print pid user cmd fds when fds > 100. Use 2>/dev/null to skip unreadabl",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "One-liner: parse both .log and .log.gz, extract ts and dur from JSON lines and endpoint from JSON; filter to last 4 hours via epoch comparison (date -d '4 hours ago' +%s); accumulate totals per host+e",
+            "text": "I would implement a single AWK-based pipeline (no deps) that streams both formats, uses zcat for gz, extracts hour from ts or file time, and builds a fingerprint as: src_or_tag + ':' + lower(trimmed(m",
             "isCorrect": false
           },
           {
+            "id": "b",
+            "text": "One-liner: for f in /var/log/auth.log /var/log/auth.log.*.gz; do case $f in *.gz) zcat $f;; *) cat $f;; esac; done | awk '/Accepted|Failed/ && /for/ { for (i=1;i<=NF;i++) if ($i ~ /^for$/) { u=$(i+1);",
+            "isCorrect": true
+          },
+          {
             "id": "c",
-            "text": "Propose a single streaming pipeline that normalizes lines from both formats, derives service from the path or JSON, floors the timestamp to hour, and accumulates counts for ERROR/CRITICAL per hour and",
+            "text": "Proposed approach: filter last 15 minutes with find -mmin, read both formats (plain: 'YYYY-MM-DD HH:MM:SS LEVEL: svc: msg', JSON: {\"ts\":\"...\",\"svc\":\"name\",\"lvl\":\"ERROR\",\"msg\":\"...\"}). Use a two-path p",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Idea: loop /proc, for each pid read /proc/$pid/stat to get utime (14), stime (15) and starttime (22); compute age = (uptime - starttime/CLK_TCK) with awk; if age <= 1800, read UID from /proc/$pid/stat",
+            "text": "Proposed one-liner approach: scan /var/log/app/** including .log.gz; decode with zcat for gz files; support JSON and text lines; group multi-line blocks by detecting blank-indented continuation; finge",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests practical UNIX troubleshooting: /proc inspection, FD counting, and portable shell logic.\n\n## Key Concepts\n\n- /proc/[pid]/fd enumerates open FDs; 2>/dev/null handles perms\n- /proc/[pid]/cmdline uses NUL separators; convert to spaces\n- Map pid to user with ps; handle missing data gracefully\n\n## Follow-up Questions\n\n- How would you adapt for containers/namespaces?\n- How would you optimize for systems with thousands of PIDs?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests ability to craft robust one-liners for real-world log analysis, including rotated.gz files, without extra dependencies.\n\n## Key Concepts\n- Shell pipelines\n- On-the-fly gzip handling\n- Text extraction with awk\n- Sorting and formatting output\n\n## Code Example\n```bash\nfor f in /var/log/auth.log /var/log/auth.log.*.gz; do case $f in *.gz) zcat $f;; *) cat $f;; esac; done | awk '/Accepted|Failed/ && /for/ { for (i=1;i<=NF;i++) if ($i ~ /^for$/) { u=$(i+1); if (u!=\"\") c[u]++ } } END { for (u in c) print u\":\"c[u] }' | sort -t: -k2 -nr\n```\n\n## Follow-up Questions\n- How would you adjust for IPv6 or multiple SSH daemons?\n- How would you extend to include failed login attempts and rate-limit alerts?",
+        "difficulty": "beginner"
       },
       {
         "id": "unix-q-24",
-        "questionId": "q-4605",
-        "question": "In a Unix host, logs live under /srv/logs/app/ with files app-YYYY-MM-DD.log and nightly rotation to app-YYYY-MM-DD.log.gz. Each line is either a plain log line like YYYY-MM-DD HH:MM:SS - svc: message or a JSON object {\"ts\":\"YYYY-MM-DD HH:MM:SS\",\"svc\":\"name\",\"lvl\":\"LEVEL\",\"msg\":\"...\"}. Write a robust one-liner (no external deps beyond standard UNIX tools) that prints, for every service, the number of unique error messages seen in the last 60 minutes, across all files and rotations, deduplicating identical messages per service, and tolerant of unreadable files?",
+        "questionId": "q-6834",
+        "question": "In a host with multiple microservices writing logs to /var/log/microservices/<svc>/*.log and rotated daily into .log and .log.gz, lines can be either 'YYYY-MM-DD HH:MM:SS LEVEL: message' or JSON {\"ts\":\"...\",\"level\":\"ERROR\",\"msg\":\"...\"}. Provide a robust one-liner Bash pipeline (no external deps) that prints the top 3 services by number of ERROR events observed in the last 2 hours, across both formats and archives, skipping unreadable files and deduplicating across rotations?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Collect both plain and JSON log lines from app-*.log and app-*.log.gz, filter to the last 60 minutes, parse both formats to extract svc and msg, then for each service count distinct messages and outpu",
+            "text": "Use a single pipeline that collects both log types, decompresses gz when needed, and streams into a compact awk that normalizes timestamps and derives the service name from the path. It should count o",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "find /data -type f -printf '%D %i %p\\n' 2>/dev/null | awk '{k=$1\":\"$2; paths[k]=(paths[k]?paths[k] \" \" : \"\")$3; cnt[k]++} END{for (k in cnt) if (cnt[k]>1) print k\" \"paths[k]}'",
+            "text": "Use a single Bash pipeline that streams both plain and JSON logs (using gzip -cd for *.log.gz files) and normalizes timestamps to hourly buckets. Track in awk: per-host, per-hour total events and ERROR events, counting…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use a single-pass streaming awk: stream every log file (gz via zcat; others via cat), emit per-host and per-process blocks starting on 'ERROR:' or JSON lvl:ERROR, extract msg (plain after 'ERROR:' or",
+            "text": "Idea: loop /proc, for each pid read /proc/$pid/stat to get utime (14), stime (15) and starttime (22); compute age = (uptime - starttime/CLK_TCK) with awk; if age <= 1800, read UID from /proc/$pid/stat",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a streaming one-liner: for each file under /logs/** (including .log.gz); decompress gz with zcat, extract either JSON ts or text timestamp, map to UTC hour via date -u -d, buffer multi-line ERROR",
+            "text": "Strategy: locate last 6 hours of logs with find -mmin -360, decompress gz with zcat, parse both formats for latency and service, aggregate sums and counts per host-service, and print host|service|avg_",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to merge heterogeneous log formats, handle compressed files, enforce a time window, and deduplicate per service—common in production observability tasks.\n\n## Key Concepts\n- Robust multi-format parsing (plain and JSON)\n- Reading gzipped logs transparently\n- Time-window filtering via epoch comparison\n- Per-service deduplication and aggregation\n\n## Code Example\n\n```bash\n# (Conceptual outline; exact one-liner will combine find, zcat/cat, and awk to parse both formats, filter by last 60m, deduplicate per svc/msg, and print top-5)\nfind /srv/logs/app -type f \\( -name 'app-*.log' -o -name 'app-*.log.gz' \\) -print0 | \\\n  xargs -0 -I{} sh -c 'if [ -f \"{}\" ]; then if [[ \"{}\" == *.gz ]]; then zcat \"{}\"; else cat \"{}\"; fi; fi' | \\\n  awk -v since=\"$(date -d \"60 minutes ago\" +%s)\" '\n    # parse both formats, emit svc|msg when ts>=since\n  ' | \\\n  sort | uniq -c | sort -nr | head -n5\n```\n\n## Follow-up Questions\n- How would you extend to handle a configurable time window? \n- How would you port this to a distributed logging system (eg, Kafka)?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nTests parsing of heterogeneous log formats, rotation handling, and cross-service aggregation under time constraints, all with standard UNIX tools. It also probes robustness against unreadable files and dedup across rotations.\n\n## Key Concepts\n- Cross-format log parsing (plain text and JSON) without extra deps\n- Time-window filtering using epoch timestamps\n- Handling gzipped rotations and unreadable files\n- Service extraction from file paths and per-service aggregation\n- Deduplication across rotated files\n\n## Code Example\n```javascript\n// Pseudo: demonstrates approach, not production-ready\n``` \n\n## Follow-up Questions\n- How would you scale this to thousands of services and multiple hosts?\n- How would you adapt for multi-line log messages and partial JSON lines?",
+        "difficulty": "intermediate"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-06-19T12:37:24.396Z",
+    "createdAt": "2026-06-20T06:21:51.290Z",
     "version": 1
   }
 ]
