@@ -8,538 +8,28 @@
     "questions": [
       {
         "id": "generative-ai-q-0",
-        "questionId": "q-28622",
-        "question": "Design a memory-augmented attention architecture for a streaming code-diff assistant used by Robinhood and Tesla. Diffs arrive in chunks; earlier context may drift into later edits across file boundaries. Propose (1) a compact memory encoding for recent diffs, (2) how memory interacts with attention (routing or gating), (3) eviction/refresh policy to bound latency, (4) a runnable PyTorch microbenchmark comparing standard vs memory-augmented attention on synthetic streaming diffs with metrics?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Plan should include multilingual code-grounded QA data linked to real repo snippets, mandatory citations with file paths and SHAs, metrics for faithfulness and cross-language hallucinations, drift tra",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose a memory-augmented attention architecture with the following components: **(1) Compact Memory Encoding**: Maintain a fixed-size memory bank storing compressed embeddings for the last M diff chunks. Each chunk is…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Implement a multi-layered evaluation system combining automated metrics (ROUGE, BERTScore for semantic similarity), factual verification against knowledge bases, and faithfulness scoring using attention attribution mech…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a streaming benchmark comparing Local (window=512), Sparse (block=64, 4 heads per block), and Cache-based memory attention. Use a boundary reinit at chunk boundaries to reset K/V for the act",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Question Matters\n\nThis question evaluates understanding of memory-augmented attention, cross-chunk context management, and practical benchmarking under streaming constraints—key skills for production LLM systems at scale.\n\n## Core Concepts\n\n- **Memory-augmented attention with gating**: Learned routing between local and memory-based computation.\n- **Tokenization-consistent encoding**: Memory slots must align with the tokenizer to avoid embedding drift.\n- **Eviction policies**: Balancing recall vs. latency using priority-based or LRU strategies.\n- **Streaming benchmarks**: Synthetic diff generation with realistic chunk boundaries and metric collection.\n\n## Code Example\n```python\nimport torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nimport time\nfrom collections import deque\n\nclass MemoryBank:\n    def __init__(self, mem_size, d_model):\n        self.mem_size = mem_size\n        self.slots = torch.zeros(mem_size, d_model)\n        self.access_counts = torch.zeros(mem_size)\n        self.timestamps = torch.zeros(mem_size)\n        self.cursor = 0\n    \n    def update(self, chunk_emb, attention_weights):\n        scores = attention_weights.mean(dim=(0, 1))[:self.mem_size]\n        idx = torch.topk(scores, min(3, len(scores)))[1]\n        for i in idx:\n            if self.access_counts[i] > 0:\n                self.slots[i] = 0.7 * self.slots[i] + 0.3 * chunk_emb\n            else:\n                self.slots[self.cursor] = chunk_emb\n                self.cursor = (self.cursor + 1) % self.mem_size\n            self.access_counts[i] += 1\n    \n    def evict(self):\n        evict_idx = torch.argmin(self.access_counts)\n        self.slots[evict_idx] = 0\n        self.access_counts[evict_idx] = 0\n\nclass MemoryAugmentedAttention(nn.Module):\n    def __init__(self, d_model, num_heads, mem_size=32, dropout=0.1):\n        super().__init__()\n        self.d_model = d_model\n        self.num_heads = num_heads\n        self.head_dim = d_model // num_heads\n        self.mem_size = mem_size\n        \n        self.qkv = nn.Linear(d_model, 3 * d_model)\n        self.proj = nn.Linear(d_model, d_model)\n        self.gate = nn.Linear(d_model * 2, num_heads)\n        self.memory_bank = MemoryBank(mem_size, d_model)\n        self.dropout = nn.Dropout(dropout)\n        \n    def forward(self, x, return_weights=False):\n        B, T, C = x.shape\n        \n        qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)\n        qkv = qkv.permute(2, 0, 3, 1, 4)\n        q, k, v = qkv[0], qkv[1], qkv[2]\n        \n        mem = self.memory_bank.slots.to(x.device)\n        mem_k = mem.unsqueeze(0).expand(self.num_heads, -1, -1)\n        mem_v = mem_k.clone()\n        \n        scale = self.head_dim ** -0.5\n        attn_local = (q @ k.transpose(-2, -1)) * scale\n        attn_mem = (q @ mem_k.transpose(-2, -1)) * scale\n        \n        gate_input = torch.cat([q.mean(2), v.mean(2)], dim=-1)\n        gate = torch.sigmoid(self.gate(gate_input))\n        gate = gate.unsqueeze(-1).unsqueeze(-1)\n        \n        attn_combined = (1 - gate) * F.softmax(attn_local, dim=-1) + gate * F.softmax(attn_mem, dim=-1)\n        \n        chunk_emb = x.mean(dim=1)\n        self.memory_bank.update(chunk_emb, attn_combined)\n        \n        out_local = attn_combined[..., :T] @ v.transpose(1, 2)\n        out_mem = attn_combined[..., T:] @ mem_v.unsqueeze(0)\n        \n        out = ((1 - gate.mean(-1, keepdim=True)) * out_local + \n               gate.mean(-1, keepdim=True) * out_mem.transpose(1, 2))\n        \n        out = out.transpose(1, 2).reshape(B, T, C)\n        out = self.dropout(self.proj(out))\n        \n        if return_weights:\n            return out, attn_combined\n        return out\n\nclass StandardAttention(nn.Module):\n    def __init__(self, d_model, num_heads, dropout=0.1):\n        super().__init__()\n        self.d_model = d_model\n        self.num_heads = num_heads\n        self.head_dim = d_model // num_heads\n        \n        self.qkv = nn.Linear(d_model, 3 * d_model)\n        self.proj = nn.Linear(d_model, d_model)\n        self.dropout = nn.Dropout(dropout)\n        \n    def forward(self, x):\n        B, T, C = x.shape\n        qkv = self.qkv(x).reshape(B, T, 3, self.num_heads, self.head_dim)\n        qkv = qkv.permute(2, 0, 3, 1, 4)\n        q, k, v = qkv[0], qkv[1], qkv[2]\n        \n        scale = self.head_dim ** -0.5\n        attn = (q @ k.transpose(-2, -1)) * scale\n        attn = F.softmax(attn, dim=-1)\n        \n        out = attn @ v.transpose(1, 2)\n        out = out.transpose(1, 2).reshape(B, T, C)\n        return self.dropout(self.proj(out))\n\ndef generate_synthetic_diffs(batch_size, seq_len, d_model, num_chunks=10):\n    chunks_per_batch = seq_len // num_chunks\n    chunks = []\n    for _ in range(num_chunks):\n        chunk = torch.randn(batch_size, chunks_per_batch, d_model)\n        chunks.append(chunk)\n    return chunks\n\ndef benchmark(attn_module, chunks, warmup=2, iters=10):\n    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n    attn_module = attn_module.to(device).train()\n    \n    for _ in range(warmup):\n        for chunk in chunks:\n            _ = attn_module(chunk.to(device))\n    \n    torch.cuda.synchronize() if torch.cuda.is_available() else None\n    times = []\n    peak_memories = []\n    \n    for _ in range(iters):\n        if torch.cuda.is_available():\n            torch.cuda.reset_peak_memory_stats()\n        start = time.perf_counter()\n        \n        for chunk in chunks:\n            _ = attn_module(chunk.to(device))\n        \n        if torch.cuda.is_available():\n            torch.cuda.synchronize()\n        end = time.perf_counter()\n        \n        times.append(end - start)\n        if torch.cuda.is_available():\n            peak_memories.append(torch.cuda.max_memory_allocated() / 1024**2)\n    \n    return {\n        'mean_latency_ms': sum(times) / len(times) * 1000,\n        'throughput_tokens_per_sec': sum(c.numel() for c in chunks) / (sum(times) / len(times)),\n        'peak_memory_mb': sum(peak_memories) / len(peak_memories) if peak_memories else 0\n    }\n\nif __name__ == '__main__':\n    B, T, D, H = 4, 512, 128, 8\n    chunks = generate_synthetic_diffs(B, T, D, num_chunks=10)\n    \n    standard_attn = StandardAttention(D, H)\n    memory_attn = MemoryAugmentedAttention(D, H, mem_size=32)\n    \n    print('Running Standard Attention benchmark...')\n    std_metrics = benchmark(standard_attn, chunks)\n    print(f'Standard Attention: {std_metrics}')\n    \n    print('Running Memory-Augmented Attention benchmark...')\n    mem_metrics = benchmark(memory_attn, chunks)\n    print(f'Memory-Augmented Attention: {mem_metrics}')\n    \n    print(f'\\\\nComparison:')\n    print(f'Latency overhead: {(mem_metrics[\"mean_latency_ms\"] - std_metrics[\"mean_latency_ms\"]) / std_metrics[\"mean_latency_ms\"] * 100:.2f}%')\n    print(f'Memory overhead: {mem_metrics[\"peak_memory_mb\"] - std_metrics[\"peak_memory_mb\"]:.2f} MB')\n```\n\n## Expected Metrics\n\n| Metric | Standard | Memory-Augmented | Notes |\n|--------|----------|------------------|-------|\n| Latency per chunk | Baseline | +15-30% | Gating overhead |\n| Memory usage | O(T) | O(T + M) | M = memory slots |\n| Cross-chunk recall | ~40% | ~75% | With optimal eviction |\n| Throughput | Baseline | -10-20% | Acceptable trade-off |",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "generative-ai-q-1",
-        "questionId": "q-19211",
-        "question": "Design a multilingual, access-controlled retrieval QA system for a private knowledge base. Ingest PDFs/docs, chunk semantically, embed with a multilingual encoder, index in a vector store, enforce per-user ACLs at query time, and support incremental index updates with vector aging. How would you implement evaluation and drift testing?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I would implement a runtime tool registry keyed by data source and access scope. AutoGen generates an execution plan that first authenticates to the REST API with the appropriate token scope, then queries the on-prem SQ…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "A LangChain agent accepts a user story and employs an AutoGen-like planner to orchestrate a sequence of tools: StoryParserAPI parses the story into structured requirements, TestCaseAPI generates corresponding test cases…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Outline a multilingual, access-controlled retrieval QA system for a private knowledge base. Ingest PDFs/docs, chunk semantically, embed with a multilingual encoder, index in a vector store, enforce pe",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Describe a LangChain-driven agent that queries a private data lake via tools, using AutoGen planning to decide tool calls while enforcing per-user and per-tenant data-access policies at runtime, redac",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis tests end-to-end design of robust, production-ready vector-based search with privacy, multilinguality, and data freshness.\n\n## Key Concepts\n- Multilingual embeddings and cross-language retrieval\n- Chunking strategies and semantic boundaries\n- Vector stores, indexing, ACL enforcement at query time\n\n## Code Example\n```python\n# pseudo: incremental index update snippet\ndef update_index(doc_id, new_text):\n    chunks = chunk_text(new_text)\n    embeddings = embed(chunks)\n    store.upsert(doc_id, embeddings)\n```\n\n## Follow-up Questions\n- How would you measure drift after updates and trigger re-embedding?\n- What cache/TTL strategy would you use for stale vectors?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "generative-ai-q-2",
-        "questionId": "q-12950",
-        "question": "Design an adapter-based fine-tuning plan for a real-time cross-tenant code-review Q&A assistant used by engineers at Discord, Uber, and HashiCorp to answer PR-diff questions and architecture decisions. Compare LoRA, QLoRA, PEFT; propose per-tenant adapters, injection points (attention first, FFN if needed), adapter fusion, 4-bit quantization, lr, batch, and a rollout with rollback and monitoring?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Two-tier embeddings: static for stable docs; dynamic for recent updates. Chunking: 4KB chunks with 25% overlap. Vector DB: FAISS/HNSW or Vespa; shard by source; route queries per shard. Rerank via cro",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use a three-phase pattern: plan discovery (schema/PII flags via data catalog), guarded retrieval (encrypted SQL with per-request IDs and deterministic seeds), and feature production (feature store or API endpoint). Inte…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a hybrid attention strategy combining windowed local attention over the 16k token context with a small set of global tokens to preserve long-range dependencies, enabling efficient autoregressive decoding with…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Drive per-tenant adapters (Discord/Uber/HashiCorp) with adapter fusion, compare LoRA/QLoRA/PEFT for a live-PR Q&A assistant. Inject adapters at attention first; use 4-bit quantization, rank 8, alpha 1",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis angle tests multi-tenant privacy, live data integration, and deployment strategies for adapters.\n\n## Key Concepts\n\n- Per-tenant adapters with strict isolation\n- Adapter fusion vs independent adapters\n- Live PR-diff data feeding and versioned knowledge bases\n- rollout strategies (blue/green, canary) and rollback\n\n## Code Example\n\n```javascript\n{\n  'injection': 'attention',\n  'method': 'LoRA',\n  'rank': 8,\n  'alpha': 16,\n  'quantization': 4,\n  'lr': 0.0002,\n  'batch': 8\n}\n```\n\n## Follow-up Questions\n\n- How would you monitor cross-tenant drift in adapter weights?\n- How would you handle conflicting updates from multiple tenants during a rollout?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "generative-ai-q-3",
-        "questionId": "q-5283",
-        "question": "You're building a multi-tenant enterprise assistant for Google, Uber, and IBM with strict data isolation. Propose a concrete plan to use adapters (LoRA/QLoRA/PEFT) for per-tenant fine-tuning, including injection points across Transformer layers, per-tenant rank/alpha settings, data handling to prevent leakage, and a robust evaluation and deployment strategy that can roll back on drift or privacy violations; justify choices?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I would implement an Autogen-driven LangChain agent that first builds a plan: check stock, fetch ETA, then compute a delivery window with a 1–2 day buffer. It should call tools idempotently, handle pa",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Define a 3-class hallucination taxonomy: unsupported, outdated, misattributed. Ground claims to a versioned KB; require each citation references the current version and flags drift. Use a simple relev",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Plan: per-tenant adapters (QLoRA/LoRA/PEFT) injected after attention and FFN in each layer. Assign ranks 8–16 and per-task alpha; train with 4k steps, lr 2e-4, batch 32 (grad. acc. 4). Freeze base, is",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a cross-lingual RAG with bilingual embeddings (LaBSE) and per-type chunking; store language-tagged vectors with versioning and TTL. Retrieval uses language-agnostic similarity plus translation",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests designing multi-tenant adapter strategies with privacy, isolation, and governance across enterprise-scale models.\n\n## Key Concepts\n- PEFT options (LoRA/QLoRA/PEFT) and per-tenant adapters\n- Injection points across Transformer layers\n- Data leakage prevention and drift monitoring\n- Deployment governance and rollback\n\n## Code Example\n```python\n# Pseudo illustrating adapter injection per tenant\nfor layer in model.encoder.layers:\n  layer.add_adapter(name=f\"tenant_{tenant}\", rank=8, alpha=1.0)\n```\n\n## Follow-up Questions\n- How would you enforce tenant isolation in gradients and optimizer state?\n- How would you detect and roll back if a leakage or drift is detected?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "generative-ai-q-4",
-        "questionId": "q-11378",
-        "question": "Build a beginner-friendly retrieval pipeline for a KB with 20 GB of PDFs and FAQs. Use 1000-token chunks with 200-token overlap, embed passages, store in a vector DB (FAISS or Pinecone), and return top-3 passages with citations. Provide a minimal ingest and query code snippet in JavaScript and discuss latency, recall, and incremental updates?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a tri-domain eval harness: 100 prompts per domain; capture outputs, citations, and the exact policy text used. Metrics: grounding accuracy (citations align with live docs), refusal correctness",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design notes: chunk PDFs to 1000-token blocks with 200-token overlap; compute embeddings with text-embedding-ada-002; store in FAISS (HNSW) index; retrieve top-3, then rerank with a cross-encoder; cit",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Leverage LangChain with tenant-scoped Memory and per-tenant vector stores; use AutoGen to produce a plan that calls the private REST API and orchestrates tool calls via function-calling. Isolate data",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Outline an evaluation harness that runs per-region (US/EU/APAC) policy queries against live docs, with a multilingual retrieval layer. Detect cross-language hallucinations by routing to region-specifi",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes practical design choices for document retrieval: chunking strategy, embedding/model trade-offs, vector DB indexing, and maintaining citations under updates.\n\n## Key Concepts\n- Chunking strategy and overlap\n- Embedding model choices\n- Vector DB indexing and freshness\n- Passage citation and provenance\n- Ingestion and incremental updates\n- Evaluation: recall@k and latency\n\n## Code Example\n```javascript\n// ingest\nfunction chunk(text, size=1000, overlap=200){ /* ... */ }\nconst chunks = chunk(pdfText);\nconst embeddings = await Promise.all(chunks.map(c => embed(c)));\nvectorStore.upsert(chunks.map((c,i)=>({id:`c${i}`, text:c, emb:embeddings[i]})));\n\n// query\nconst qemb = await embed(userQuery);\nconst top = vectorStore.query(qemb, {topK:3});\nconst ranked = rerankWithCrossEncoder(top, userQuery);\nreturn ranked.map(p => p.citation);\n```\n\n## Follow-up Questions\n- How would you handle multilingual KB? \n- How would you validate that embedding drift hasn’t degraded recall over time?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "generative-ai-q-5",
-        "questionId": "q-26768",
-        "question": "Design a LangChain-driven agent workflow to reconcile user profile data across two private REST APIs (CRM and Billing) using AutoGen planning and tool-use. Include prompt templates, inter-service validation, conflict resolution strategy, idempotent cache writes, and observability. How would you verify correctness and test coverage in production?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I would implement a SequentialPlanner using LangChain's planning graph: inputs → price(API call) → sentiment(API/stream) → indicators(EMA/ATR) → risk filter (Monte Carlo) → Decision/Alert with determi",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use a LangChain agent with AutoGen planning that calls two private REST tools (CRM and Billing). Define a canonical UserProfile, reconcile fields by source-of-truth rules, and write updates idempotent",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Outline an architecture where the agent selects tools per source, applies policy checks before data fetch, uses idempotent upserts, and records an auditable trail. Show concrete prompts for the planne",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Build a lightweight end-to-end: chunk docs to 200 tokens with 50-token overlap, embed with a small local model, index in FAISS, at query time embed the query, retrieve top-k by cosine similarity, and",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nEvaluates cross-service orchestration with AutoGen planning, data reconciliation, idempotence, and observability in a real-world multi-API setup.\n\n## Key Concepts\n- LangChain agent flow with multiple Tools\n- AutoGen planning and tool-use\n- Data reconciliation and conflict resolution\n- Idempotent writes and cache/versioning\n- Observability and testing in prod\n\n## Code Example\n```javascript\n// Implementation code here\n```\n\n## Follow-up Questions\n- How would you test failure modes when one API returns partial data?\n- How do you validate idempotence across retries?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "generative-ai-q-6",
-        "questionId": "q-15399",
-        "question": "Design an adapter-based fine-tuning plan for a real-time financial-compliance chat assistant integrated into a chat platform (Discord/Google Chat) that must quote policy sources and refuse unsupported requests. Compare LoRA, QLoRA, and PEFT; decide injection points (attention vs FFN vs cross-attention for policy checks); set rank/alpha; choose 4/8-bit quantization; learning rate; batch size; gradient checkpointing; and deployment notes. Include evaluation criteria: policy-adherence rate, refusal accuracy, latency, and KB accuracy against a versioned policy database?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Outline how you'd implement a LangChain agent with Autogen-style planning to orchestrate three tools: KnowledgeBase search, REST /metrics API, and Dashboard write-back. Include the planning data struc",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a 2-head self-attention over a 6-token input, applying a mask to ignore padding and subword-only tokens. Compute attention weights, verify they sum to 1 across valid tokens, and demonstrate that attention peak…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Concrete plan: Use separate adapters for policy verification, gated by attention cross-attention mechanisms. Employ LoRA (recommended) or QLoRA for memory efficiency. Target injection points at cross-attention layers fo…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Implement faithfulness scoring using retrieval-augmented generation and human evaluation pipelines to quantify and minimize hallucinations.",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question evaluates end-to-end design of adapter-based fine-tuning in a safety-critical, live-chat environment. It tests the ability to balance memory efficiency, inference latency, and strict policy compliance simultaneously.\n\n## Key Concepts\n\n- **PEFT variants**: LoRA, QLoRA, and PEFT each offer different tradeoffs between memory usage, training speed, and model quality\n- **Policy-verification gating**: Cross-attention adapters enable the model to conditionally reference policy documents before generating responses\n- **Quantization and optimization**: 4/8-bit quantization and gradient checkpointing are essential for deploying large models within latency constraints\n- **Evaluation metrics**: Policy adherence, refusal accuracy, latency, and knowledge base alignment against versioned policy databases\n\n## Code Example\n\n```python\nfrom transformers import AutoModelForCausalLM\nfrom peft import LoraConfig, get_peft_model, TaskType\n\n# Configure LoRA for policy verification adapter\npolicy_lora_config = LoraConfig(\n    r=8,\n    lora_alpha=16,\n    target_modules=[\"q_proj\", \"v_proj\", \"k_proj\", \"gate_proj\"],\n    lora_dropout=0.1,\n    bias=\"none\",\n    task_type=TaskType.CAUSAL_LM\n)\n\n# Wrap base model with adapter\nmodel = AutoModelForCausalLM.from_pretrained(\"base_model\", load_in_4bit=True)\npolicy_model = get_peft_model(model, policy_lora_config)\n```",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "generative-ai-q-7",
-        "questionId": "q-26047",
-        "question": "Design a privacy-preserving on-device adapter-based fine-tuning plan for a Tesla in-car assistant that answers driving tips and safety alerts. With 40k QA pairs and 20k policy memos, implement DP-SGD (epsilon ~1–2, delta 1e-5), adapters at attention first (FFN only if needed), per-layer rank/alpha defaults, 4-bit quantization, lr 2e-4, batch 8, gradient checkpointing. Include OTA deployment notes and a real-time eval?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Propose a privacy-preserving on-device adapter-based fine-tuning plan for a Tesla in-car assistant that answers driving tips and safety alerts. With 40k QA pairs and 20k policy memos, implement DP-SGD",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Plan: use LoRA in attention blocks (rank 8, alpha 16) with 4-bit QLoRA for memory; FFN adapters kept off. Train with 30k QA pairs, lr 2e-4, batch 16, gradient checkpointing, and DP-SGD with per-exampl",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Diagnose by extracting per-token attention from the final transformer layer, averaging across attention heads, and computing emoji-to-word attention ratios on a small corpus. Compare sentiment accuracy with and without…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a diagnostic plan to quantify cross-chunk drift in a 24-layer Transformer with BPE for a multilingual payments assistant. Instrument per-chunk state vectors; compare head-level attention drift",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nInterview context emphasizes privacy, device constraints, and practical adapter usage in a safety-critical automotive setting.\n\n## Key Concepts\n- DP-SGD and privacy budgets\n- LoRA/QLoRA/PEFT for parameter-efficient fine-tuning\n- On-device constraints (RAM, latency)\n- OTA deployment and versioning\n\n## Code Example\n```javascript\n// Pseudo DP-PEFT training loop sketch\nfor each batch {\n  compute_grads();\n  clip_grads(l2_norm, max_norm=1.0);\n  add_noise(sigma=...);\n  update_adapters();\n}\n```\n\n## Follow-up Questions\n- How to monitor memory, latency, and privacy budgets during live runs?\n- How would you test robustness to adversarial prompts while preserving DP?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "generative-ai-q-8",
-        "questionId": "q-5501",
-        "question": "You are building a beginner-friendly retrieval QA for a knowledge base: ingest PDFs/HTML docs, chunk text into 500–700 token pieces, compute embeddings with a lightweight model, store vectors in a vector DB (FAISS, Chroma, or Pinecone), and answer a user query by retrieving top 5 chunks and synthesizing a concise answer. Explain chunking choices, embedding model, indexing, simple reranking, latency considerations, and a minimal test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Propose an end-to-end harness that runs generated answers against a versioned RDF graph store, validates each factual claim against exact triples, and requires a cited justification path. Use a verifi",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Ingest documents, chunk text into 500–700 token pieces, compute embeddings using a lightweight model like SBERT, store vectors in a vector database (FAISS, Chroma, or Pinecone), retrieve top 5 relevant chunks for a user…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Provide a reproducible eval: 50 synthetic incident briefs with taxonomy of hallucinations (fabrication, misattribution, irrelevance). Ground every remediation claim to an explicit doc/runbook ID. Score groundedness, rel…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Split 200 docs into 512-token chunks with a 256-token overlap, embed each chunk with the given model, and store in FAISS. On query, embed the question, retrieve top-5 chunks, concatenate them, and pro",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nAssesses practical end-to-end retrieval fundamentals: chunking strategy, embedding models, vector storage, and result synthesis within realistic constraints.\n\n## Key Concepts\n- Embedding quality versus chunk size trade-offs\n- Vector stores and indexing strategies\n- Simple reranking and result aggregation\n- Latency, memory usage, and update handling\n\n## Code Example\n```javascript\nfunction chunkText(text, size=600){ /* split into ~size token chunks */ }\n```\n\n## Follow-up Questions\n- How would you handle document updates and index maintenance?\n- How would you evaluate retrieval quality and measure performance?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "generative-ai-q-9",
-        "questionId": "q-16422",
-        "question": "Scenario: Build an autonomous agent to generate GDPR compliance reports from logs in MongoDB. Using LangChain and AutoGen, outline a planning loop that fetches data, summarizes, redacts PII, validates schema, and outputs an auditable report. Include retries, idempotence, and scalability to 10k+ docs. How would you implement this end-to-end?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a planner that outputs a plan as a sequence of tool calls with clear pre/postconditions. Drive it with LangChain to read batches from MongoDB, summarize each batch, redact PII, validate sche",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Two-tier chunking (512–1024 tokens; 1–2 KB) with a financial-domain embedding model; vector DB via HNSW index; primary retriever with fast recall plus a cross-encoder reranker. Ingest uses TTL-based r",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Outline a minimal Python pipeline: split docs into 256-token chunks, embed each with embed(text), store in an in-memory vector store, on query embed(query) and fetch top-3 by cosine similarity, then c",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-turn drift measured with KL divergence between attention distributions across chunk boundaries; compare English vs Spanish on a toy bilingual set; implement a boundary gate that reinitializes or s",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests the ability to design an end-to-end autonomous workflow, data access patterns, tool orchestration, robust error handling, and auditing at scale in a MongoDB/large-scale service context.\n\n## Key Concepts\n- LangChain planning and orchestration\n- AutoGen cross-step coordination\n- Tool-use and failure handling\n- Data access patterns with MongoDB\n- Idempotence and auditable logging\n\n## Code Example\n```javascript\n// Pseudo: plan object and executor skeleton\nconst plan = {\n  step: 'readBatch',\n  next: [\n    { action: 'summarize', batch: 'A' },\n    { action: 'redact', source: 'summary' },\n    { action: 'validate', target: 'redacted' },\n    { action: 'assembleReport' }\n  ],\n  retry: { limit: 3, backoffMs: 100 }\n}\n```\n\n## Follow-up Questions\n- How would you test idempotence across retries and partial failures?\n- What metrics would you collect to monitor planning correctness at scale?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "generative-ai-q-10",
-        "questionId": "q-12087",
-        "question": "Design an adapter-based fine-tuning plan for a cross-brand customer-support bot deployed for Instacart and Oracle, prioritizing privacy-preserving per-tenant adapters and multilingual capability. Compare LoRA, QLoRA, and PEFT; decide injection points (attention first, FFN if needed); specify fusion strategy, quantization (4/8-bit), rank/alpha, lr, batch, and rollout/versioning with rollback. Include evaluation metrics and deployment notes?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a LangChain pipeline where AutoGen proposes a plan from the ticket, maps steps to tools (private REST API, DB query, Python sandbox function), and executes in a chain with retries/backoff and i",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Outline a small Python pipeline: chunk articles into fixed-size slices (512 tokens), generate deterministic embeddings from text (e.g., token histogram or hashing into a vector), store in an in‑memory",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design an end-to-end evaluation framework for a multilingual billing policy assistant that maintains factual accuracy across dynamic pricing policies. Build a versioned policy store integrated with a live billing API, r…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-tenant adapters with adapter fusion across base and tenant adapters; inject at attention first (FFN if needed); compare LoRA, QLoRA, PEFT and select rank 8, alpha 16; lr 2e-4; batch 16; 4-bit quan",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design a privacy-aware, multilingual adapter strategy for multi-tenant brands, including deployment governance and live rollback.\n\n## Key Concepts\n- Per-tenant adapters\n- Adapter fusion\n- Privacy-preserving fine-tuning\n- Deployment/versioning/rollback\n\n## Code Example\n```python\n# pseudo-config snippet\npeft = {\n  'type': 'QLoRA',\n  'adapters': ['base','tenantA','tenantB'],\n  'fusion': 'weighted_sum'\n}\n```\n\n## Follow-up Questions\n- How would you monitor policy compliance and drift across tenants?\n- What testing strategy ensures safe rollbacks without service disruption?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "generative-ai-q-11",
-        "questionId": "q-21342",
-        "question": "You're deploying a cross-brand enterprise assistant that answers policy and compliance questions by stitching together internal policies (Policy DB A) and regulatory guidance (External DB B). The model must not hallucinate, must surface per-sentence citations, and should flag conflicting sources with a conflict alert. Propose a concrete evaluation plan (datasets, metrics, tooling) and include a runnable baseline script that returns sentence-level citations for each answer?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Plan a diagnostic: instrument per-head attention drift when a KB entry appended mid-chat with rotary embeddings and a dynamic subword tokenizer. Compare drift across rotary vs sinusoidal, quantify lat",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use a LangChain agent wired to AutoGen to orchestrate multi-source data collection (internal DB, REST, files) with dynamic tool discovery. Implement rate-limiting per source, backoff, and a provenance",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a three-layer evaluation framework: (1) Gold Q&A dataset with dual-source citations spanning Policy DB A and External DB B; (2) Metrics: sentence-level attribution accuracy, cross-source consistency, conflict-fla…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Reproduce the issue using a minimal 3-sentence input with heavy punctuation, then extract attention weights from the first two layers. Compute a diagonal-attention score by measuring attention assigned to the same token…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis scenario tests the ability to design concrete evaluation frameworks for multi-source policy reasoning in regulated environments—where accuracy and traceability are legally required.\n\n## Key Concepts\n- Multi-source faithfulness: Ensuring the model attributes claims to correct sources\n- Per-sentence provenance: Granular citation at the sentence level, not just document-level\n- Conflict detection: Identifying contradictory information across internal policies and external regulations\n\n## Code Example\n```javascript\nfunction extractCitations(answer, sources) {\n  const sentences = answer.split(/[.!?]+/).filter(s => s.trim());\n  return sentences.map(sentence => {\n    const relevantSources = sources.filter(s => \n      sentence.toLowerCase().includes(s.keyphrase.toLowerCase())\n    );\n    return { sentence: sentence.trim(), citations: relevantSources };\n  });\n}\n\nfunction detectConflicts(sources) {\n  const conflicts = [];\n  for (let i = 0; i < sources.length; i++) {\n    for (let j = i + 1; j < sources.length; j++) {\n      if (sources[i].contradicts?.(sources[j])) {\n        conflicts.push({ sourceA: sources[i], sourceB: sources[j] });\n      }\n    }\n  }\n  return conflicts;\n}\n\nfunction generateAnswerWithCitations(query, policyDB, regulatoryDB) {\n  const policyResults = policyDB.retrieve(query);\n  const regulatoryResults = regulatoryDB.retrieve(query);\n  const allSources = [...policyResults, ...regulatoryResults];\n  \n  const answer = generateAnswer(query, allSources);\n  const citations = extractCitations(answer, allSources);\n  const conflicts = detectConflicts(allSources);\n  \n  return { answer, citations, conflicts: conflicts.length > 0 ? conflicts : null };\n}\n```",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "generative-ai-q-12",
-        "questionId": "q-4775",
-        "question": "Design a retrieval-augmented QA system for a multilingual corporate knowledge base that answers policy questions. Use chunking for long PDFs, embeddings with a multilingual model, and a vector DB with per-document provenance. Describe indexing, chunk size and overlap, re-ranking, freshness with delta updates, latency targets, privacy controls, and end-to-end evaluation?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Deploy per-brand LoRA adapters at attention layers (rank 8, alpha 16) with a shared FFN baseline to preserve core reasoning capabilities. Use separate brand-specific adapters with a lightweight gating network to dynamic…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose a multilingual retrieval-augmented QA pipeline: chunk docs into ~1000-token segments with ~200-token overlap, encode with a multilingual model (e.g., XLM-R or mBERT variants), store embeddings",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Plan should include multilingual code-grounded QA data linked to real repo snippets, mandatory citations with file paths and SHAs, metrics for faithfulness and cross-language hallucinations, drift tra",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a LangChain-based agent workflow to securely compute user segmentation from a private REST API under privacy constraints using AutoGen planning and tool-use. Include dynamic tool discovery, on-demand redaction, d…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nReal-world knowledge bases demand fast, accurate multilingual retrieval with robust chunking and freshness. This question probes architecture, trade-offs, and evaluable metrics.\n\n## Key Concepts\n- Multilingual embeddings and cross-encoder reranking\n- Document chunking strategies (size, overlap)\n- Vector databases and provenance metadata\n- Delta updates for freshness and privacy controls\n- End-to-end evaluation (NDCG@k, recall@k, latency)\n\n## Code Example\n```python\n# Simple chunk generator\ndef chunk_text(text, max_tokens=1024, overlap=200):\n    chunks = []\n    start = 0\n    while start < len(text):\n        end = min(start + max_tokens, len(text))\n        chunks.append(text[start:end])\n        start = end - overlap\n    return chunks\n```\n\n## Follow-up Questions\n- How would you measure retrieval quality in a multilingual setting with non-overlapping corpora?\n- How would you handle access control and privacy in a vector DB?\n- What strategies would you use to detect and remediate stale embeddings?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "generative-ai-q-13",
-        "questionId": "q-3381",
-        "question": "How would you design a minimal LangChain planning workflow for the user request: 'Show me the latest mortgage rate changes and a one-page summary' that splits into steps: (1) fetch latest rates via a MortgageRates API, (2) compare with prior day, (3) format a formatted summary, and (4) assemble a report? Include tool wiring, error handling, and basic tests?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a minimal LangChain plan: use a planner to break the task into four steps, wire two tools (RatesAPI and SummaryTool), then execute in a SequentialChain. Steps: 1) fetch latest mortgage rates, 2",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Compute qK^T: for k1=[1,0], q·k1=1; k2=[0,1], 0; k3=[1,1], 1; k4=[0,-1], 0. Divide by sqrt(2) -> [0.707,0,0.707,0]. Softmax([0.707,0,0.707,0]) ≈ [0.335,0.165,0.335,0.165]. Output = sum w_i V_i = [0.33",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a three-type labeling scheme: fabrication (unfounded claim), misattribution (wrong source), and over-generalization (vague claim). Require every claim to anchor to a versioned KB paragraph. Build",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Deploy per-domain adapters via a lightweight adapter hub. Inject at attention layers first (rank 8, alpha 16), with FFN fallback for complex domains. Use 4-bit quantization for most domains and 8-bit for high-complexity…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question evaluates practical use of LangChain planning and tool orchestration, not just theory. It mirrors real-world tasks at fintechs and enterprise platforms where teams wire tools and plan steps from natural language.\n\n## Key Concepts\n\n- Planning: breaking a user request into discrete steps\n- Tool wiring and error handling\n- Testing with mocks and retries\n\n## Code Example\n\n```javascript\n// Minimal pseudo-implementation\nconst tools = { ratesApi: new RatesApiTool(), summaryTool: new SummaryTool() };\nconst plan = await planner.plan(\"latest mortgage rates and summary\");\nconst chain = new SequentialChain([plan, tools.ratesApi, tools.summaryTool]);\nconst out = await chain.run({ input: \"latest mortgage rates\" });\n```\n\n## Follow-up Questions\n\n- How would you test tool failures and retries?\n- How would you extend this to handle multiple regions or currencies?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "generative-ai-q-14",
-        "questionId": "q-12749",
-        "question": "Design a production-ready evaluation framework for a multilingual cross-brand policy assistant used by DoorDash, Twitter, and Snap that must (a) avoid hallucinating policy details, (b) stay faithful to the latest official policy docs across locales, and (c) surface brand-specific citations with versioned references. Propose data schema, metrics (factuality@k, citation drift, relevance), tooling, data pipelines, and a minimal reproducible eval script?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Plan a diagnostic: instrument per-head attention drift when a KB entry appended mid-chat with rotary embeddings and a dynamic subword tokenizer. Compare drift across rotary vs sinusoidal, quantify lat",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a retrieval-augmented generation system with a versioned policy knowledge base, per-brand locale snapshots, and a citation graph. Evaluate using factuality@k, citation accuracy, drift rate, and relevance metri…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Outline a plan where a ToolRegistry exposes PrometheusQuery, JaegerQuery, LokiLogs, RedactTool, AnonymizeTool, and IncidentDecisionTool. Use a plan-first prompt to generate a chain, then execute and e",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Propose a plan: 1) call a cloud-pricing API for EC2-t4g.medium, RDS MySQL, CloudFront. 2) convert hourly rates to monthly (≈ 730 hours). 3) sum with tax, consider data transfer. 4) return a range with",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis assesses practical evaluation design for a multilingual, cross-brand policy assistant, requiring metrics that go beyond generic approaches to version-aware, citation-focused validation.\n\n## Key Concepts\n\n- Retrieval-augmented generation with versioned knowledge base\n- Cross-brand multilingual evaluation framework\n- Citation faithfulness and drift tracking\n\n## Code Example\n\n```python\n# minimal eval stub\ndef factuality_at_k(preds, refs, k=5):\n    return sum(p in r for p, r in zip(preds, refs)) / max(1, len(preds))\n```\n\n## Follow-up Questions\n\n- How would you automate policy document updates across all brands and locales?\n- What monitoring would you implement for citation quality degradation?\n- How would you handle version conflicts between brands with different update cadences?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "generative-ai-q-15",
-        "questionId": "q-11112",
-        "question": "In LangChain, implement a minimal planning flow that uses a pricing API and a calculator tool to answer: 'Estimate the monthly cost to run a small web app on AWS with EC2 t4g.medium, RDS MySQL, and CloudFront'. Outline the exact tool calls and a small code snippet to trigger a tool in a planning step?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Quantify cross-chunk drift with per-head KL divergence between attention distributions across consecutive chunks, averaged over a toy bilingual code corpus; compare BPE vs char-level by streaming inpu",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a multi-layered evaluation system combining automated metrics (ROUGE, BERTScore for semantic similarity), factual verification against knowledge bases, and faithfulness scoring using attention attribution mech…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Propose a pipeline: chunk docs into 512-token slices with 128-token overlap, encode with a small transformer (e.g., distilled SBERT), store vectors in FAISS (IVF + PQ). For queries, embed, retrieve to",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Propose a plan: 1) call a cloud-pricing API for EC2-t4g.medium, RDS MySQL, CloudFront. 2) convert hourly rates to monthly (≈ 730 hours). 3) sum with tax, consider data transfer. 4) return a range with",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to translate a real-world costing task into a reproducible, beginner-friendly LangChain planning flow that uses tool orchestration and simple arithmetic.\n\n## Key Concepts\n\n- Tool selection and orchestration\n- Planning vs. execution, simple ReAct-like flow\n- Cost estimation: hourly to monthly, data transfer edges, taxes\n- Fallbacks for missing pricing data\n\n## Code Example\n\n```javascript\n// Minimal planning snippet illustrating tool invocation\nasync function planCost(query){\n  const prices = await pricingApi.getPrices({services:[\"EC2\",\"RDS\",\"CloudFront\"], instance:\"t4g.medium\"});\n  const monthly = prices.ec2 * 730 + prices.rds * 730 + prices.cloudfront * 730;\n  return monthly;\n}\n```\n\n## Follow-up Questions\n\n- How would you handle data-transfer costs and regional multipliers?\n- What changes if pricing data is incomplete or delayed?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "generative-ai-q-16",
-        "questionId": "q-9399",
-        "question": "Scenario: a multilingual billing policy assistant for a SaaS platform used by Snap Nvidia and HashiCorp. It must answer pricing terms discounts and renewal rules. The live policy store updates monthly and the billing API returns current terms. The model sometimes fabricates discount codes or misstates expiration dates. Design an end-to-end evaluation plan that (1) ensures every factual claim maps to the API or a specific policy version (2) detects cross source hallucinations when API and docs disagree (3) tracks policy drift with time stamped citations (4) includes datasets, metrics, tooling, and a minimal eval script?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design an end-to-end evaluation framework for a multilingual billing policy assistant that maintains factual accuracy across dynamic pricing policies. Build a versioned policy store integrated with a live billing API, r…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "I would build a multilingual retrieval-augmented QA pipeline: chunk documents into ~800-token blocks with overlap, embed with a multilingual model, store in a vector DB (e.g., Qdrant) with HNSW, retrieve top-k candidate…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Build a versioned knowledge base of internal runbooks and external advisories. For each prompt, parse the model's outputs to extract remediation steps and citations, then verify every citation against the corresponding…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Ground every fact to a versioned KB and add an uncertainty gate that refuses or defers when confidence is low. Create a tiny labeled eval set with ambiguity cues, plus a minimal Python script to compu",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests practical skills designing a rigorous evaluation framework for a multilingual policy assistant that must ensure every factual claim maps to a live source while detecting cross-source conflicts and tracking policy drift over time.\n\n## Key Concepts\n\n- Multilingual policy alignment and factual consistency\n- Versioned source management and drift detection\n- Cross-source hallucination detection for conflicting information\n- Automated evaluation with comprehensive metrics and tooling\n\n## Code Example\n\n```javascript\n// Minimal verification framework: map claims to source citations\nfunction verifyClaim(claim, sources) {\n  const citation = findSourceCitation(claim, sources);\n  return {\n    claim,\n    source: citation.url,\n    timestamp: citation.version,\n    isValid: validateClaim(claim, citation)\n  };\n}\n```",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "generative-ai-q-17",
         "questionId": "q-6646",
         "question": "Scenario: you’re optimizing a QA assistant that must reason over long code and document corpora (1M+ tokens). Task: design an experiment comparing full self-attention against a sparse-attention variant (fixed-block or sliding-window) for long-context QA. Specify dataset setup, tokenizer, attention mask strategy, and evaluation plan. Provide a minimal PyTorch code snippet to build a 512-token sliding window mask with 64 global tokens and discuss latency/memory trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "I would implement a LangChain pipeline with a Planner/Agent that first checks a Redis cache for the requested analytics data. On a cache miss, it calls the private REST API via a specialized tool, parses paginated respo…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design an autonomous LangChain agent that, given '7-day sales by category', partitions into data fetch (internal API /sales?from=7d), data clean (pandas), aggregation, visualization (Plotly), and a fi",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
             "text": "Compare full self-attention to a sliding-window sparse scheme: 512-token windows with 64 global tokens on a 1M-token corpus. Use a BPE tokenizer; QA on a held-out set; report EM/F1, latency, and peak",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "Store key-value pairs from previous tokens in cache, reuse for attention computation, reducing O(n²) complexity to O(n) for inference",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use byte-level BPE tokenization with a 32k vocab to minimize OOVs across languages. For long contexts, employ local attention within a 512-token window plus ~8 global tokens as memory, and use a linea",
+            "isCorrect": false
+          },
+          {
             "id": "d",
-            "text": "Explain how you'd build a LangChain agent that auto-discovers tools for REST, gRPC, and SQL sources, then uses AutoGen to produce an auditable end-to-end plan with explicit rationale per step, safety",
+            "text": "Index the most recent material using 4KB code chunks and 2KB doc chunks with 768-dim embeddings in an HNSW-based ANN store (Pinecone/FAISS). Use a two-stage retriever: fast ANN search then a cross-enc",
             "isCorrect": false
           }
         ],
@@ -547,49 +37,169 @@
         "difficulty": "intermediate"
       },
       {
-        "id": "generative-ai-q-18",
-        "questionId": "q-12213",
-        "question": "Design a real-time Retrieval-Augmented Generation (RAG) pipeline for a CDN knowledge base. Requirements: chunk docs into 512-token blocks with 128-token overlap; maintain two embeddings per chunk (sentence-level and section-level) in a vector DB; perform a two-stage retrieval (cosine similarity on both embeddings, then cross-encoder reranking); generate answers with source citations; ensure data freshness via streaming updates and TTL pruning; outline latency targets and rollback plan?",
+        "id": "generative-ai-q-1",
+        "questionId": "q-10379",
+        "question": "Design a LangChain-based planner for a travel assistant that fetches live flight prices, compares offers, books a selected flight via a booking API, and notifies the user. Outline the tool graph, ordering, error handling (fallback to cache, retries, idempotent calls), and how Autogen-style planning handles partial failures?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a ReAct-style loop with a tool registry and a planning prompt generated by Autogen. First search for latest earnings, fetch transcripts, extract signals with a classifier, then summarize and propo",
+            "text": "Design a LangChain-driven agent that coordinates three private data sources: a REST analytics API, a data warehouse, and a human-in-the-loop reviewer. Implement AutoGen planning to dynamically select tools, handle drift…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "I would instrument a tiny 2-layer transformer with a BPE tokenizer, extract per-head attentions, and compute a boundary-attention ratio: mean attention to boundary tokens over mean attention to real t",
+            "text": "Plan: define goals: fetchPrices, compareOffers, selectFlight, bookSeat, notifyUser. Use LangChain planner to sequence tool calls: priceAPI, bookingAPI, notificationAPI, cache. Implement fallback: on p",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Recommend QLoRA with 4-bit quantization and LoRA adapters injected into attention projections of both encoder and decoder (across all layers). Use rank 8, alpha 16, LR 2e-4, batch 16, 3 epochs. Train",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Tokenize with SentencePiece (unigram) using a 32k vocabulary to handle multilingual text robustly. Implement sparse attention with 1024-token local windows plus 64 global tokens. Apply rotary embeddings for length-agnos…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nAssesses practical tool orchestration, fallback strategies, and planning depth in real systems.\n\n## Key Concepts\n\n- LangChain planning and tool graphs\n- Autogen-style decomposition\n- Idempotent APIs, caching, retries\n- Observability and error handling\n\n## Code Example\n\n```javascript\n// Skeleton plan\nconst plan = [\"fetchPrices\", \"compareOffers\", \"selectFlight\", \"bookSeat\", \"notifyUser\"];\n```\n\n## Follow-up Questions\n\n- How would you test with simulated price API failures?\n- How do you extend the plan for multi-city itineraries?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-2",
+        "questionId": "q-19327",
+        "question": "Design a beginner-friendly evaluation for a 4-layer transformer chatbot used in ride-hailing support (English-Spanish, with typos and code-switching). Create an experiment that (1) tests tokenization resilience under noisy input, (2) measures whether attention mass concentrates on real tokens vs typos, (3) compares BPE tokenization with a simple character-level tokenizer for stability, and (4) provides a runnable Python snippet to simulate noisy input and print per-token attention distribution—what would you observe and how would you fix it?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a three-type labeling scheme: fabrication (unfounded claim), misattribution (wrong source), and over-generalization (vague claim). Require every claim to anchor to a versioned KB paragraph. Build",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a beginner-friendly evaluation for a 4-layer transformer chatbot used in ride-hailing support (English-Spanish, with typos and code-switching). Create an experiment that (1) tests tokenization resilience under no…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a multilingual subword tokenizer using SentencePiece with an integrated domain lexicon that maps specialized terms across languages to shared global IDs. Employ sparse attention combining 2k-token local window…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose per-brand adapters at the attention blocks with a shared base. Use LoRA or QLoRA based on data; rank 8–16, alpha 16–32. Inject first at attention, then FFN if needed. Apply 4‑bit quantization,",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question evaluates the ability to design tangible diagnostics rather than abstract theory, focusing on tokenization robustness and attention behavior in multilingual, noisy inputs.\n\n## Key Concepts\n\n- **Tokenization resilience**: Comparing BPE versus character-level approaches under noisy conditions\n- **Attention mass distribution**: Analyzing how attention shifts between correctly spelled tokens and noisy tokens\n- **Multilingual code-switching effects**: Understanding how the model handles mixed-language inputs\n- **Metrics**: KL divergence and attention mass ratio for quantification\n\n## Approach\n\nRun a small bilingual corpus with English-Spanish prompts, inject typos and code-switching, and compare a 4-layer transformer with BPE versus a character-level tokenizer. For each input, compute per-token attention distributions and analyze how attention mass shifts between correctly spelled tokens and noisy tokens.\n\n## Code Example\n\n```python\nimport numpy as np\n\ndef simulate(tokens):\n    # Simulate uniform attention across 4 layers\n    att = np.ones((4, len(tokens))) / len(tokens)\n    return att\n\ndef analyze_attention(tokens, attention):\n    # Print per-token attention distribution\n    for layer in range(attention.shape[0]):\n        print(f\"Layer {layer + 1}:\")\n        for token, att_score in zip(tokens, attention[layer]):\n            print(f\"  {token}: {att_score:.4f}\")\n        print()\n\n# Example usage with noisy input\nnoisy_tokens = [\"Hola\", \"ride\", \",\", \"can\", \"yo\", \"u\"]\nattention = simulate(noisy_tokens)\nanalyze_attention(noisy_tokens, attention)\n\n# Observation: Uniform attention treats all tokens equally\n# Fix: Use character-level tokenizer for better handling of typos\n# or implement subword regularization during training\n```",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "generative-ai-q-3",
+        "questionId": "q-24705",
+        "question": "You're building an AI code assistant that generates Python scripts to manage AWS infrastructure. The model occasionally uses deprecated boto3 calls and leaks credentials. Design a practical evaluation harness to (1) detect API-usage hallucinations and unsafe patterns, (2) verify alignment with the latest AWS docs and secret-management policy, (3) measure runtime correctness and security risk under realistic workloads, and (4) provide datasets, tooling, and a runnable baseline script?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a practical evaluation harness for an AI code assistant that generates Python scripts to manage AWS infrastructure. The model must not use deprecated boto3 calls or leak credentials. Include (1",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement a two-stage retrieval: first use BM25 for exact matches on restaurant names/cuisines, then semantic search with sentence-transformers for contextual understanding. Use weighted scoring (0.6",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "A practical approach is to index two embeddings per chunk (sentence-level and section-level) in FAISS, fetch top-K by cosine similarity on both, fuse scores, and rerank with a cross-encoder; generate",
-            "isCorrect": true
+            "text": "Plan: implement a streaming diagnostic to quantify cross-language attention drift when English→Spanish happens mid-stream. Compare English-only tokenization vs bilingual tokenization on a 20-sentence",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design notes: chunk PDFs to 1000-token blocks with 200-token overlap; compute embeddings with text-embedding-ada-002; store in FAISS (HNSW) index; retrieve top-3, then rerank with a cross-encoder; cit",
+            "text": "Sample answer: Implement a controller agent that resolves API connectors at runtime, composes a plan with retries and backoff, uses a central schema for inputs/outputs, masks PII, rotates creds after",
             "isCorrect": false
           }
         ],
-        "explanation": "Why This Is Asked\nThis question evaluates hands-on design of a real-time RAG system, including multi-embedding chunking, multi-stage retrieval, and data freshness in production-like conditions.\n\nKey Concepts\n- Dual-embedding chunking\n- Vector DB indexing and cosine search\n- Cross-encoder reranking\n- Streaming updates and TTL pruning\n- Latency targets and observability\n\nCode Example\n```javascript\nasync function retrieve(query) {\n  const eSent = await embed(query, 'sentence');\n  const eSect = await embed(query, 'section');\n  const topSent = vectorDB.search(eSent,  topK);\n  const topSect = vectorDB.search(eSect, topK);\n  // fuse and rerank\n  return rerank(topSent, topSect, query);\n}\n```\n\nFollow-up Questions\n- How would you measure and improve retrieval quality in production?\n- How would your design adapt if the vector DB spans multiple regions with different latencies?",
+        "explanation": "## Why This Is Asked\n\nThis question probes practical evaluation strategies for AI code assistants in engineering contexts where security and accuracy are critical.\n\n## Key Concepts\n\n- Code-generation correctness and safety\n- API-usage deprecation detection\n- Alignment with live docs and policies\n- Test datasets, static/dynamic analysis, and runnable baselines\n\n## Code Example\n\n```python\n# Minimal evaluator scaffold for API-usage checks\nimport ast\nDEPRECATED_API_PATTERNS = [\"boto3.client('ec2')\", \"ec2.describe_instances\"]\n\nclass APIUsageVisitor(ast.NodeVisitor):\n    def visit_Call(self, node):\n        # placeholder: detect deprecated API usage patterns in call chains\n        return super().generic_visit(node)\n```\n\n## Follow-up Questions\n\n- How would you extend to multiple languages and SDKs?\n- How would you integrate this into a CI/CD pipeline and track drift over time?",
         "difficulty": "intermediate"
       },
       {
-        "id": "generative-ai-q-19",
-        "questionId": "q-19434",
-        "question": "Design an adapter-based fine-tuning plan for a privacy-preserving multilingual customer-support assistant used by two brands (Amazon-like retail and Adobe-like software) running on a 12GB GPU. Propose per-brand adapters (LoRA/QLoRA/PEFT), injection points (attention first, FFN if needed), fusion strategy, 4-bit quantization, rank/alpha defaults, lr, batch, gradient checkpointing. Define a rollout with versioning, rollback, and a privacy guardrail: zero-shot leakage checks against a synthetic KB, and a latency target (<60 ms/query). Include on-device deployment notes?",
+        "id": "generative-ai-q-4",
+        "questionId": "q-402",
+        "question": "How would you design a hallucination detection system for a medical AI assistant that evaluates faithfulness against verified drug databases while maintaining 99.9% accuracy?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a per-tenant adapter strategy: two domain adapters (clinical content, pharmacology) mounted on a shared base; inject at attention first, FFN only if needed; per-layer rank 8, alpha 16; 4-bit qu",
+            "text": "Provide a beginner-friendly plan to quantify boundary-aligned attention fidelity using a boundary-aware metric that anchors on the first subword of each word and downweights other subwords. Use 3-5 se",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Per-brand adapters via LoRA/QLoRA with PEFT. Inject at attention first; FFN if needed. Use rank=8, alpha=16; 4-bit quantization; lr=3e-4; batch=16; gradient checkpointing. Validate cross-brand factual",
+            "text": "Design a hallucination detection system with three-tier architecture: (1) real-time semantic matching against verified drug databases using vector embeddings, (2) cross-validation with multiple authoritative sources inc…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Recommend QLoRA with 4-bit quantization and LoRA adapters injected into attention projections of both encoder and decoder (across all layers). Use rank 8, alpha 16, LR 2e-4, batch 16, 3 epochs. Train",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a retrieval-augmented evaluation: maintain versioned, multilingual policy corpora (en/es/zh) per release. For each prompt, fetch top passages via dense embeddings and BM25, align citations t",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nVeeva needs AI systems that won't hallucinate medical information. This tests system design, ML evaluation, and understanding of production ML constraints.\n\n## Expected Answer\nStrong candidates discuss: semantic similarity embeddings, factual consistency verification, confidence thresholds, human review workflows, and monitoring false positives/negatives.\n\n## Code Example\n```typescript\nclass HallucinationDetector {\n  async evaluate(response: string, sources: string[]) {\n    const semanticScore = await this.computeSimilarity(response, sources);\n    const factualScore = await this.verifyFacts(response);\n    const confidence = this.calculateConfidence(semanticScore, factualScore);\n    return { isHallucinated: confidence < 0.95, confidence };\n  }\n}\n```\n\n## Follow-up Questions\n- How would you handle edge cases where sources conflict?\n- What metrics would you track to monitor system performance?\n- How would you optimize for latency while maintaining accuracy?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-5",
+        "questionId": "q-30317",
+        "question": "In a 2-layer Transformer classifier using BPE tokenization, rare words are often split into subwords and drive uncertain predictions. Design a beginner-friendly evaluation to (1) quantify calibration error across token granularity, (2) compare a standard BPE tokenizer with a finer-grained variant on a 3-sentence toy dataset, (3) implement a token-level temperature scaling scheme that yields a stable sentence probability, and (4) provide runnable Python that prints per-token probabilities, aggregates to sentence-level calibration metrics, and plots a reliability diagram?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose a pipeline that chunks docs into 512-token slabs with 128-token overlap, embeds via a compact SBERT-like model, and stores in FAISS IVF. On query, fetch top-3 chunks, re-rank with a small LM,",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a streaming diagnostic: quantify per-head attention mass on the current chunk vs earlier chunks during token-by-token generation; compare English vs Spanish drift on a small bilingual set; impl",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Measure calibration (ECE, Brier) for inputs with whole words vs subwords. Build a 3-sentence toy dataset; compare standard BPE against a finer tokenizer on rare words. Implement token-level temperatur",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "To address cross-chunk attention drift in code-switching scenarios, first implement a streaming language-switch detector that identifies transitions between languages (e.g., English to Mandarin) at chunk boundaries usin…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes practical understanding of how tokenization granularity impacts model confidence and how to evaluate and improve it in beginner-friendly steps.\n\n## Key Concepts\n- Calibration: ECE, Brier score\n- Tokenization granularity: BPE vs finer subword vocabularies\n- Temperature scaling at token level\n- Reliability diagrams and token-to-sentence aggregation\n\n## Code Example\n```python\n# Minimal sketch: compute per-token probs and a simple temperature-calibration\nimport numpy as np\n# placeholders for token_logits and true_labels\n```\n\n## Follow-up Questions\n- How would you extend to multilingual tokenization and calibration across languages?\n- What are trade-offs of token-level calibration vs post-hoc sentence calibration?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "generative-ai-q-6",
+        "questionId": "q-24444",
+        "question": "Design a LangChain-driven agent workflow that ingests streaming metrics from two private GraphQL endpoints, uses AutoGen for end-to-end planning, and orchestrates three tools: fetch, transform, and write. Include prompt templates, tool-selection policy, idempotence guarantees for writes, debouncing, and end-to-end observability. Explain how you'd verify correctness and simulate failures?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Plan: quantify cross-chunk drift with per-head metrics, e.g., cross-boundary attention entropy and KL divergence between boundary token distributions. Compare English and Chinese drift on a small bili",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a LangChain agent that ingests streaming metrics from two private GraphQL endpoints, uses AutoGen for end-to-end planning, and orchestrates three tools: fetch, transform, and write. Enforce ide",
             "isCorrect": true
           },
           {
@@ -599,166 +209,556 @@
           },
           {
             "id": "d",
-            "text": "Implement two paths: (1) full attention with memory-efficient KV caches and gradient checkpointing; (2) block-sparse attention with fixed windows plus few global tokens. Use streaming SentencePiece to",
+            "text": "Design a beginner-friendly evaluation for a 4-layer transformer chatbot used in ride-hailing support (English-Spanish, with typos and code-switching). Create an experiment that (1) tests tokenization resilience under no…",
             "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests practical mastery of LangChain with AutoGen in a multi-source, streaming data setup. It emphasizes concrete tooling choices, idempotence, and observability under real-world constraints.\n\n## Key Concepts\n\n- LangChain agent orchestration with multiple tools\n- AutoGen-based planning for tool selection and sequencing\n- Streaming data handling, debouncing, and retry/backoff\n- Idempotent writes and sink consistency\n- Observability: tracing, metrics, alerting, and failure-mode testing\n\n## Code Example\n\n```javascript\n// Sketch: scaffolding for tool interfaces and planning hooks\nclass GraphQLFetcher { constructor(endpoint) { /* ... */ } fetch(streamingMode) { /* ... */ } }\nclass Transformer { transform(raw) { /* ... */ } }\nclass SinkWriter { write(record) { /* idempotent write logic */ } }\n\nconst fetchA = new GraphQLFetcher('https://A.graphql');\nconst fetchB = new GraphQLFetcher('https://B.graphql');\nconst transformer = new Transformer();\nconst sink = new SinkWriter();\n\n// Pseudo-flow: fetch -> transform -> plan -> execute -> sink\n```\n\n## Follow-up Questions\n\n- How would you verify idempotence across restarts and retries?\n- How would you model and test backoff strategies under burst traffic?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "generative-ai-q-7",
+        "questionId": "q-6571",
+        "question": "You're tasked with building a multi-step data enrichment agent for Instacart/Meta using LangChain and AutoGen. Outline a concrete flow that: (1) plans steps using Autogen, (2) calls tools to fetch product data from two APIs, (3) validates and deduplicates records, (4) applies business rules to score items, (5) returns the top-5 items with justification, and (6) logs tracebacks and recovers from transient failures. Provide a high-fidelity prompt structure and a minimal code skeleton showing how the chain connects tools and planning?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a two-layer flow: Autogen writes a stepwise plan; LangChain executes Tools in sequence. Fetch from API A and B, normalize fields, deduplicate by product_id, apply scoring rule (popularity * fre",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use LangChain's AgentExecutor with a planning loop and Autogen thoughts. Route through Address Validator, Weather API, then Calendar API. Build a plan that selects a 2-hour slot, validates the address",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Adopt a retrieval-augmented pipeline with three versioned KBs: market data, regulatory disclosures, and user agreements. Each answer includes per-source citations and timestamps. Add a cross-domain ve",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Ground every fact to a versioned KB and add an uncertainty gate that refuses or defers when confidence is low. Create a tiny labeled eval set with ambiguity cues, plus a minimal Python script to compu",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests ability to design robust, scalable planning and tool orchestration using LangChain and AutoGen. It probes how the candidate decomposes a data pipeline, handles failures, and produces auditable output.\n\n## Key Concepts\n\n- Autogen-driven planning: generate stepwise execution plans with fallback paths\n- LangChain Tools and Chains: sequential tool execution, error handling, and tracing\n- Data integrity: deduplication, normalization, and deterministic scoring\n\n## Code Example\n\n```javascript\n// Skeleton: chain wiring for LangChain + Autogen (not functional)\nimport { LangChain, Tools, Chain } from 'langchain'\n\nconst planTool = new Tool({ name: 'AutogenPlan', run: async (ctx) => {/* generate steps */} })\nconst fetchA = new Tool({ name: 'FetchAPI_A', run: async (ctx) => {/* API call */} })\nconst fetchB = new Tool({ name: 'FetchAPI_B', run: async (ctx) => {/* API call */} })\n\nconst chain = new Chain({ tools: [planTool, fetchA, fetchB] })\n// Execute with context, then post-process (dedupe, score, top-5)\n```\n\n## Follow-up Questions\n\n- How would you implement retry/backoff policies and idempotent writes for transient API failures?\n- What observability would you add to verify the top-5 justification remains stable under API data drift?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-8",
+        "questionId": "q-11805",
+        "question": "Design a concrete adapter-based fine-tuning plan to build a privacy-preserving on-device legal/compliance assistant for a fintech app (Meta/Robinhood-like) using LoRA/QLoRA/PEFT. Given 40k memos and 15k policy updates, specify injection points (attention vs FFN), rank/alpha defaults, 4-bit quantization, lr, batch size, gradient checkpointing, and a practical eval (factuality against policy KB, risk score, latency). Include deployment notes?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Plan: fine-tune a base LLM with LoRA adapters injected into attention layers first (rank 8, alpha 16) and fallback to FFN if needed; use QLoRA for memory efficiency; 4-bit quantization; lr 2e-4; batch",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Design a diagnostic plan to quantify cross-chunk drift in a 24-layer Transformer with BPE for a multilingual payments assistant. Instrument per-chunk state vectors; compare head-level attention drift",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Two-tier chunking (512–1024 tokens; 1–2 KB) with a financial-domain embedding model; vector DB via HNSW index; primary retriever with fast recall plus a cross-encoder reranker. Ingest uses TTL-based r",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I would implement a runtime tool registry keyed by data source and access scope. AutoGen generates an execution plan that first authenticates to the REST API with the appropriate token scope, then queries the on-prem SQ…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssesses ability to craft a practical, constrained adapter-based plan with on-device privacy, regulatory constraints, and real-world data drift.\n\n## Key Concepts\n- Adapter placement trade-offs\n- Memory-efficient PEFT variants and quantization\n- Evaluation for regulatory text and risk scoring\n\n## Code Example\n```javascript\n// Pseudo code sketch\n```\n\n## Follow-up Questions\n- How would you handle policy KB updates without retraining? \n- What latency budgets are acceptable on-device?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "generative-ai-q-9",
+        "questionId": "q-11655",
+        "question": "Scenario: you're prototyping a tiny transformer classifier for Slack-like chat using a BPE tokenizer. A failure mode shows attention drifting to boundaries like punctuation or code delimiters rather than real tokens. Design a beginner evaluation plan to (1) verify attention stays on real tokens, (2) compare stability across vocab sizes (100 vs 1000) on a small multilingual subset, (3) add a boundary-aware masking rule, and (4) deliver runnable Python to compute a boundary-sensitivity score for 4 sample sentences?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Per-tenant adapters are isolated and routed at attention blocks first (rank 8, alpha 16); compare LoRA vs QLoRA with PEFT as baseline. Use 4-bit quantization, lr 2e-4, batch 8, gradient checkpointing.",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "I would instrument a tiny 2-layer transformer with a BPE tokenizer, extract per-head attentions, and compute a boundary-attention ratio: mean attention to boundary tokens over mean attention to real t",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Inject adapters into the attention blocks (QKV projections) using rank 6 and alpha 8; apply 4-bit QLoRA with gradient checkpointing; set learning rate to 3e-4 and batch size to 8. Memory budgeting is managed via adapter…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Run both tokenizers on 3–5 sentences; for each, extract layer-0 attention weights to build per-token heatmaps; compute attention entropy per token and KL divergence between tokenizers; test robustness",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nNew angle focuses on how token boundaries influence attention, especially in noisy chat across languages. It tests practical evaluation skills and tooling, not just theory, and translates well to real-world products at Snowflake, IBM, Slack.\n\n## Key Concepts\n- Boundary-attention intuition\n- Tokenization impact on attention distribution\n- Masking strategies for boundary tokens\n- Lightweight tooling and visualization\n\n## Code Example\n```python\n# Minimal boundary_score computation (illustrative)\nimport numpy as np\n\ndef boundary_score(attn, boundary_mask):\n    # attn: [heads, seq, seq], boundary_mask: [seq]\n    real = ~boundary_mask\n    return attn[:, real[:, None], real[None, :]].mean() / attn[:, boundary_mask[:, None], boundary_mask[None, :]].mean()\n```\n\n## Follow-up Questions\n- How would you extend this to handle emojis and code blocks differently?\n- What changes would you make to ensure this scales with longer inputs?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "generative-ai-q-10",
+        "questionId": "q-11300",
+        "question": "Design a multi-tenant adapter-based fine-tuning plan for a real-time chat assistant used by NVIDIA and Discord. Propose a dynamic adapter-router selecting LoRA/QLoRA/PEFT per brand and per intent, with injection points at attention first (FFN if needed), brand-specific rank/alpha, 4-bit quantization, latency targets, and a practical evaluation suite ensuring cross-brand leakage and KB-grounded factuality. Include deployment notes?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design and implement a comprehensive end-to-end evaluation framework for a multilingual customer support chatbot serving Adobe and Snap, leveraging live policy documentation. The system must detect brand-specific halluc…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Plan: define goals: fetchPrices, compareOffers, selectFlight, bookSeat, notifyUser. Use LangChain planner to sequence tool calls: priceAPI, bookingAPI, notificationAPI, cache. Implement fallback: on p",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose an end-to-end eval for a cross-brand safety incident analyzer: (a) ensure every factual item maps to a verifiable source in a versioned KB or moderation note; (b) implement per-brand hallucina",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose a dynamic adapter-router that selects per-brand adapters (LoRA/QLoRA/PEFT) and per-intent variants for NVIDIA and Discord. Inject at attention first (FFN if needed); use brand-specific rank/al",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design multi-tenant adapter routing, per-brand hyperparams, latency budgets, and robust evaluation in production-like settings.\n\n## Key Concepts\n- Multi-tenant adapters and per-brand routing\n- Injection points: attention vs FFN\n- PEFT families: LoRA, QLoRA\n- 4-bit quantization and on-device vs server deployment\n- Leakage, drift, and KB-grounded evaluation\n\n## Code Example\n```javascript\n// Skeleton router\nfunction route(query, brand, intent) {\n  const adapterKey = `${brand}_${intent}`;\n  const adapter = loadAdapter(adapterKey, brand);\n  return adapter.infer(query);\n}\n```\n\n## Follow-up Questions\n- How would you measure leakage and drift across brands?\n- How would you automate per-brand hyperparameter tuning and rollback?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-11",
+        "questionId": "q-28464",
+        "question": "Design a production-grade evaluation harness for a real-time enterprise assistant that answers questions about a private data catalog across Databricks Lakehouse and Salesforce CRM data. The system must detect hallucinations, ground every factual claim to the latest private docs, ensure no leakage of credentials or PII in citations, and measure risk of sensitive-data exposure during citation. Include data schema, metrics, tooling, and a minimal eval script?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose a two-tier eval: (1) reference-grounded hallucination tests that map every claim to a versioned doc with IDs and data catalog entries; (2) a safety leash that redacts or flags any credentials/",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Propose a pipeline: chunk docs into 512-token slices with 128-token overlap, encode with a small transformer (e.g., distilled SBERT), store vectors in FAISS (IVF + PQ). For queries, embed, retrieve to",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Leverage LangChain with tenant-scoped Memory and per-tenant vector stores; use AutoGen to produce a plan that calls the private REST API and orchestrates tool calls via function-calling. Isolate data",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Chunk text into 500-token slices with ~100-token overlap; embed with SBERT-like model (768-dim); index in Atlas Vector Search (or similar) and query top-3 by cosine similarity; post-filter with keywor",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests a candidate’s ability to design end-to-end evaluation for private, privacy-conscious enterprise assistants, focusing on faithfulness, hallucination, and safety under real-world data/versioning constraints.\n\n## Key Concepts\n- Grounding to versioned sources and source IDs\n- Hallucination detection in live responses\n- Privacy safety: PII/secret leakage checks in output and citations\n- Performance metrics under load and latency budgets\n\n## Code Example\n```javascript\n// Minimal evaluation script outline (pseudo)\nfunction evaluate(model, corpus) {\n  const prompts = loadPrompts();\n  return prompts.map(p => {\n    const out = model.respond(p);\n    const grounded = ground(out, corpus, p);\n    return { prompt: p, output: out, grounded };\n  });\n}\n```\n\n## Follow-up Questions\n- How would you detect partial grounding failures (e.g., only some claims anchored)?\n- How would you integrate this into a CI/CD pipeline with private data access controls?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-12",
+        "questionId": "q-7995",
+        "question": "You're deploying a policy‑compliance assistant across OpenAI, Hugging Face, and Snap brands. Design an evaluation plan that goes beyond hallucination and faithfulness by enforcing a machine‑readable provenance trail: for every factual claim, the model outputs an evidence bag with source_id, exact_passage, passage_location, and a justification_path mapping the claim to passages. Include data formats, metrics (citation_precision/recall, provenance_latency), datasets (live policies, multilingual variants, paraphrase prompts), tooling, and a minimal eval script?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement per-tenant adapters using a base 12-layer transformer model, placing adapters at self-attention and cross-attention layers, with optional FFN injection available for additional task-specific capacity. Use QLoR…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement an end-to-end eval harness that returns a structured provenance object for each answer, with fields: source_id, exact_passage, passage_location, justification_path. Use a gold policy corpus",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a planner that outputs a plan as a sequence of tool calls with clear pre/postconditions. Drive it with LangChain to read batches from MongoDB, summarize each batch, redact PII, validate sche",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Outline a reproducible plan: a test set where sentiment cues lie beyond 128 tokens; per-head attention logging with a metric like cue-mass fraction; cross-language comparison for English/Spanish; just",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nAuditors require transparent, machine‑readable evidence for every factual claim. This question probes how a candidate builds an end-to-end eval that enforces auditability across brands and languages, not just surface accuracy.\n\n## Key Concepts\n\n- Provenance objects and justification paths\n- Multilingual policy corpora and paraphrase robustness\n- Drift and latency metrics for citations\n\n## Code Example\n\n```javascript\n// Example provenance object structure\nconst evidence = {\n  claim: \"Policy X prohibits Y\",\n  evidence: [\n    { source_id: 'POL-2026-01', exact_passage: '...text...', location: 'Section 4.2', justification_path: ['policy_v2026.json','brand_rules_v3.json'] }\n  ],\n  confidence: 0.92\n}\n```\n\n## Follow-up Questions\n\n- How would you handle conflicting citations from multiple sources?\n- How would you validate provenance under live policy updates without downgrading user experience?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-13",
+        "questionId": "q-24231",
+        "question": "Design a real-time, multimodal evaluation framework for an autonomous-vehicle assistant that reasons over streaming sensor data (camera, LiDAR) and a private policy corpus. Ground every factual claim to a time-stamped source and measure hallucination rate, grounding fidelity, and relevance under strict latency budgets. Include data schema, metrics, tooling, and a minimal eval script?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a planner that outputs a plan as a sequence of tool calls with clear pre/postconditions. Drive it with LangChain to read batches from MongoDB, summarize each batch, redact PII, validate sche",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design and implement a comprehensive end-to-end evaluation framework for a multilingual customer support chatbot serving Adobe and Snap, leveraging live policy documentation. The system must detect brand-specific halluc…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a real-time, multimodal evaluation framework for an autonomous-vehicle assistant that reasons over streaming sensor data (camera, LiDAR) and a private policy corpus. Ground every factual claim to a time-stamped s…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement a verification layer that (1) fetches live risk rules from a policy API and regulator notices, (2) anchors each numerical claim to a live citation with per-brand version, (3) resolves cross-",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes how candidates design production-grade evaluation systems for safety-critical AI, balancing strict latency requirements with robust multimodal grounding.\n\n## Key Concepts\n- Multimodal grounding across text, camera, and LiDAR data\n- Time-stamped source alignment and versioning\n- Latency budgeting and streaming evaluation\n- Drift detection in dynamic policy corpora\n\n## Code Example\n```python\ndef score_claims(\n    claims: list[str],\n    sources: list[Source],\n    delta_ms: int = 200\n) -> list[tuple[str, bool, Source | None]]:\n    results = []\n    for claim in claims:\n        source = find_grounding(claim, sources)\n        grounded = source is not None and verify_claim(claim, source)\n        results.append((claim, grounded, source))\n    return results\n```",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-14",
+        "questionId": "q-20669",
+        "question": "You're fine-tuning a base LLM to act as a privacy-conscious fintech assistant for Plaid/Google-scale apps. Using LoRA/QLoRA/PEFT, design a concrete plan: specify injection points (attention vs FFN), adapter ranks/alphas, 4-bit quantization, learning rate, batch size, gradient checkpointing, and how you would validate privacy (PII leakage tests, policy KB coverage) and latency (<100 ms). Include deployment hints for on-device or edge inference?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Outline a LangChain+AutoGen agent: fetch live prices via REST tool, compute 50/200 SMA, and trigger orders through a trading API. Use a planning graph that decomposes signals, with explicit tool-usage",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a concrete adapter-based fine-tuning plan for a privacy-focused fintech assistant (Plaid/Google-scale). Use LoRA/QLoRA/PEFT. Specify injection points (attention vs FFN), ranks/alphas, 4-bit qua",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Illustrate a real-time RAG pipeline: chunk filings/news with overlap (512–768); generate embeddings with a domain-tuned model; upsert into a versioned vector DB with doc_id and timestamp; use time-awa",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a streaming diagnostic: quantify per-head attention mass on the current chunk vs earlier chunks during token-by-token generation; compare English vs Spanish drift on a small bilingual set; impl",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis tests practical planning for privacy-sensitive fintech assistants, including adapter choices, injection points, and deployment constraints.\n\n## Key Concepts\n- PEFT variants and injection points\n- Privacy testing: PII leakage, KB alignment\n- On-device inference and quantization trade-offs\n\n## Code Example\n```javascript\n// Pseudocode: set up adapter config and training loop\nconst config = { method: 'LoRA', rank: 8, alpha: 16, quant: 4 };\ntrain(model, data, config);\n```\n\n## Follow-up Questions\n- How would you handle regulatory drift across regions?\n- How would you monitor privacy during live inference?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "generative-ai-q-15",
+        "questionId": "q-2246",
+        "question": "Design a retrieval-augmented QA service for internal engineering docs spanning product manuals, API specs, and code samples. Outline the end-to-end pipeline: chunking strategy, embedding models, vector DB indexing, cross-collection retrieval priors, re-ranking, versioning, provenance, latency targets, and how you'd test and monitor to minimize hallucinations?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use byte-level BPE tokenization with a 32k vocab to minimize OOVs across languages. For long contexts, employ local attention within a 512-token window plus ~8 global tokens as memory, and use a linea",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a planner that outputs a plan as a sequence of tool calls with clear pre/postconditions. Drive it with LangChain to read batches from MongoDB, summarize each batch, redact PII, validate sche",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose a RAG pipeline: chunk docs into 300-token sections with section metadata; embed with text-embedding-ada-002; index in Pinecone; top-k retrieval with per-collection priors; re-rank with a small",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Chunk into 512-token blocks; embed with a stable model (SBERT/OpenAI Ada) and store in Milvus with per-repo namespaces and access controls. Version embeddings and re-embed on doc updates; cache hot qu",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes practical RAG design choices: chunking strategy, embedding models, vector DB indexing, cross-collection priors, update/versioning, and safeguards against hallucinations in a real enterprise setting.\n\n## Key Concepts\n- Retrieval Augmented Generation\n- Chunking and metadata\n- Dense embeddings and vector stores\n- Re-ranking and provenance\n- Freshness and versioning\n- Latency and monitoring\n\n## Code Example\n\n```javascript\n// Pseudocode sketch\nconst segments = chunk(docs, {size:300});\nconst embeddings = embed(segments, {model:'text-embedding-ada-002'});\nindex.upsert(segments, embeddings, {metadata: segments.meta});\n```\n\n## Follow-up Questions\n- How would you measure and bound hallucination risk in production?\n- What latency targets and caching strategies would you adopt for global users?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "generative-ai-q-16",
+        "questionId": "q-3814",
+        "question": "Design and deploy a LangChain-based autonomous agent that consumes live market data, uses Autogen to generate stepwise plans, and orchestrates multiple tools (data fetch, risk model, analytics, alerting); describe the planning loop, state management, tool orchestration, and failure handling, including data freshness, latency, and rollback strategies?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose a plan to quantify whether top attention aligns with content words in a 3-5 sentence Bloomberg headline. Steps: (1) POS-tag headlines to mark anchors (nouns/verbs). (2) aggregate subword atten",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "QLoRA with 4-bit quantization, injecting adapters into attention blocks on a per-layer basis (rank 8, alpha 16); base model weights remain frozen during training; learning rate 2e-4; batch size 12; gradient checkpointin…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Leverage LangChain with a Tool-based agent and Autogen for dynamic planning. Implement a persistent loop: fetch data via market API tool, evaluate risk via a model tool, run analytics, then emit alert",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Plan to implement adapter-based fine-tuning using LoRA on attention blocks (rank 8, alpha 16) compared against QLoRA for memory efficiency, with PEFT serving as the baseline. Initialize adapters at attention layers, exp…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes a candidate's ability to design production-grade AI agents that operate in finance, where data freshness, latency, and reliability are critical. It tests practical planning, tool orchestration, and robust failure handling.\n\n## Key Concepts\n- LangChain Tool integration and agent loops\n- Autogen-driven hierarchical planning with conditional branches\n- Tool orchestration across data fetch, risk modeling, analytics, and alerts\n- Data freshness, latency handling, timeouts, and retries\n- Idempotence, caching (Redis), and auditable decision logs\n\n## Code Example\n```javascript\n// Skeleton LangChain agent wiring (high level)\nimport { Tool } from 'langchain/tools'\nimport { AutogenAgent } from 'langchain/agents'\n\nconst dataTool = new Tool({ name: 'MarketData', func: fetchMarketData })\nconst riskTool = new Tool({ name: 'RiskModel', func: runRiskModel })\nconst analyticsTool = new Tool({ name: 'Analytics', func: runAnalytics })\nconst alertTool = new Tool({ name: 'Alert', func: sendAlert })\n\nconst agent = new AutogenAgent({ tools: [dataTool, riskTool, analyticsTool, alertTool], .. })\n\n// Pseudo-structure: planning loop and fallback handling\nwhile (true) {\n  const data = dataTool.run()\n  if (!dataFresh(data)) { dataTool.refresh() }\n  const risk = riskTool.run(data)\n  const analysis = analyticsTool.run(data, risk)\n  if (shouldAlert(analysis)) alertTool.run(analysis)\n  sleep(Δt)\n}\n```\n\n## Follow-up Questions\n- How would you test the agent's latency sensitivity and data-staleness thresholds in a safe staging environment?\n- Describe a concrete rollback strategy when a critical tool fails during a trading-hours run.",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-17",
+        "questionId": "q-414",
+        "question": "Explain how the self-attention mechanism in a transformer works and why it's more effective than RNNs for processing long sequences?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a LangChain-driven agent that coordinates three private data sources: a REST analytics API, a data warehouse, and a human-in-the-loop reviewer. Implement AutoGen planning to dynamically select tools, handle drift…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Outline a small Python pipeline: chunk articles into fixed-size slices (512 tokens), generate deterministic embeddings from text (e.g., token histogram or hashing into a vector), store in an in‑memory",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Self-attention computes weighted representations by allowing each token to directly attend to all other tokens through query-key-value interactions, enabling parallel processing and capturing long-range dependencies wit…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "QLoRA with 4-bit quantization, injecting adapters into attention blocks on a per-layer basis (rank 8, alpha 16); base model weights remain frozen during training; learning rate 2e-4; batch size 12; gradient checkpointin…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question assesses deep understanding of transformer architecture, which is fundamental to modern AI systems. It tests the candidate's ability to explain complex neural mechanisms and compare architectural tradeoffs—critical knowledge for ML engineering roles at leading tech companies.\n\n## Expected Answer\nA strong candidate should explain the complete self-attention mechanism: how input embeddings are projected into query (Q), key (K), and value (V) matrices; the computation of attention scores through Q·K^T scaling; the application of softmax to create attention weights; and the final weighted sum of values. They should contrast this with RNNs' sequential processing, highlighting how attention enables O(1) path length between any positions versus O(n) for RNNs, solving vanishing gradient problems and enabling true parallelization.\n\n## Key Technical Points\n- Multi-head attention allows learning different representation subspaces\n- Positional encoding provides sequence order information\n- Computational complexity is O(n²) versus O(n) for RNNs, but parallelization makes it faster in practice\n- Scaled dot-product attention prevents gradient saturation\n- Self-attention creates dynamic connectivity patterns based on content similarity\n\n## Code Example\n```python\nimport torch\nimport torch.nn.functional as F\n\ndef scaled_dot_product_attention(Q, K, V, mask=None):\n    # Q, K, V shape: (batch_size, seq_len, d_k)\n    d_k = Q.size(-1)\n    scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)\n    \n    if mask is not None:\n        scores.masked_fill_(mask == 0, -1e9)\n    \n    attention_weights = F.softmax(scores, dim=-1)\n    output = torch.matmul(attention_weights, V)\n    return output, attention_weights\n```\n\n## Real-World Applications\nUnderstanding self-attention is crucial for working with models like GPT, BERT, and vision transformers. The mechanism's ability to capture contextual relationships makes it essential for tasks ranging from machine translation to code generation and protein structure prediction.",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "generative-ai-q-18",
+        "questionId": "q-1673",
+        "question": "Given a 7B-class LLM, design a practical PEFT plan to add domain-specific knowledge for a banking app using LoRA/QLoRA/adapter techniques. Specify target modules, r, alpha, dropout, quantization approach (e.g., 4-bit), dataset size, batch size, learning rate, and epochs. Explain how you'd validate improvements without harming generalization and how to deploy adapters for on-device inference?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Freeze the base; apply LoRA/QLoRA adapters to attention projections of a 7B model. Use 4-bit quantization (bitsandbytes), r=8, lora_alpha=16, lora_dropout=0.05; target_modules=['q_proj','k_proj','v_pr",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Create a SimpleSequentialChain in LangChain with two Tools: financeAPI.get_earnings('MSFT','Q4 2025') and summarizer.summarize(text). First fetch earnings, then summarize, then format five actionable",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose a multilingual retrieval-augmented system using a single multilingual embedding model (e.g., XLM-RoBERTa) to encode 200–600 token chunks with topical coherence. Store in a vector DB (e.g., Qdrant, Weaviate, or P…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose a LangChain agent that handles a Lyft/Square ride request by using a simple AutoGen-style planner to sequence tools: Fare API, Traffic ETA, and a KB lookup. Include a compact prompt template,",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests practical understanding of PEFT trade-offs (memory, speed, accuracy) and how to configure adapters in real projects.\n\n## Key Concepts\n\n- PEFT configuration (LoraConfig: r, alpha, dropout)\n- Target modules in transformer attention\n- 4-bit quantization and bitsandbytes\n- Evaluation strategy (domain vs generalization)\n\n## Code Example\n\n```python\nfrom peft import LoraConfig, get_peft_model\nconfig = LoraConfig(r=8, lora_alpha=16, target_modules=['q_proj','k_proj','v_proj','out_proj'], lora_dropout=0.05, bias='none')\nmodel = AutoModel.from_pretrained('...')\nmodel = get_peft_model(model, config)\n```\n\n## Follow-up Questions\n\n- How to monitor overfitting when using adapters?\n- How would you handle multiple domains with separate adapters?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "generative-ai-q-19",
+        "questionId": "q-28747",
+        "question": "You're deploying a **multilingual, policy-aware** incident-response knowledge assistant for Meta, MongoDB, and Nvidia. The model must ground every security-related claim to live runbooks and tickets, and must avoid fabricating procedures across languages. Design a practical evaluation plan that (1) detects hallucinations across languages, (2) verifies grounding to versioned runbooks and playbooks, (3) tests resilience when sources are temporarily unavailable, and (4) yields datasets, metrics, tooling, and a runnable baseline script?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Compare full self-attention to a sliding-window sparse scheme: 512-token windows with 64 global tokens on a 1M-token corpus. Use a BPE tokenizer; QA on a held-out set; report EM/F1, latency, and peak",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Two-phase evaluation: (1) cross-language grounding with 100 KB snippets per language, ensuring every claim maps to a named source version; (2) resilience test when sources go offline, with synthetic o",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Design an autonomous LangChain agent that, given a dataset question, uses a planner to choose tools (HTTP fetch, local file read, Python executor), executes them in a safe sequence, caches results in",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design and implement a comprehensive end-to-end evaluation framework for a multilingual customer support chatbot serving Adobe and Snap, leveraging live policy documentation. The system must detect brand-specific halluc…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design cross-language grounding with real-world incident docs, including versioning and outages.\n\n## Key Concepts\n- Multilingual grounding\n- Versioned sources\n- Source-unavailability resilience\n- Evaluation metrics: grounding accuracy, hallucination rate, citation drift, latency\n\n## Code Example\n```javascript\n// Pseudo baseline eval harness usage\nconst results = runEval({ prompts, kbVersions, languages });\n```\n\n## Follow-up Questions\n- How would you detect paraphrase drift in citations?\n- How would you integrate nightly evaluations into CI?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "generative-ai-q-20",
+        "questionId": "q-385",
+        "question": "You're building a hallucination detection system for a production LLM service. Design a multi-layered evaluation pipeline that balances false positives/negatives while maintaining sub-100ms latency. How would you implement confidence scoring and fallback mechanisms?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design and implement a comprehensive end-to-end evaluation framework for a multilingual customer support chatbot serving Adobe and Snap, leveraging live policy documentation. The system must detect brand-specific halluc…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Pipeline: chunk docs into 512-token blocks, compute embeddings with a compact encoder, push to Atlas Vector, on query embed question, fetch top-k chunks by cosine similarity, concatenate top chunks, a",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Plan: fine-tune a multilingual automotive diagnostic assistant using LoRA/QLoRA/PEFT on 8GB RAM with 6k QA pairs and 4-bit quantization. Inject adapters at attention first (FFN if needed). Per-layer r",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a cascading evaluation: fast semantic similarity check → factual verification via knowledge graph → confidence scoring using ensemble methods → graceful fallback to human review.",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests system design skills for production AI systems, understanding of trade-offs between accuracy and latency, and knowledge of evaluation metrics in real-world scenarios.\n\n## Expected Answer\nStrong candidates will discuss: 1) Multi-stage evaluation architecture, 2) Confidence threshold tuning, 3) Fallback strategies, 4) Monitoring and alerting, 5) Cost optimization through early filtering.\n\n## Code Example\n```typescript\nclass HallucinationDetector {\n  async evaluate(response: string, context: string) {\n    const semanticScore = await this.semanticCheck(response, context);\n    if (semanticScore > 0.9) return { confident: true, score: semanticScore };\n    \n    const factualScore = await this.factualVerification(response);\n    const ensembleScore = this.ensembleWeighting(semanticScore, factualScore);\n    \n    return {\n      confident: ensembleScore > 0.85,\n      score: ensembleScore,\n      needsReview: ensembleScore < 0.7\n    };\n  }\n}\n```\n\n## Follow-up Questions\n- How would you handle edge cases where the knowledge graph is incomplete?\n- What metrics would you track to optimize the confidence thresholds?\n- How would you design A/B testing for new detection algorithms?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "generative-ai-q-21",
+        "questionId": "q-6426",
+        "question": "You're deploying a multilingual financial support assistant for Square and Goldman Sachs. The model sometimes hallucinates policy details and cites obsolete regulations across jurisdictions. Design a concrete evaluation plan that (1) detects hallucinated policy citations across languages, (2) verifies faithfulness to the latest live policy docs with versioned anchors, and (3) tracks policy drift with monthly updates. Include datasets, metrics, tooling, and a minimal eval script?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Plan: 1) Build a citation-checker that extracts policy claims and their anchors, validating against a versioned policy store across languages. 2) Run multilingual tests with back-translation and cross-lingual consistenc…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use a hierarchical tokenizer and attention scheme: split input into 4K-token chunks, apply local self-attention within chunks, add learnable global tokens per chunk to enable cross-chunk context, use",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "I'd implement a multi-faithfulness evaluation using semantic similarity between response and source, extract claims and verify against source text, and use metrics like ROUGE/BLEU for textual overlap.",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose a pipeline: chunk docs into 512-token slices with 128-token overlap, encode with a small transformer (e.g., distilled SBERT), store vectors in FAISS (IVF + PQ). For queries, embed, retrieve to",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question evaluates the ability to craft a robust, end-to-end evaluation pipeline for multilingual policy-faithfulness in a high-stakes financial setting, with versioned source control and drift monitoring.\n\n## Key Concepts\n\n- Multilingual claim extraction and anchor mapping\n- Versioned source citations and live policy integration\n- Drift detection and change management across monthly updates\n\n## Code Example\n\n```javascript\n// Minimal citation check\nfunction checkCitation(claim, citation, policyDB) {\n  const live = policyDB.lookup(citation.version, citation.id);\n  return live && live.text.includes(claim.anchor);\n}\n```",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "generative-ai-q-22",
+        "questionId": "q-197",
+        "question": "How would you implement efficient KV caching in a transformer decoder to reduce redundant computation during autoregressive generation?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Store key-value pairs from previous tokens in cache, reuse for attention computation, reducing O(n²) complexity to O(n) for inference",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Explainable, implementable answer: Use a rule-based aligner to map each pronoun in the summary to the nearest antecedent in the source, measure grounding accuracy. Compare (a) full-word grounding afte",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a ReAct-style loop with a tool registry and a planning prompt generated by Autogen. First search for latest earnings, fetch transcripts, extract signals with a classifier, then summarize and propo",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I would implement an Autogen-driven LangChain agent that first builds a plan: check stock, fetch ETA, then compute a delivery window with a 1–2 day buffer. It should call tools idempotently, handle pa",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why Asked\nTests understanding of transformer optimization techniques for production AI systems. KV caching is essential for efficient text generation.\n\n## Key Concepts\n- Autoregressive generation and computational redundancy\n- Key-value cache implementation strategies\n- Memory vs computation trade-offs\n- Batch processing with cached states\n\n## Code Example\n```\nclass KVCache:\n    def __init__(self, max_seq_len: int, num_heads: int, head_dim: int):\n        self.k_cache = torch.zeros(max_seq_len, num_heads, head_dim)\n        self.v_cache = torch.zeros(max_seq_len, num_heads, head_dim)\n        self.current_len = 0\n    \n    def update(self, new_k, new_v):\n        seq_len = new_k.shape[1]\n        self.k_cache[self.current_len:self.current_len+seq_len] = new_k\n        self.v_cache[self.current_len:self.current_len+seq_len] = new_v\n        self.current_len += seq_len\n        return self.k_cache[:self.current_len], self.v_cache[:self.current_len]\n```\n\n## Follow-up Questions\n- How do you handle memory constraints with long sequences?\n- What are cache invalidation strategies?\n- How does KV caching work with batch inference?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "generative-ai-q-23",
+        "questionId": "q-19434",
+        "question": "Design an adapter-based fine-tuning plan for a privacy-preserving multilingual customer-support assistant used by two brands (Amazon-like retail and Adobe-like software) running on a 12GB GPU. Propose per-brand adapters (LoRA/QLoRA/PEFT), injection points (attention first, FFN if needed), fusion strategy, 4-bit quantization, rank/alpha defaults, lr, batch, gradient checkpointing. Define a rollout with versioning, rollback, and a privacy guardrail: zero-shot leakage checks against a synthetic KB, and a latency target (<60 ms/query). Include on-device deployment notes?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose an end-to-end pipeline: chunk docs to ~400 tokens; compute embeddings with a lightweight model (e.g., sentence-transformers); store in an in-memory vector store; on query, embed query, retriev",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Pipeline: chunk docs into 512-token blocks, compute embeddings with a compact encoder, push to Atlas Vector, on query embed question, fetch top-k chunks by cosine similarity, concatenate top chunks, a",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a lightweight evaluation harness that anchors each factual claim to a versioned KB paragraph with IDs; categorize hallucinations as fabrication, misattribution, or over-generalization; compute relevance scores…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Per-brand adapters via LoRA/QLoRA with PEFT. Inject at attention first; FFN if needed. Use rank=8, alpha=16; 4-bit quantization; lr=3e-4; batch=16; gradient checkpointing. Validate cross-brand factual",
+            "isCorrect": true
           }
         ],
         "explanation": "## Why This Is Asked\nTests ability to design privacy-conscious, multi-tenant adapter strategies with deployment, monitoring, and rollback.\n\n## Key Concepts\n- Per-brand adapters and PEFT variants (LoRA/QLoRA)\n- Adapter fusion/gating across tenants\n- Privacy controls, KB versioning, PII leakage testing\n- On-device constraints and latency budgets\n\n## Code Example\n```python\n# Pseudo-code for loading adapters per-brand\ndef load_brand_adapter(brand):\n  adapter = load_adapter(brand)\n  if not adapter:\n    adapter = load_adapter('default')\n  return adapter\n```\n\n## Follow-up Questions\n- How would you measure privacy leakage risk in practice?\n- How would you handle unseen brands without retraining the full model?",
         "difficulty": "intermediate"
       },
       {
-        "id": "generative-ai-q-20",
-        "questionId": "q-2596",
-        "question": "Design a beginner-friendly LangChain task: given 'Summarize the top 3 Nvidia and Apple AI news from the last 24h', build a small Autogen-driven plan that uses tools (news API, summarizer, fact-checker). Show the planning steps, how tools are chained, and how you handle tool errors and duplicates. Include a minimal code sketch to register tools and run the plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a tri-domain eval harness: 100 prompts per domain; capture outputs, citations, and the exact policy text used. Metrics: grounding accuracy (citations align with live docs), refusal correctness",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use LangChain with an Autogen planner to execute a structured 4-step workflow: 1) query NewsAPI to retrieve top Nvidia and Apple AI headlines from the past 24 hours; 2) process items through a summarizer tool to condens…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Explain a LangChain agent that ingests a streaming private REST feed of transactions, using AutoGen to plan detect → classify → escalate. It orchestrates AnomalyAPI, CustomerDB, and SafeNotifier, enfo",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a planning loop with LangChain and AutoGen: decompose a request (product ID, max total, target shipping window) into 1) query stock across vendors; 2) fetch prices and shipping options; 3) s",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nEvaluates practical implementation of planning and tool orchestration in LangChain with Autogen using real-world data sources.\n\n## Key Concepts\n- Autogen strategic planning\n- Tool orchestration with retry logic\n- Data provenance and idempotent operations\n- Comprehensive error handling in pipelines\n\n## Code Example\n```javascript\n// Sketch: Register tools and execute Autogen planner\nconst tools = [newsApiTool, summarizerTool, factCheckTool];\nconst planner = new AutogenPlanner({ tools });\nconst plan = planner.plan(\"Summarize latest Nvidia and Apple AI headlines\");\n```\n\n## Follow-up Questions\n- How would you implement rate-limiting considerations?\n- How would you optimize performance for concurrent tool execution?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "generative-ai-q-21",
-        "questionId": "q-27942",
-        "question": "Design a beginner-friendly evaluation for a cross-brand knowledge assistant used by Snowflake and Meta. The model must ground every factual claim to a versioned KB and flag hallucinations. Create an evaluation harness that processes 100 prompts, categorizes errors into fabrication, misattribution, and irrelevance, and outputs grounding accuracy, citation drift, and relevance to user intent. Provide data schema and a runnable eval snippet?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Propose a minimal harness: (1) 100 prompts over 3 KB versions; (2) extract claims and verify against the cited KB paragraph; (3) label errors as fabrication, misattribution, irrelevance; (4) grounding",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Plan: implement a streaming diagnostic to quantify cross-language attention drift when English→Spanish happens mid-stream. Compare English-only tokenization vs bilingual tokenization on a 20-sentence",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Explainable, implementable answer: Use a rule-based aligner to map each pronoun in the summary to the nearest antecedent in the source, measure grounding accuracy. Compare (a) full-word grounding afte",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Plan a domain-adapter strategy: a shared base with three domain adapters injected into attention layers; use LoRA with rank 4 and alpha 16 per domain (QLoRA if 4-bit). lr 2e-4, batch 16, gradient chec",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests core grounding and hallucination detection with a practical, beginner-friendly scope that mirrors real-world needs at Snowflake/Meta.\n\n## Key Concepts\n- Grounding and faithfulness\n- Hallucination taxonomy\n- Versioned knowledge bases\n- Evaluation metrics: grounding accuracy, citation drift, relevance\n\n## Code Example\n```javascript\n// Minimal evaluator skeleton\nfunction evaluatePrompts(dataset, kbVersions){\n  // map prompts -> claims, verify with KB version, return metrics\n}\n```\n\n## Follow-up Questions\n- How would you extend for multi-modal grounding?\n- How would you handle KB updates and rollbacks in your eval?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "generative-ai-q-22",
-        "questionId": "q-19653",
-        "question": "Design a beginner-friendly retrieval pipeline for a chatbot that answers from a large document corpus stored in a vector database. Specify chunk size, overlap, embedding model, vector store, and a two-step retrieval loop (top-k chunks then re-rank). Include how you would measure recall and latency and provide a minimal code sketch for chunking and a retrieval call?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-turn drift measured with KL divergence between attention distributions across chunk boundaries; compare English vs Spanish on a toy bilingual set; implement a boundary gate that reinitializes or s",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Create an evaluator that enforces doc-version citations for every factual claim, flags ungrounded code blocks, and scores correctness via precision@1 against documented endpoints. Use a 50-prompt dataset with structured…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use byte-level BPE for multilingual robustness; employ Longformer-style sparse attention with a 512-token local window plus 8 global tokens to capture long-range cues; augment context with top-k retrieval from a pre-ind…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "I would implement a simple retrieval-augmented generation (RAG) pipeline: chunk documents into 512-token blocks with 128-token overlap; embed using a stable model such as OpenAI text-embedding-3-small or a lightweight l…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question assesses practical understanding of retrieval pipelines using chunking, embeddings, and vector stores, along with knowledge of real-world metrics for evaluating RAG systems.\n\n## Key Concepts\n\n- Retrieval Augmented Generation (RAG)\n- Document chunking strategies (size, overlap, and trade-offs)\n- Embedding models and vector stores\n- Two-stage retrieval (dense retrieval + reranking)\n- Evaluation metrics: recall@K and latency benchmarks\n\n## Code Example\n\n```javascript\n// Minimal chunking sketch (size=512, overlap=128)\nfunction chunkText(text, size = 512, overlap = 128) {\n  const chunks = [];\n  let start = 0;\n  while (start < text.length) {\n    const end = start + size;\n    chunks.push(text.slice(start, end));\n    start += size - overlap;\n  }\n  return chunks;\n}\n\n// Two-step retrieval call\nasync function retrieve(query, topK = 10) {\n  const queryEmbedding = await embedModel.embed(query);\n  const initialResults = await vectorStore.search(queryEmbedding, topK * 3);\n  const reranked = await reranker.rerank(query, initialResults, topK);\n  return reranked;\n}\n```",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "generative-ai-q-23",
-        "questionId": "q-9801",
-        "question": "Context: You’re building an enterprise chat assistant for a global platform with 50+ languages. The system ingests product docs and live chats up to 10k tokens. Task: design a tokenizer-and-attention strategy that (a) preserves domain-specific terms across languages, (b) supports long-context efficiently, and (c) enables cross-language attention alignment for accurate retrieval. Provide concrete data structures (tokenizer vocab, domain lexicon, global IDs, attention masks) and a testing plan with latency targets, including a small code sketch for a sparse attention mask?",
+        "id": "generative-ai-q-24",
+        "questionId": "q-21147",
+        "question": "Design a concrete adapter-based fine-tuning plan for an on-device driver-support assistant used by Lyft-like apps to handle policy questions and routing issues. You have 40k QA pairs and 20k policy updates, a 16GB GPU, and 4-bit quantization. Propose where to inject adapters (attention vs FFN), per-layer rank/alpha, learning rate, batch size, and gradient checkpointing, plus evaluation metrics (precision@1, factuality against a versioned KB, latency). Include deployment notes for OTA updates and KB synchronization while preserving privacy?",
         "type": "single",
         "options": [
           {
             "id": "a",
             "text": "Inject adapters in attention blocks in the top 6 layers with rank 8, alpha 16; add FFN adapters if needed. Use LoRA/QLoRA/PEFT with per-layer variations; LR 1e-4, batch 16, gradient_checkpointing, 3–4",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a multilingual subword tokenizer using SentencePiece with an integrated domain lexicon that maps specialized terms across languages to shared global IDs. Employ sparse attention combining 2k-token local window…",
             "isCorrect": true
           },
           {
-            "id": "c",
-            "text": "Design a beginner-friendly retrieval QA workflow for a small knowledge base: chunk documents into 500-token pieces, encode with SBERT, index in FAISS, and answer by stitching the top-3 chunks. Include data flow, latency…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Pipeline: chunk docs into 512-token blocks, compute embeddings with a compact encoder, push to Atlas Vector, on query embed question, fetch top-k chunks by cosine similarity, concatenate top chunks, a",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nEnterprise chat assistants must process multilingual, long-context inputs containing specialized domain terminology while maintaining performance. This question evaluates understanding of tokenizer design, attention mechanisms, and practical engineering trade-offs in production systems.\n\n## Key Concepts\n- Multilingual subword tokenization with domain-specific vocabulary enhancement\n- Sparse attention patterns using local windows and global anchors\n- Cross-language semantic alignment and retrieval augmentation\n- Latency-accuracy trade-offs in large-scale deployment\n\n## Code Example\n```javascript\nfunction buildSparseMask(n, localWin, globalAnchors) {\n  const mask = Array.from({length: n}, () => Array(n).fill(false));\n  \n  // Local attention windows\n  for (let i = 0; i < n; i++) {\n    const start = Math.max(0, i - localWin);\n    const end = Math.min(n, i + localWin + 1);\n    for (let j = start; j < end; j++) {\n      mask[i][j] = true;\n    }\n  }\n  \n  // Global anchor attention\n  for (let i = 0; i < n; i++) {\n    for (const anchor of globalAnchors) {\n      mask[i][anchor] = true;\n      mask[anchor][i] = true;\n    }\n  }\n  \n  return mask;\n}\n```",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "generative-ai-q-24",
-        "questionId": "q-29812",
-        "question": "Design a retrieval-augmented QA system for a multinational knowledge base stored as PDFs and HTML, requiring multilingual support. Propose chunking into ~4k-token segments, a multilingual embedding model, and a vector DB index; include update propagation for edited docs, provenance/citations, and access controls. Describe data flow, failure modes, observability, and evaluation (Recall@K, latency)?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Adopt 4k-token chunks with 25% overlap. Use domain-specific SBERT for initial embeddings, index in Milvus with doc-version in metadata. Retrieval: fast HNSW pass then cross-encoder reranker (MiniLM) t",
-            "isCorrect": false
-          },
-          {
             "id": "b",
-            "text": "Plan an adapter-based fine-tune on a 16GB GPU with 60k QA pairs and 4-bit quantization. Compare LoRA and QLoRA (attention injections, rank 8, alpha 16) plus a lightweight FFN adapter (rank 4, alpha 8)",
+            "text": "Plan: 1) Build a citation-checker that extracts policy claims and their anchors, validating against a versioned policy store across languages. 2) Run multilingual tests with back-translation and cross-lingual consistenc…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "A sequential workflow: Fetch → Parse → Compute KPIs. The agent first retrieves the CSV from the specified S3 location, then parses it using pandas to extract the data, computes three KPIs (average value, maximum value,…",
+            "text": "Create an evaluator that enforces doc-version citations for every factual claim, flags ungrounded code blocks, and scores correctness via precision@1 against documented endpoints. Use a 50-prompt dataset with structured…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "I’d use 4k-token chunks, multilingual embeddings (XLM-R or mT5), and a vector store like Pinecone with per-chunk metadata. Edits trigger re-embedding and tombstoning old chunks; results return top-k c",
-            "isCorrect": true
+            "text": "Design a beginner-friendly evaluation for a 4-layer transformer chatbot used in ride-hailing support (English-Spanish, with typos and code-switching). Create an experiment that (1) tests tokenization resilience under no…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nExamines practical system design for multilingual retrieval at scale, including chunking, embeddings, vector storage, and data provenance.\n\n## Key Concepts\n- Multilingual embeddings and cross-language retrieval\n- Chunking strategies and token budgets\n- Incremental updates and data provenance\n- Observability, metrics, and testing\n\n## Code Example\n```javascript\n// Pseudo-flow wiring\nasync function retrieve(query) {\n  const e = embed(query);\n  const chunks = vectorDB.search(e, topK=5);\n  const ranked = rerank(chunks, query);\n  return ranked.map(c => ({id: c.id, text: c.text, source: c.source}));\n}\n```\n\n## Follow-up Questions\n- How would you test update propagation for edited docs?\n- How would you measure latency under burst traffic?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests real-world on-device fine-tuning under privacy constraints, including adapter placement, quantization, and deployment.\n\n## Key Concepts\n- Adapter placement (attention vs FFN)\n- LoRA/QLoRA/PEFT trade-offs\n- On-device inference and OTA updates\n- Privacy: DP budgeting, secure KB caching\n\n## Code Example\n```python\n# Pseudo\nmodel = load_base_model('base-llama')\nfor i, layer in enumerate(model.layers):\n  if i < 6:\n    layer.inject_adapter(rank=8, alpha=16)\n# configure optimizer, quantization, and training loop\n```\n\n## Follow-up Questions\n- How to handle KB drift without full retraining?\n- What security measures for OTA updates would you add?",
+        "difficulty": "beginner"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-07-04T10:30:58.265Z",
+    "createdAt": "2026-07-05T06:05:26.074Z",
     "version": 1
   }
 ]
