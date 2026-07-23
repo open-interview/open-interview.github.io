@@ -8,648 +8,108 @@
     "questions": [
       {
         "id": "linux-foundation-sysadmin-q-0",
-        "questionId": "q-23554",
-        "question": "On a Linux host running a shared media-processing pipeline with dozens of tenants, memory pressure causes global reclaim pauses during bursts, inflating tail latency in the streaming path. Design a production plan to guarantee per-tenant memory isolation and minimize reclaim impact while preserving throughput. Include per-tenant cgroups (memory.max), swap policies, THP tuning, NUMA placement, vm.dirty_ratio, and a staged load-test with rollback?",
+        "questionId": "q-23336",
+        "question": "On a Linux host running a serverless platform with thousands of ephemeral containers on a NUMA machine, you observe tail latency spikes during cold-start bursts. Root cause analysis points to kernel SLUB allocator contention and memory fragmentation. How would you diagnose this issue and design a production mitigation plan that includes SLUB tuning parameters, per-tenant memory isolation with cgroups, NUMA binding, observability with BPF probes, and a staged rollout with rollback?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement per-tenant memory pools via cgroups v2: memory.max and optional memory.swap.max, disable swap for tenants, set memory.high, and pin processes with numactl to specific NUMA nodes. Disable THP",
+            "text": "Diagnose using BPF programs tracing kmem:kmalloc and kmem:mm_page_alloc_extended_zone failures, combined with analysis of /proc/slabinfo and /proc/buddyinfo for fragmentation metrics. Apply SLUB tuning parameters: set s…",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Deploy per-tenant memory and CPU limits via cgroups v2 and cpuset, pin cache workers to specific NUMA nodes, and bind NIC interrupts to dedicated cores. Enable PMU counters for L3/DRAM bandwidth, run",
+            "text": "Implement per-tenant user, mount, pid, and network namespaces; mount a private root via a read-only bind of a tenant base plus an overlay for writable state. Drop capabilities, enable seccomp-bpf, and",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Check user membership: `id user; groups user`. Verify sudo rights: `sudo -l -U user`. If none, backup sudoers, create `/etc/sudoers.d/user` with `user ALL=(ALL) NOPASSWD:/usr/bin/systemctl restart myservice`. Validate s…",
+            "text": "Begin by mapping log paths and selecting a backend (journald vs rsyslog). Enable persistent log storage on a dedicated partition; tune journald: Storage=persistent, SystemMaxUse, RateLimitBurst; or co",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a systemd unit with Type=forking, PIDFile, and ExecStartPre that checks and clears a stale lock: if /var/lib/backup/backup.lock exists and its PID is not running, delete it. Stop uses KillMode=con",
+            "text": "Isolate per-tenant metadata by giving each tenant its own subvolume/file system (ext4/XFS) with dir_index enabled and, if feasible, separate inode tables; tune inode density, raise fs.file-max and ino",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical memory isolation in multi-tenant Linux hosts, balancing latency and throughput under bursty workloads. It probes cgroup awareness, NUMA affinity, and low-latency page reclaim decisions.\n\n## Key Concepts\n- cgroups v2 memory.max and memory.swap.max for per-tenant budgets\n- THP considerations for latency-sensitive workloads\n- NUMA-aware placement with membind/numactl\n- VM tuning: vm.dirty_ratio, min_free_kbytes, swappiness\n- Observability: pidstat/iostat/slabtop; synthetic burst testing\n\n## Code Example\n```bash\n# per-tenant memory limit in cgroup2\nmkdir -p /sys/fs/cgroup/mytenant.slice\necho 8G > /sys/fs/cgroup/mytenant.slice/memory.max\necho 0 > /sys/fs/cgroup/mytenant.slice/memory.swap.max\n# bind a process to a NUMA node\nnumactl --cpunodebind=0 --membind=0 /path/to/tenant-app\n```\n\n## Follow-up Questions\n- How would you measure reclaim latency and detect per-tenant starvation?\n- What rollback plan would you implement if a burst causes global risk, and how would you validate it?",
-        "difficulty": "intermediate"
+        "explanation": "This question tests advanced Linux kernel internals knowledge required for production SRE or senior sysadmin roles managing containerized workloads at scale. It evaluates understanding of SLUB allocator behavior, NUMA topology awareness, cgroup v2 resource controls, BPF-based observability, and safe deployment practices.\n\n## Diagnosis Approach\nStart with observability using BPF to trace slab allocation paths. Use tracepoint-based BPF programs to capture allocation latency and failure counts:\n\n```c\n// trace_slub_latency.bpf.c\n#include <linux/bpf.h>\n#include <linux/tracepoint.h>\n#include <bpf/bpf_helpers.h>\n\nstruct {\n    __uint(max_entries, 1024);\n    __type(key, u64);\n    __type(value, u64);\n} latencies SEC(\".maps\");\n\nTRACEPOINT_PROBE(kmem, kmalloc) {\n    u64 ts = bpf_ktime_get_ns();\n    // Sample only allocations > 100us\n    return 0;\n}\n\nTRACEPOINT_PROBE(kmem, kmalloc_node) {\n    u64 *existing = bpf_map_lookup_elem(&latencies, &args->ptr);\n    if (!existing) {\n        u64 lat = bpf_ktime_get_ns() - args->call_site;\n        if (lat > 100000) // >100us threshold\n            bpf_map_update_elem(&latencies, &args->ptr, &lat, BPF_ANY());\n    }\n    return 0;\n}\n```\n\nUse `perf record -e kmem:kmalloc -a -- sleep 10` to sample allocation hot spots, and `cat /proc/slabinfo` for fragmentation metrics. Check `/proc/buddyinfo` for per-node fragmentation and `cat /sys/kernel/slab/allocstalls` for allocation stalls.\n\n## Mitigation Strategy\n\n**SLUB Tuning**: Apply these kernel parameters:\n- `slub_min_order=3` — Forces 8KB minimum allocation, reducing fragmentation\n- `slub_max_order=3` — Limits maximum order to prevent large contiguous allocations\n- `min_free_kbytes=65536` — Maintains 64MB reserved memory pool\n- `cpu_partial=256` — Optimizes per-CPU partial slab cache\n- `slub_nomerge` — Disables slab merging for better debugging\n\n**Per-Tenant Memory Isolation** (cgroup v2):\n```bash\n# Create per-tenant memory cgroup\nmkdir -p /sys/fs/cgroup/tenant-$TENANT_ID\necho \"53687091200\" > /sys/fs/cgroup/tenant-$TENANT_ID/memory.max  # 50GB limit\necho \"42949672960\" > /sys/fs/cgroup/tenant-$TENANT_ID/memory.high   # Soft limit 40GB\n# Enable NUMA locality tracking\necho \"1\" > /sys/fs/cgroup/tenant-$TENANT_ID/memory.numa_locality\n```\n\n**NUMA Binding**:\n```bash\n# Pin containers to specific NUMA nodes\npodman run --cpuset-cpus=\"0-15\" --cpuset-mems=\"0\" ...\n# Or use cgroupv2 resource control\necho \"0\" > /sys/fs/cgroup/tenant-$TENANT_ID/cpuset.mems\n```\n\n**Observability with BPF**:\n```bash\n# Monitor SLUB contention in production\nbpftrace -e 'kprobe:__kmalloc /comm == \"containerd\"/ { @[comm] = count(); }'\n\n# Trace page allocation failures\nbpftrace -e 'tracepoint:kmem:mm_page_alloc_extended_zone { @ = count(); }'\n```\n\n**Staged Rollout with Rollback**:\n1. Deploy to 5% of traffic with latency monitoring\n2. Monitor P50, P95, P99 latency every 5 minutes\n3. If P99 > 50ms for 2 consecutive intervals, automatic rollback\n4. Scale to 25%, then 50%, then 100% with similar criteria\n5. Always maintain canary running previous stable version",
+        "difficulty": "advanced"
       },
       {
         "id": "linux-foundation-sysadmin-q-1",
-        "questionId": "q-21105",
-        "question": "On a Linux host running a multi-tenant data-processing service with containerized workloads on a shared NVMe SSD using overlayfs, occasional tail latency spikes manifest during bursts. Design a production plan to diagnose and reduce I/O bottlenecks while preserving tenant isolation. Outline I/O scheduler tuning (mq-deadline vs bfq), per-tenant I/O control (cgroup v2 io.max/io.weight), NUMA locality, block-layer caching strategies, observability (iostat, blktrace, bpftrace), and a staged load-test with rollback?",
+        "questionId": "q-16651",
+        "question": "On a Linux host running a shared in-memory edge cache and a compute job runner on a single NUMA machine, tail latency spikes to 200–300 ms during bursts despite ample NIC bandwidth. Design a production plan to diagnose and mitigate cache and memory contention while preserving throughput. Include per-tenant isolation (cpuset/cgroup v2), NUMA binding, IRQ affinity, cache locality strategies, observability with perf/pmu/pidstat, and a staged load-test and rollback?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Plan: confirm a time sync service is active (chrony or systemd-timesyncd), verify drift with chronyc tracking and sources, ensure NTP servers are reachable, then resync and revalidate. Inspect current",
+            "text": "Isolate tenants with memory.max and memory.high in a cgroup v2, pin processes to NUMA nodes, tune vfs_cache_pressure and min_free_kbytes, set per-tenant IO priorities with BFQ/Deadline, and hint page",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Plan: identify bursts with iostat and blktrace; test IO schedulers BFQ and mq-deadline with tuned queue_depth; enforce per-tenant I/O via cgroup v2 io.max/io.weight; pin I/O and workers to NUMA nodes;",
+            "text": "Deploy per-tenant memory and CPU limits via cgroups v2 and cpuset, pin cache workers to specific NUMA nodes, and bind NIC interrupts to dedicated cores. Enable PMU counters for L3/DRAM bandwidth, run",
             "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Run systemd-analyze blame to identify slow units, then trim serial dependencies on noncritical services with systemctl edit to drop unnecessary Requires/Wants. Limit network-online.target usage to ser",
+            "text": "Pin each tenant to dedicated CPUs and a NUMA node via cpuset/v2, assign memory.min/max, and bound I/O interrupts to that node. Enable NUMA-aware scheduling and CPU affinity, and adjust IRQ/softirq aff",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Pin each tenant to dedicated CPUs and a NUMA node via cpuset/v2, assign memory.min/max, and bound I/O interrupts to that node. Enable NUMA-aware scheduling and CPU affinity, and adjust IRQ/softirq aff",
+            "text": "Use a fair IO scheduler (BFQ or Kyber) for NVMe; cap per-tenant I/O with cgroup2 io.max/io.weight; pin each tenant to a dedicated CPU set and bind its memory to a NUMA node; tune min_free_kbytes and v",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical, in-field problem solving for Linux IO bottlenecks in multi-tenant environments, including scheduler choice, per-tenant isolation, NUMA awareness, and observability.\n\n## Key Concepts\n- IO scheduling: bfq vs mq-deadline and parameter tuning\n- cgroup v2 IO controllers: io.max, io.weight for tenant isolation\n- NUMA pinning and CPU affinity for I/O paths\n- Observability stack: iostat, blktrace, perf, bpftrace, ftrace\n\n## Code Example\n```bash\n# Example: view per-tenant IO weight\ncat /sys/fs/cgroup/io/tenant.slice/io.weight\n```\n\n## Follow-up Questions\n- How would you rollback if a change increases tail latency?\n- How would you validate isolation guarantees under bursty workloads?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nThis question probes practical skills in diagnosing memory/cache contention and per-tenant isolation on a NUMA machine, balancing latency and throughput under bursts.\n\n## Key Concepts\n\n- NUMA locality and memory policies\n- cgroup v2, cpuset, and per-tenant isolation\n- IRQ affinity and NIC queue mapping\n- PMU/perf/pidstat observability\n- Staged load-testing and safe rollback\n\n## Code Example\n\n```bash\n#!/bin/bash\n# Quick NUMA and cache state snapshot\nnumactl --hardware\ngrep -E \"MemTotal|Cached|Slab\" -m1 /proc/meminfo\n```\n\n## Follow-up Questions\n\n- How would you validate improvements on tail latency vs throughput?\n- What changes would you make if hardware is upgraded with multiple NUMA nodes?",
+        "difficulty": "advanced"
       },
       {
         "id": "linux-foundation-sysadmin-q-2",
-        "questionId": "q-12361",
-        "question": "On a Linux host running a GPU-accelerated ML training cluster, a trainer intermittently stalls during peak dataset loading due to memory fragmentation of hugepages. Design a production plan to guarantee deterministic hugepage availability and zero fragmentation for the trainer: NUMA-aware reservation, cpuset isolation, THP disabled, hugetlbfs usage, and a test plan with concurrent training jobs and memory pressure. Include concrete steps, commands, and a rollback path if issues arise?",
+        "questionId": "q-1939",
+        "question": "On a Linux host running a web stack (Nginx proxy to a Node/Go app), the app writes to /var/log/webapp/app.log and /var/log/webapp/access.log. Bursts fill the disk and logrotation sometimes fails because the app keeps logs open. Propose a production-grade plan to ensure reliable log rotation with no data loss and no disk-full events. Include concrete logrotate config (copytruncate vs postrotate), systemd unit tweaks (Restart, ExecReload), filesystem layout advice, and a test plan to reproduce a burst and verify rotation completes without downtime?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Audit inode usage with df -i /var/log/app and du -a /var/log/app | wc -l. Immediate fix: enable daily logrotate with compress, maxsize, and maxage; ensure /var/log is on a partition with ample inodes.",
+            "text": "Isolate NIC IRQs to dedicated CPU cores away from tenant workloads using IRQ affinity masks. Enable multiqueue NIC support and configure RPS (Receive Packet Steering) and XPS (Transmit Packet Steering) to distribute RX/…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Plan to reproduce, bench, and isolate I/O bottlenecks: 1) instrument with iostat -dx, ioping, and blktrace; 2) compare IO schedulers (deadline vs bfq) and two queue depths; 3) implement per-tenant io.",
+            "text": "Implement a staged kpatch deployment strategy: validate on a hot spare kernel with sustained NUMA-pinned workloads, monitor critical metrics (latency, stalls, panics), and establish clear rollback criteria including pat…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Disable Transparent Huge Pages (THP); reserve a fixed hugepage pool on the target NUMA node; mount hugetlbfs; pin trainer processes to the node via cpuset and numactl; run under a dedicated systemd slice with MemoryHigh…",
+            "text": "Configure logrotate with copytruncate (or a postrotate that signals the process to reopen logs) and rotate daily or at 100M, keeping 7 archives. Move logs to a dedicated partition; enable Restart=on-f",
             "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Set up per-tenant groups and enforce via setgid, ACLs, and a rollback plan. Audit: getfacl -R /data/tenants; ls -ld /data/tenants; identify drift with find /data/tenants -perm -2000. Fix: chown -R roo",
+            "text": "Audit inode usage with df -i /var/log/app and du -a /var/log/app | wc -l. Immediate fix: enable daily logrotate with compress, maxsize, and maxage; ensure /var/log is on a partition with ample inodes.",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question tests practical hands-on skills for ensuring deterministic memory allocation in real ML workloads, balancing performance requirements with system isolation.\n\n## Key Concepts\n- HugePages and THP management\n- NUMA-aware memory reservation\n- cpuset/isolation and systemd slices\n- hugetlbfs vs. transparent huge pages\n\n## Code Example\n```bash\n# Disable THP\necho never > /sys/kernel/mm/transparent_hugepage/enabled\n\n# Reserve hugepages (example for a fixed pool on Node0)\nsysctl -w vm.nr_hugepages=128\n\n# Mount hugetlbfs\nmkdir -p /dev/hugepages\nmount -t hugetlbfs hugetl",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nTests practical log management skills: integrating logrotate with systemd, handling open-file rotation issues, and ensuring disk-safety with verifiable tests.\n\n## Key Concepts\n- logrotate behavior: copytruncate vs postrotate\n- systemd unit settings: Restart, ExecReload\n- filesystem layout and quotas for logs\n- reproducible test plan to simulate burst and confirm rotation\n\n## Code Example\n```javascript\n// logrotate config snippet (illustrative)\n// Real config lives in /etc/logrotate.d/webapp\n```\n\n## Follow-up Questions\n- What are the tradeoffs of copytruncate vs postrotate in data integrity?\n- How would you monitor disk usage and set automated alerts for log growth?",
+        "difficulty": "beginner"
       },
       {
         "id": "linux-foundation-sysadmin-q-3",
-        "questionId": "q-6816",
-        "question": "On a Linux host hosting a multi-tenant container cluster, tail startup latency spikes during bursts despite ample CPU; design a production plan to identify and mitigate startup latency using low-overhead tracing (eBPF) to profile container lifecycle events (namespace creation, cgroup setup, mounts, network namespace) and enforce per-tenant budgets? Include data collection, tenant-scoped tracing, rollout criteria, and rollback strategy?",
+        "questionId": "q-27417",
+        "question": "On a Linux host running a high-throughput, multi-tenant container platform, container startup latency spikes during bursts due to repeated cgroup, namespace, and network setup work on a shared kernel. Design a production plan to diagnose and reduce startup latency while preserving strict tenant isolation. Include per-tenant resource and namespace strategies, kernel I/O/network tweaks, observability, and a staged test/rollback?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use systemd-analyze to identify boot bottlenecks and map the critical chain, enable parallel startup and socket-activation for essential units, isolate the SLA-critical service with a dedicated cpuset and systemd v2 cgr…",
+            "text": "Limit per-container egress using tc HTB on the host NIC. Identify the backup container’s veth, map each container to a class, and cap the backup class to a small fraction (e.g., 200 Mbps) while other",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Develop a low-overhead eBPF tracing plan to profile container lifecycle events (namespace creation, cgroup setup, mounts, network namespace) during startup bursts. Tag events with per-tenant identifie",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Deploy a lightweight monitor per container that checks /var/log/<ct> size every 5 minutes and alerts on threshold. Enforce quotas via per-dir quotas on the filesystem (or systemd.slice if available) t",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Diagnose inotify/watch exhaustion on a shared CI scratch area used by many tenants. Baseline max_user_watches and per-tenant file-descriptor usage; enforce per-tenant ulimit -n (and optional cgroup li",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design advanced observability with safe overhead, tenant isolation, and rollback.\n\n## Key Concepts\n- eBPF tracepoints, container lifecycle, per-tenant tagging, tail-latency analysis, rollout and rollback.\n\n## Code Example\n```javascript\n// Pseudo-eBPF sketch: tag events with tenant and record startup latency\ntracepoint(\"container_start\", (ctx) => {\n  const tenant = getCurrentTenantId();\n  recordLatency(tenant, now() - startTime);\n});\n```\n\n## Follow-up Questions\n- How would you validate that tracing does not perturb startup times under load?\n- What metrics and dashboards would you expose to operators?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-4",
-        "questionId": "q-21796",
-        "question": "On a Linux host running a multi-tenant data-processing cluster, tenants share a pooled NVMe-backed storage backend (iSCSI) and tail latency spikes occur during bursts. Design a production plan to diagnose and reduce storage I/O tail latency while preserving tenant isolation and throughput. Include per-tenant I/O quotas (CGroups v2 blkio or BFQ), NUMA-aware IO paths, measurement with blktrace/iostat/iometer, a staged rollout with rollback, and concrete commands or steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Patch plan: Utilize a distribution-supported live patching tool (kpatch/kgraft/Ksplice) that maintains compatibility with the exact kernel version and glibc. Execute initial deployment on a staging environment replicati…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Baseline with mpstat -P ALL 1 5 and iostat to confirm steal and I/O contention. Isolate tenants with cgroups v2: create per-tenant slices (tenant-a.slice, tenant-b.slice) and assign cpu.max or CPUQuot",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Configure per-tenant I/O quotas using cgroups v2 with the BFQ scheduler, bind heavy tenants to dedicated NUMA nodes, and map devices to per-tenant cgroups. Instrument with blktrace, iostat, and fio for comprehensive obs…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Plan: enforce per-tenant I/O limits with cgroups v2 io.max, pin data-feed to a dedicated CPU set on a single NUMA node, use an NVMe-friendly mq-deadline scheduler, prefer io_uring paths, isolate workl",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question evaluates practical I/O isolation and performance tuning in multi-tenant Linux environments, focusing on tail latency reduction while maintaining isolation guarantees under bursty workloads.\n\n## Key Concepts\n- **Per-tenant I/O throttling**: cgroups v2 io.max for bandwidth limits or BFQ for latency-aware scheduling\n- **NUMA-aware I/O paths**: Binding tenant workloads to NUMA-local storage controllers to minimize cross-node traffic\n- **Observability**: blktrace for block layer tracing, iostat for throughput and latency metrics, fio for benchmark validation\n- **Staged rollout**: Deploy changes incrementally with automated rollback triggers based on predefined latency thresholds\n\n## Diagnosis Approach\n1. **Baseline measurement**: Use iostat and blktrace to establish current latency distribution and identify peak contributors\n2. **Tenant isolation verification**: Confirm cgroup boundaries are properly enforced and no cross-tenant I/O interference exists\n3. **NUMA topology analysis**: Map storage devices to NUMA nodes and identify misaligned workloads\n\n## Implementation Plan\n1. Create per-tenant cgroups and assign I/O weight limits using BFQ\n2. Pin tenant workloads to NUMA-local CPUs and storage paths\n3. Deploy incremental changes with continuous monitoring\n4. Roll back automatically if tail latency exceeds thresholds",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-5",
-        "questionId": "q-24796",
-        "question": "On a Linux host shared by multiple tenants via SSH, bursts of logins cause noticeable latency for some tenants. Design a beginner-friendly plan to enforce fair CPU usage per tenant using cgroup v2, without modifying applications. Include how to create per-tenant slices, set cpu.max, test latency with a synthetic burst, monitoring, and rollback steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-tenant namespaces with VRF-style routing, dedicated CPUs, and XDP/BPF-based per-tenant ACLs and egress shaping. Use tc HTB/fq_codel with per-tenant queues, bind NIC TX/RX rings to the same NUMA no",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Plan: instrument with pqos to allocate per-tenant CAT/MBA, enable resctrl groups mapped to each tenant, pin CPUs with cpuset, configure mbctl quotas, set memory bandwidth limits, run a phased load tes",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Per-tenant cgroup v2 slices, assign cpu.max per tenant (e.g., 50% of a core) and cpu.weight for fairness, and hook user sessions to their slice via systemd.slice. Baseline test with a scripted SSH log",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Create per-tenant network namespaces with separate veth pairs. On the collector NIC, configure dedicated HTB queues for rate shaping and fq_codel for bounded latency on each tenant's ingress traffic. Pin IRQs and NAPI p…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests the ability to translate requirements into concrete ops: per-tenant resource isolation, knowledge of cgroup v2, and integration with systemd for session scope, plus a practical test and rollback plan.\n\n## Key Concepts\n- Cgroup v2 hierarchy and cpu.max\n- Per-tenant slices (system.slice/tenant-<name>.slice)\n- Attaching sessions to slices (systemd.slice) and fair scheduling\n- Baseline latency measurement and a burst test\n- Rollback safety and rollback steps\n\n## Code Example\n```\n# Create per-tenant slices\nsudo mkdir -p /sys/fs/cgroup/tenant-a.slice\nsudo mkdir -p /sys/fs/cgroup/tenant-b.slice\n\n# Limit each to 50% of a single CPU\necho \"50000 100000\" | sudo tee /sys/fs/cgroup/tenant-a.slice/cpu.max\necho \"50000 100000\" | sudo tee /sys/fs/cgroup/tenant-b.slice/cpu.max\n\n# Example: bind a login session to a tenant slice (conceptual)\nsudo systemd-run --slice=tenant-a.slice -t --unit=ssh-session tenant-a-login\n```\n\n## Follow-up Questions\n- How would you automate tenant-to-slice assignment for new users?\n- What monitoring would you add to detect drift or fairness violations, and how would you alert on them?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-6",
-        "questionId": "q-18609",
-        "question": "On a Linux host running multiple LXC containers for tenants, a shared 1 Gbps NIC experiences intermittent latency spikes under bursts due to a single container saturating traffic via offloads. Design a beginner-friendly plan to diagnose and mitigate per-container network contention without modifying apps. Include data collection, traffic shaping with tc, per-container tagging, and a rollback path?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "A comprehensive plan to diagnose and minimize tail I/O latency in a multi-tenant Linux environment with a shared NVMe pool: **Diagnosis Phase:** Instrument the I/O path with blktrace, iostat, and perf to identify delays…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Create per-tenant slices with systemd (tenantA.slice…tenantF.slice), assign processes via systemd-run --slice, and set CPUWeight/IOWeight to distribute CPU/I/O fairly. Monitor with systemd-cgtop and c",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Collect metrics (iostat, sar, and ifstat) during bursts to identify the tenant. Tag containers with net_cls, create a root qdisc and per-container classes using tc with ht b or cbq, cap bandwidth per",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use XDP in native mode at ingress with a per-tenant BPF hash map (tenant_id -> token bucket). Forward if bucket>0 (atomically decremented); otherwise XDP_DROP or rate-limit. Update quotas live from us",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests practical triage: observe, identify, and mitigate network contention with basic linux tools. Emphasizes non-app changes and safe rollback.\n\n## Key Concepts\n\n- Network namespaces, net_cls, tc/qdisc, ht b\n- Data collection (iostat, sar, ifstat)\n- Rollback procedures and safety checks\n\n## Code Example\n\n```javascript\n// Example validation commands\niostat -xz 2\nsar -n DEV 1 5\n```\n\n## Follow-up Questions\n\n- How would you verify isolation under peak bursts?\n- What if the offender changes after changes?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-7",
-        "questionId": "q-29689",
-        "question": "On a Linux host running a multi-tenant data ingestion service (Snowflake-like) with a high-throughput NIC, tail latency spikes occur during bursts due to interrupt handling overhead. Design a production plan to diagnose and mitigate NIC interrupt bottlenecks without compromising throughput. Include per-tenant isolation, IRQ affinity, NIC multiqueue tuning (RPS/XPS), cgroups/v2 pinning, observability, and a staged test with rollback?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Diagnose contention points using perf and bpftrace. Implement per-tenant tc queues with HTB for bandwidth allocation and fq_codel for flow pacing. Redirect packets to per-tenant receive rings via XDP_REDIRECT, leveragin…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement per-tenant CPU isolation using cgroups v2 and systemd slices: create dedicated slices for each tenant (e.g., tenantA.slice, tenantB.slice) within the unified cgroups v2 hierarchy. Apply cpu.max quotas to enfor…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Increase nf_conntrack capacity and apply per-source limits to relieve pressure. Steps: 1) Monitor current usage: `cat /proc/net/nf_conntrack | wc -l`; 2) Scale capacity: `sysctl -w net.netfilter.nf_conntrack_max=524288`…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Isolate NIC IRQs to dedicated CPU cores away from tenant workloads using IRQ affinity masks. Enable multiqueue NIC support and configure RPS (Receive Packet Steering) and XPS (Transmit Packet Steering) to distribute RX/…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question evaluates practical performance engineering skills for NIC interrupt handling in multi-tenant data ingestion workloads. It requires understanding the interplay between kernel networking, IRQ affinity, multiqueue configuration, and per-tenant CPU pinning.\n\n## Key Concepts\n\n- **IRQ Affinity & CPU Isolation**: Direct NIC interrupts to dedicated cores to avoid contention with tenant workloads.\n- **NIC Multiqueue, RPS/XPS, & XDP**: Utilize multiple hardware queues and software steering to distribute packet processing.\n- **cpuset/cgroups v2**: Enforce per-tenant CPU placement and resource boundaries.\n- **Observability**: Use perf, ftrace, bpftrace, and latency histograms for granular visibility.\n- **Safe Testing**: Implement staged load testing with automated rollback procedures.\n\n## Code Example\n\n```bash\n# Enable IRQ affinity for NIC (eth0) IRQs\nfor irq in $(cat /proc/interrupts | grep eth0 | awk '{print $1}' | tr -d ':'); do\n    echo 2 > /proc/irq/$irq/smp_affinity  # Pin to CPU core 1\ndone\n\n# Configure RPS for RX distribution across cores 4-7\necho f0 > /sys/class/net/eth0/queues/rx-0/rps_cpus\necho f0 > /sys/class/net/eth0/queues/rx-1/rps_cpus\n\n# Disable irqbalance\nsystemctl stop irqbalance\n\n# cgroups v2 per-tenant CPU pinning\nmkdir -p /sys/fs/cgroup/tenant-a\necho 4-7 > /sys/fs/cgroup/tenant-a/cpuset.cpus.effective\necho 0 > /sys/fs/cgroup/tenant-a/cpuset.mems\necho $(pgrep -f tenant-a-ingestion) > /sys/fs/cgroup/tenant-a/cgroup.procs\n```",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-8",
-        "questionId": "q-11667",
-        "question": "On a Linux host running a multi-tenant CI/CD runner fleet, thousands of short-lived jobs execute in per-tenant systemd.slice units, sharing CPU and I/O. Burst starts cause head-of-line latency and unfairness. Design a production plan to reduce startup latency while preserving isolation. Include per-tenant CPU/memory quotas, cpuset, uclamp, per-tenant io.max, systemd tuning, observability, and a staged roll-out with canaries?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Isolate clocks per tenant via Linux time namespaces; pin containers to a PHC-backed clock from the NIC; run per-tenant ptp4l with its own grandmaster and hardware timestamping; use chrony in bounded-s",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use per-tenant systemd.slice with CPUQuota and MemoryHigh/Low, assign tenants to dedicated cpuset, bind tasks to CPUs, enable per-tenant io.max in cgroup v2, and apply uclamp to bound workload. Instru",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Implement per-tenant memcg v2 quotas (memory.max and memory.high) with per-tenant swap accounting tuned, pin critical workloads to a reserved CPU subset, and adjust oom_score_adj to favor critical ten",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Plan uses hardware timestamping on NICs (PTP/1588), Chrony configured as a boundary clock, per-tenant time namespaces for clock skew isolation, and kernel tunables (TSC, HPET, CLOCK_BOOTTIME). Instrum",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design robust multi-tenant resource governance using Linux primitives (cgroup v2, systemd.slice, cpuset) and per-tenant I/O shaping, plus instrumentation.\n\n## Key Concepts\n\n- cgroup v2 per-tenant isolation with CPUQuota and MemoryHigh/Low\n- cpuset binding and uclamp to fix CPU cost\n- per-tenant io.max to bound I/O\n- Observability: perf, bpftrace, blktrace, custom dashboards\n- Canary rollout and rollback strategy\n\n## Code Example\n\n```bash\n# Create tenant slice and set quotas\nsystemctl set-property tenant-A.slice CPUQuota=25% MemoryHigh=1G\n# Assign CPU affinity\ntaskset -pc 0-3 <pid>\n```\n\n## Follow-up Questions\n\n- How to measure tail-latency impact under bursty job inflow?\n- How would you handle a tenant needing sudden spike in CPU without starving others?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-9",
-        "questionId": "q-30164",
-        "question": "On a Linux host serving a shared CI/build farm for multiple tenants, bursts of builds trigger thousands of inotify and fanotify events, causing per-tenant builds to sporadically fail due to watcher exhaustion. Design a production plan to diagnose and mitigate event handling bottlenecks without breaking tenant isolation. Include per-tenant directory scoping, limits tuning for inotify/fanotify, polling strategies, observability, and a staged rollback?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a comprehensive isolation strategy by partitioning CPU resources using cpuset with isolcpus and per-tenant cgroups; pin audio processing workers to dedicated NUMA nodes; enable the PREEMPT_RT kernel with real-…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Start by mapping tenants to dedicated watcher quotas, raise per-tenant inotify limits (inotify.max_user_watches, max_queued_events) and segregate watch trees via per-tenant namespaces or cgroups. Move",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Implement per-tenant TLS session caching to reduce redundant cryptographic operations; pin worker threads to dedicated CPU cores to minimize context switching overhead; leverage hardware offload via the kernel crypto AP…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement per-tenant latency tracing with eBPF: attach to sched_switch and key events, map samples to tenants via cgroup v2 paths; accumulate p95/p99 latency in a BPF map keyed by tenant ID; keep overhead under 2% CPU a…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis angle probes practical limits tuning under multi-tenant workloads, focusing on file-system event delivery bottlenecks rather than generic performance.\n\n## Key Concepts\n- inotify vs fanotify\n- per-tenant quotas and namespaces\n- cgroups, namespaces, watch scoping\n- observability during bursts\n- rollback strategies\n\n## Code Example\n```bash\n# Temporarily bump per-tenant inotify limits\nsysctl -w fs.inotify.max_user_watches=524288\nsysctl -w fs.inotify.max_queued_events=1048576\n```\n\n## Follow-up Questions\n- How would you validate that the rollout preserves tenant isolation and fairness?\n- What metrics would you chart to detect regressing bursts?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-10",
-        "questionId": "q-29172",
-        "question": "On a Linux host serving a shared data lake, hundreds of tenants perform file operations in /data/tenants/*; security auditing via auditd must log critical actions (create, delete, chown) but keep CPU overhead under 3-5% during peak bursts. Propose concrete audit rules, per-tenant rate limits, log rotation, and a rollback/test plan using ausearch, aureport, and fio/iostat to validate performance impact?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Audit inode usage with df -i /var/log/app and du -a /var/log/app | wc -l. Immediate fix: enable daily logrotate with compress, maxsize, and maxage; ensure /var/log is on a partition with ample inodes.",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement targeted audit rules for critical file operations under `/data/tenants/*` using the watch directive to minimize overhead: ```bash auditctl -w /data/tenants -p wa -k tenant_changes ``` Configure a global rate l…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Enable BFQ as the IO scheduler for the disks backing VMs; create per-VM cgroups under /sys/fs/cgroup/io, set io.weight higher for the critical VM and io.max for others, and consider dedicating a disk/",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-tenant namespaces with VRF-style routing, dedicated CPUs, and XDP/BPF-based per-tenant ACLs and egress shaping. Use tc HTB/fq_codel with per-tenant queues, bind NIC TX/RX rings to the same NUMA no",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Question Is Asked\nThis question evaluates practical auditing configuration on multi-tenant Linux hosts with strict performance constraints. It tests understanding of auditd internals, rate limiting strategies, and empirical validation methods.\n\n## Key Concepts\n- **Targeted audit rules**: The watch directive (`-w path -p permissions`) applies rules only to specific paths, minimizing CPU overhead compared to broad syscall monitoring\n- **Key-based filtering**: Key prefixes (`-k`) enable efficient post-hoc filtering with `ausearch` and `aureport` without kernel-level per-tenant rules\n- **Rate limiting**: The `rate_limit` setting in `auditd.conf` caps kernel-to-user-space event delivery, preventing auditd from becoming a bottleneck during burst activity\n- **Disk protection**: The `admin_space_left_action = suspend` setting ensures the system remains operational even if audit logging consumes all available disk space\n\n## Evaluation Criteria\nStrong answers demonstrate:\n1. Knowledge of `-w` and `-k` flags for efficient rule construction\n2. Understanding of auditd rate limiting and queue behavior\n3. Ability to validate performance impact using standard Linux monitoring tools\n4. Evidence of operational safety via rollback procedures",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-11",
-        "questionId": "q-26098",
-        "question": "On a Linux host running dozens of containerized services with a single runtime, startup latency spikes under burst load cause some containers to miss readiness windows. Propose a beginner-friendly, production-safe plan to diagnose and reduce container startup latency by tuning systemd units and the container runtime, without changing application code. Include baseline measurements, concrete changes (unit directives, parallelization, CPU quotas), a test plan, and rollback steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Baseline: run systemd-analyze blame and systemd-analyze critical-chain to identify slow units. Then optimize: set DefaultDependencies=no for independent services; adjust After/Wants to reduce unnecess",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "A comprehensive plan to diagnose and minimize tail I/O latency in a multi-tenant Linux environment with a shared NVMe pool: **Diagnosis Phase:** Instrument the I/O path with blktrace, iostat, and perf to identify delays…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Propose isolating tenants with cgroup v2, pinning CPU and memory resources, and comparing ext4 (with dir_index) vs XFS metadata performance under mixed workloads. Tune directory indexing and inode/dentry cache parameter…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Create per-tenant slices (tenantA.slice) and assign each container to its slice. Set CPUQuota=50% and CPUQuotaPeriod=100000, optionally pin to CPUs with CPUAffinity. Add a lightweight monitor (pidstat",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes practical, hands-on troubleshooting of startup latency in multi-tenant Linux environments using systemd and container runtimes.\n\n## Key Concepts\n- systemd analysis (blame, critical-chain)\n- Unit directives and parallelization\n- Linux cgroups/slices and CPU quotas\n- Socket activation and container runtimes\n- Safe rollback and validation\n\n## Code Example\n```bash\n# Baseline measurements\nsystemd-analyze blame\nsystemd-analyze critical-chain\n```\n\n## Follow-up Questions\n- How would you measure per-tenant startup latency and isolate tenants?\n- What risks come with per-tenant slices and CPUQuota, and how would you mitigate them?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-12",
-        "questionId": "q-9168",
-        "question": "On a Linux host running a multi-tenant GPU-accelerated inference farm (containers using NVIDIA GPUs via the NVIDIA container toolkit). Tenants submit bursts of short inference requests; observed latency spikes and GPU queueing when multiple tenants contend for the same device. Design a production plan to guarantee per-tenant fairness and deterministic end-to-end latency. Include GPU isolation strategy (MIG or per-GPU slices), CPU pinning, container runtime isolation, metrics, alerting, and a test/rollback plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Deploy per-tenant memory and CPU limits via cgroups v2 and cpuset, pin cache workers to specific NUMA nodes, and bind NIC interrupts to dedicated cores. Enable PMU counters for L3/DRAM bandwidth, run",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use per-tenant GPU isolation (MIG or per-GPU slices), CPU pinning, and container runtimes with strict cgroups v2 quotas. Run GPUs through MPS to reduce cross-tenant queueing. Instrument with eBPF trac",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Establish per-tenant labels and dedicated NIC resources, pin Rx rings and IRQs to tenant-specific CPUs, and deploy an XDP/eBPF program that enforces per-tenant rate limits while redirecting traffic to per-tenant queues.",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Partition CPU resources using CGroups v2: allocate cores 0-3 for data ingestion and cores 4-5 for alerting; configure alerting within a dedicated systemd.slice with CPUAffinity=4-5 and CPUQuota=60%; execute alerting wit…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nReal-world multi-tenant GPU inference farms face tail latency spikes due to cross-tenant contention. This question probes practical isolation strategies, scheduling trade-offs, and robust validation.\n\n## Key Concepts\n- GPU virtualization (MIG vs vendor slices)\n- CPU pinning and cgroups v2 quotas\n- GPU‑aware scheduling (MPS, container runtimes)\n- Observability with eBPF, perf, and metrics dashboards\n- Test plans with burst workloads and safe rollback\n\n## Code Example\n```bash\n# Example burst test (illustrative)\nfor i in {1..1000}; do curl -s http://tenant-$i.local/infer >/dev/null & done\nwait\n```\n\n## Follow-up Questions\n- How would you roll back MIG changes if latency targets drift during a rollout?\n- Which metrics dashboards and alert thresholds would you use for SLA violations?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-13",
-        "questionId": "q-2931",
-        "question": "On a Linux server hosting a web app, the /var partition has space but inode usage on /var/lib/app/cache is near exhaustion due to many tiny files created daily. Propose a production plan to prevent inode exhaustion without downtime: redesign cache storage (hashed dirs), implement cleanup/rotation, enable tmpfiles purge, and a lightweight watchdog. Include concrete commands and config snippets, plus a reproducible test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Diagnose contention points using perf and bpftrace. Implement per-tenant tc queues with HTB for bandwidth allocation and fq_codel for flow pacing. Redirect packets to per-tenant receive rings via XDP_REDIRECT, leveragin…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use per-tenant IO quotas (io.max/io.weight) in cgroup v2, dedicate the critical build path to a fast IO group (BFQ/Kyber), isolate storage per tenant, NUMA-bind devices, and per-tenant tmpfs scratch s",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Plan: 1) migrate cache to hashed dir layout using sha1/first2 chars (e.g., /var/lib/app/cache/aa/abcd...). 2) add a daily cleanup script and rotate/compress logs; delete files older than 14 days. 3) e",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Outline a concrete plan to mitigate memory pressure and THP fragmentation causing tail latency in a multi-tenant container stack. Include: per-tenant memory limits (memory.max, memory.high), explicit",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to reason about inode pressure, not just disk space. Shows practical fixes that avoid downtime and maintain SLA.\n\n## Key Concepts\n\n- Inodes vs disk space\n- Cache storage layout and HA safety\n- Automated cleanup and tmpfiles\n- Lightweight watchdogs and test plans\n\n## Code Example\n\n```bash\n# migrate: create hashed dirs and move files\nmkdir -p /var/lib/app/cache/aa\n# example migration placeholder\n```\n\n## Follow-up Questions\n\n- How would you generalize this for multiple tenants?\n- What are potential pitfalls of hashed-cache layouts?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-14",
-        "questionId": "q-12002",
-        "question": "On a Linux host with a shared scratch area mounted at /scratch, multi-tenant bursts of small writes cause IO wait spikes on a single HDD. Design a beginner-friendly plan to diagnose and reduce IO contention without changing tenant apps. Include per-tenant isolation (simple quotas or cgroups), IO scheduling (bfq or CFQ), baseline tests, and a rollback path?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Plan using cgroup v2: create ci.slice with per-service sub-slices (ci-runner-A/B/C). Assign cpu.max and io.max per service; pin CPUs via cpuset and set IRQ affinity. Use BFQ for per-service I/O schedu",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Run vmstat 1 and free -m to confirm paging. If paging is high, apply basic controls: 1) set vm.swappiness=10; 2) enable zram swap (2GB); 3) create per-tenant memory limits via cgroups; 4) mount /tmp a",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Baseline I/O shows iowait spiking on /scratch during bursts (iostat -xz 1). Group tenants into high/normal priorities and apply simple per-tenant limits via blkio cgroups (cgcreate -g blkio:/scratch_h",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use XDP in native mode at ingress with a per-tenant BPF hash map (tenant_id -> token bucket). Forward if bucket>0 (atomically decremented); otherwise XDP_DROP or rate-limit. Update quotas live from us",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests hands-on ability to diagnose Linux I/O contention using basic tools, implement lightweight QoS via cgroups and IO scheduler, and validate with a rollback, all at beginner level suitable for large-scale shared environments.\n\n## Key Concepts\n- IO scheduling (BFQ/CFQ)\n- blkio cgroups\n- iostat/iotop baseline checks\n- Rollback and test planning\n\n## Code Example\n```bash\n# Baseline check\niostat -xz 1\n# Create high-priority group and set limits\nsudo cgcreate -g blkio:/scratch_high\nsudo bash -c 'echo 1024 > /sys/fs/cgroup/blkio/scratch_high/blkio.weight'\n```\n\n## Follow-up Questions\n- How would you adapt for cgroup v2?\n- What metrics indicate successful isolation vs. degraded throughput?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-15",
-        "questionId": "q-13500",
-        "question": "On a Linux host acting as a multi-tenant VPN gateway for a fintech app, tenants share a single NIC and kernel; design a production plan to guarantee per-tenant network isolation and predictable egress latency under bursty traffic. Include per-tenant routing domains or namespaces, XDP/BPF for per-tenant ACLs and QoS, tc/qdisc with HTB, IRQ affinity and CPU pinning, NUMA awareness, and a test plan with synthetic tenants using iperf3/netperf; outline rollback?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "## Diagnosis and Mitigation Plan for Page Cache Contention ### 1. Baseline Metrics Collection Establish a performance baseline using standard Linux monitoring tools: - **vmstat 1**: Monitor context switches, page faults…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Instrument the datapath using bpftool, perf, and bpftrace to identify contention points in per-tenant maps and locate verifier reload triggers. Implement per-tenant per-CPU maps to eliminate lock contention across cores…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Check current limits (fs.inotify.max_user_watches, max_user_instances) and count watches per pid via /proc/*/fd, reproducing with a large repo. If exhausted, raise limits (sysctl -w fs.inotify.max_use",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-tenant namespaces with VRF-style routing, dedicated CPUs, and XDP/BPF-based per-tenant ACLs and egress shaping. Use tc HTB/fq_codel with per-tenant queues, bind NIC TX/RX rings to the same NUMA no",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests Linux networking, virtualization concepts, and QoS under multi-tenant load in a real-world VPN gateway.\n\n## Key Concepts\n\n- Per-tenant namespaces/VRF routing\n- XDP/BPF for ACLs and QoS\n- tc/qdisc HTB or fq_codel per tenant\n- IRQ affinity and CPU pinning\n- NUMA awareness and tenant cgroups\n- Observability with iperf/netperf\n\n## Code Example\n\n```javascript\n// High-level pseudo steps (not executed as-is)\nconst tenants = [\"t1\",\"t2\"];\nfor (const t of tenants) {\n  const ns = createNamespace(`vn_${t}`);\n  setupVRF(ns, t);\n  bindVpnWorkerToNamespace(ns);\n}\n```\n\n## Follow-up Questions\n\n- How would tail latency be measured and bounded at 99th percentile?\n- How to safely onboard/offboard tenants without disruption?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-16",
-        "questionId": "q-11900",
-        "question": "On a Linux host that runs a stateful service with a strict 2-second startup SLA, upgrades can cause jitter because a late-boot network service delays the rest. Design a production plan to guarantee deterministic startup: map the boot chain with systemd-analyze, enable parallel unit startup and socket-activation for the critical path, isolate the path with cpuset/cgroups v2, pre-warm caches, reserve CPU/network resources, and implement a staged rollback. Include tests and rollback strategy?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Set a per-tenant swap max using cgroups v2 memory.swap.max; lower vm.swappiness to 10; enable zram (2–4GB) to absorb bursts; run a controlled stress test per tenant and monitor swap in/out and latency",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Per-tenant AF_XDP UMEM regions and XDP programs pinned to dedicated RX queues; bind workers to CPUs; use cgroup v2 network controllers or per-tenant netns; tc/qdisc with per-tenant policing and shapin",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use systemd-analyze to identify boot bottlenecks and map the critical chain, enable parallel startup and socket-activation for essential units, isolate the SLA-critical service with a dedicated cpuset and systemd v2 cgr…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use per-tenant GPU isolation (MIG or per-GPU slices), CPU pinning, and container runtimes with strict cgroups v2 quotas. Run GPUs through MPS to reduce cross-tenant queueing. Instrument with eBPF trac",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question presents a realistic production scenario where strict startup SLAs are impacted by system-level dependencies. It tests the candidate's ability to analyze complex boot chains, apply performance optimization techniques, and design robust deployment strategies in Linux environments.\n\n## Key Concepts\n- systemd boot analysis and unit orchestration\n- Parallel startup and socket activation patterns\n- CPU isolation using cpuset and systemd v2 cgroups\n- Resource reservation for SLA-critical paths\n- Cache and firmware pre-warming strategies\n- Staged rollout methodologies",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-17",
-        "questionId": "q-9211",
-        "question": "On a Linux host that runs a multi-tenant io_uring-based build farm for CI workloads, bursty tenants saturate shared NVMe storage causing unpredictable latency. Design a plan to guarantee per-tenant I/O isolation and predictable tail latencies. Include per-tenant CPU isolation with cpuset, per-tenant IO quotas using cgroup v2 io.max, tenancy-aware io_uring queues, memory locking, and a test plan with synthetic tenants and latency measurements; provide rollback steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Audit with du -h --max-depth=2 /var/log/tenant-* to identify top tenants and big files. Create per-tenant logrotate rules under /etc/logrotate.d/tenant-*, setting maxsize, weekly rotation, compress, a",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Audit inode usage with df -i /var/log/app and du -a /var/log/app | wc -l. Immediate fix: enable daily logrotate with compress, maxsize, and maxage; ensure /var/log is on a partition with ample inodes.",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Plan: isolate tenants with cpuset on dedicated CPUs, enforce per-tenant IO limits via cgroup v2 io.max on the NVMe device, assign a separate io_uring context per tenant, lock required buffers with mem",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Enable key-based auth, disable password logins and root login, restrict SSH by IP or AllowUsers, and ensure emergency console access. Use sshd_config: PasswordAuthentication no; PermitRootLogin no; Pu",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design I/O isolation for multi-tenant workloads using modern Linux primitives (io_uring, cgroups v2) and to think about end-to-end testing.\n\n## Key Concepts\n- cgroup v2 io.max per-device quotas\n- cpuset CPU isolation and NUMA awareness\n- per-tenant io_uring contexts\n- memory locking and pinned buffers\n- realistic testing with fio and latency histograms\n\n## Code Example\n```javascript\n// Example: create tenant cgroup and set io.max\nconst patch = `\nmkdir -p /sys/fs/cgroup/tenant-A\necho \"104857600 10485760\" > /sys/fs/cgroup/tenant-A/io.max\necho \"2-3\" > /sys/fs/cgroup/tenant-A/cpuset.cpus\n`;\n```\n\n## Follow-up Questions\n- How to handle dynamic tenants join/leave and minimize reconfiguration downtime?\n- How would you observe QoS violations and perform safe rollbacks?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-18",
-        "questionId": "q-28808",
-        "question": "On a Linux host running a multi-tenant data-processing service, tenants run rootless containers (Podman) using user namespaces. Bursts cause excessive syscall counts due to seccomp/landlock filters, impacting latency. Design a production plan to isolate tenants, minimize syscall overhead, and maintain security. Include per-tenant namespace labeling, Landlock/seccomp policy design, a shared allowlist cache, per-tenant cgroups v2 controllers for CPU/memory/io, observability with perf/eBPF, and a staged load-test with rollback?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-tenant cgroups v2 slices: create slices tenantA and tenantB, set cpu.max to cap CPU time and io.weight to limit disk I/O, and run a lightweight watcher (Python) logging per-tenant usage every 5s w",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use per-tenant user namespaces with unique IDs, enforce Landlock policies tuned per tenant, and precompute/seccomp filters. Assign tenants to their own cgroup paths (cpu,memory,io) under a shared root",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Instrument the I/O path (iostat -dx, blktrace, ioping, pidstat) to locate hot queues and metadata contention. Implement per-tenant I/O control with cgroup v2 io.weight/io.max; consider a separate devi",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Create a dedicated NVMe namespace or pool for the critical artifact path; assign each tenant a fixed io.max in a separate cgroup2 subtree; pin the critical write processes to a reserved CPU core set;",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to weave security isolation (Landlock, seccomp) with performance in rootless containers.\n\n## Key Concepts\n- rootless containers, user namespaces\n- Landlock and seccomp policy design\n- cgroup v2 isolation (cpu, memory, io)\n- per-tenant labeling and policy versioning\n- observability with perf/eBPF\n- staged load testing and rollback\n\n## Code Example\n```bash\n# Example Landlock policy generation (pseudo)\nlandlockctl create-policy --tenant A --allowed syscalls read,write,open\nlandlockctl apply --tenant A --policy policy-A.bin\n```\n\n## Follow-up Questions\n- How would you version policies and audit changes per tenant?\n- How would you detect and roll back a policy that worsens latency?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-19",
-        "questionId": "q-11981",
-        "question": "On a Linux host running a multi-tenant streaming ingest path, tail latency spikes during micro-bursts. The team suspects kernel memory management pauses caused by Transparent Huge Pages. Propose a production plan to diagnose and mitigate this without sacrificing throughput. Include measurement steps (perf, ftrace), THP toggling strategy, per-tenant memory controls (cgroups v2 memory.high), NUMA considerations, and a staged test/rollback plan with netperf/wrk workloads?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Measure with perf, ftrace, and slabtop to see THP pauses during bursts; check /sys/kernel/mm/transparent_hugepage/enabled. If THP stalls are real, disable THP (echo never > enabled). Enforce per-tenan",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Disable THP completely for the DB path, reserve dedicated hugepages, pin memory (memlock) via rlimits/mlockall, bind the process to specific NUMA nodes, and isolate it in its own cgroup. Verify p95 la",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Plan: verify NUMA topology with lscpu/lstopo, identify hot memory regions and tenant-node mapping, then enforce cpuset-based CPU affinity and per-tenant memory.high with cgroup v2. Prefer node-local allocation for laten…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Propose per-tenant v2 cgroups under /sys/fs/cgroup, map each tenant to a dedicated slice (tenantA.slice), and set CPU.max so total across tenants uses host capacity (e.g., 1-2 CPUs on a 4-core host).",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to diagnose subtle kernel-memory-caused tail latency in a multi-tenant setting and implement targeted, low-risk mitigations.\n\n## Key Concepts\n- Transparent Huge Pages impact on latency\n- perf, ftrace, slabinfo/pagecache for diagnosis\n- cgroups v2 memory controls (memory.high) for tenant isolation\n- NUMA awareness and CPU pinning\n- Safe rollback and staged testing with real workloads\n\n## Code Example\n````javascript\n// Example snippet: minimal tenants map for per-tenant memlimit (illustrative)\nconst tenants = { a: { memHigh: 512 * 1024 * 1024 }, b: { memHigh: 256 * 1024 * 1024 } };\n````\n\n## Follow-up Questions\n- How would you automate detection of THP-related pauses in production dashboards?\n- What if disabling THP degrades throughput instead of latency—what alternative mitigations would you try?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-20",
-        "questionId": "linux-foundation-sysadmin-networking-1768260262823-4",
-        "question": "You suspect ARP storms on a host with interface eth1. To quickly verify ARP traffic and identify abnormal ARP activity on that interface, which command should you run?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Baseline AVC audit collection (ausearch) to identify hot checks; instrument with perf/ftrace to quantify policy overhead; refactor by introducing per-tenant domains/types, label data paths with tenant",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "To quickly verify ARP traffic and identify abnormal ARP activity on interface eth1, run 'tcpdump -i eth1 arp'. This command captures and displays ARP packets specifically on the eth1 interface, allowing you to monitor f…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Enable XFS project quotas and map each tenant to a project ID; create per-tenant subdirectories under /data and assign them to their projects with xfs_quota. Set per-project inode/block limits. Use bf",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Deploy kpatch to apply live kernel patches with zero downtime. Start with a 5% canary group (2-3 non-critical hosts) and verify stability over 12-24 hours. Then scale to 20% of the fleet, followed by staged rollouts inc…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Correct Answer\nA. tcpdump with the arp filter on the specific interface captures ARP requests/replies, which is exactly what you need to observe ARP storms.\n\n## Why Other Options Are Wrong\n- Option B: ICMP captures are unrelated to ARP activity.\n- Option C: TCP traffic does not reveal ARP behavior.\n- Option D: arp -a shows ARP table entries but not live ARP traffic, making storms harder to observe in real time.\n\n## Key Concepts\n- ARP monitoring with packet captures\n- Interface-specific traffic analysis\n- Distinguishing ARP storms from normal ARP chatter\n\n## Real-World Application\n- Proactively diagnosing network broadcast storms and ARP-related outages in data-center or campus networks.",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "linux-foundation-sysadmin-q-21",
-        "questionId": "q-17862",
-        "question": "On a Linux host running a multi-tenant compute cluster (Docker/K8s) where tail latency spikes during scheduler quiescence despite CPU steady-state, design a production plan to diagnose and reduce tail latency using per-tenant eBPF tracing, CFS tuning, and minimal overhead. Include instrumentation (sched_switch, page faults), tenant tagging (cgroup2), a staged canary rollout, and rollback steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Create a logrotate config at /etc/logrotate.d/app for /srv/app/logs/*.log with daily, size 100M, rotate 7, compress, delaycompress, missingok, notifempty, and a postrotate block that reloads the servi",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Create a dedicated ci.slice with CPUQuota=50%, CPUQuotaPeriodSec=100ms, MemoryLimit=2G, and TasksMax=200. Use a service template ci-job@.service with Slice=ci.slice and per-job limits. Test by launchi",
+            "text": "Use Linux IMA to enforce signed binaries for hot-reload. Sign binaries in CI, publish to a signed repo, enable IMA-based attestation, and require the service to be measured before load. Integrate with",
             "isCorrect": false
           },
           {
@@ -659,106 +119,646 @@
           },
           {
             "id": "d",
-            "text": "I would implement per-tenant latency tracing with eBPF: attach probes to sched_switch, context_switch, page_fault, and IRQ paths; tag events by cg2 tenant ID; build per-tenant histograms for p95/p99 l",
+            "text": "To reduce container startup latency while preserving tenant isolation, implement the following staged approach: **1. Pre-provision per-tenant resources at tenant setup time** Create namespace and cgroup hierarchies duri…",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to translate theory into production observability and tuning under multi-tenant pressure. It requires practical use of eBPF, cgroup tagging, scheduler behaviors, and rollout discipline.\n\n## Key Concepts\n- eBPF tracing and perf/pintrace\n- cgroup v2 tagging and per-tenant isolation\n- CFS scheduling and CPU affinity\n- safe staged rollout with canaries and rollback\n\n## Code Example\n```c\n// Skeleton eBPF program for sched_switch event\nint on_sched_switch(struct trace_event_raw_sched_switch *ctx) { return 0; }\n```\n\n## Follow-up Questions\n- How would you map latency sources to tenants in a real system?\n- What metrics would you emit to dashboards and how would you alert?",
+        "explanation": "## Why This Question Is Asked\nThis question assesses practical ability to diagnose and reduce container startup tail latency in multi-tenant Linux environments, requiring a balance between isolation guarantees and throughput performance.\n\n## Key Concepts\n- cgroup v2 resource quotas and hierarchy management\n- Namespace lifecycle optimization and reuse strategies\n- Network namespace (netns) initialization patterns\n- Trade-offs between tenant isolation and startup overhead\n- Observability tooling: perf, pidstat, BPF, ftrace\n- Staged testing methodology and safe rollback procedures\n\n## Architecture Considerations\nThe solution requires coordinating multiple kernel subsystems (cgroups, namespaces, networking) while maintaining security boundaries. Pre-provisioning shifts setup overhead from container creation time to tenant onboarding, spreading cost over time. Network namespace reuse must be carefully evaluated against tenant isolation requirements—the shared network namespace optimization works best for trust boundaries within the same security domain. Kernel tuning requires balancing latency reduction against fairness and throughput for other tenants on the shared host.",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-4",
+        "questionId": "q-14997",
+        "question": "On a multi-tenant Linux host handling a high-throughput log ingestion pipeline writing to a shared journal, tail latency spikes occur under bursty writes. Design a production plan to guarantee per-tenant I/O isolation while preserving throughput. Specify storage topology (NVMe pools or separate namespaces), I/O scheduler and per-tenant throttling, per-tenant cgroups (blkio/mq) with quotas, barrier/flush tuning, and a test plan using fio patterns and a safe rollback path?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Begin by establishing a baseline using mpstat, pidstat, and perf to identify which cores are being throttled and which tenants are causing the highest CPU contention. Once you have this data, enforce per-tenant CPU quot…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Audit with du -h --max-depth=2 /var/log/tenant-* to identify top tenants and big files. Create per-tenant logrotate rules under /etc/logrotate.d/tenant-*, setting maxsize, weekly rotation, compress, a",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Isolate I/O per tenant using dedicated NVMe namespaces or logical volumes, apply per-tenant blkio/cgroup v2 I/O throttling and weights, and configure an I/O scheduler with per-tenant weighted fairness (BFQ or mq-deadlin…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Apply per-tenant I/O quotas with cgroup v2 io.max/io.weight on the shared NVMe, assign the critical tenant to its own IO queue and optionally a dedicated NUMA node. Use per-device throttling to cap ot",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question assesses understanding of I/O isolation in multi-tenant log ingestion environments, focusing on storage architecture, I/O schedulers, cgroups, and journal tuning to ensure fair resource distribution under bursty workloads.\n\n## Key Concepts\n- I/O isolation in multi-tenant environments\n- NVMe namespaces and logical volume partitioning\n- BFQ and mq-deadline I/O schedulers\n- cgroups v2 blkio controller for per-tenant quotas\n- Journal barrier and flush tuning for write durability\n\n## Production Architecture\n\n### Storage Topology\n- **Dedicated NVMe Namespaces**: Assign each tenant a separate NVMe namespace or partition for complete physical isolation\n- **Logical Volumes (LVM)**: Use LVM to create per-tenant thin-provisioned volumes with guaranteed I/O limits\n- **Separate Journal Devices**: Isolate journal writes to dedicated NVMe devices or namespaces to prevent journal contention\n\n### I/O Scheduler Configuration\n- **BFQ (Budget Fair Queuing)**: Best for latency-sensitive workloads; provides per-entity weighted fairness\n- **mq-deadline**: Simpler alternative with lower overhead; configure read/write batch sizes appropriately\n\n### Per-Tenant Cgroup Configuration\n```bash\n# Create per-tenant cgroups\nmkdir -p /sys/fs/cgroup/tenant-{1..N}\n\n# Set I/O throttling (bytes per second)\necho 100000000 > /sys/fs/cgroup/tenant-1/io.max\n\n# Set I/O weight (cgroup v2)\necho 100 > /sys/fs/cgroup/tenant-1/io.weight\n\n# Add tenant processes to cgroup\necho $(cat /proc/$(pgrep -f tenant1)/pid) > /sys/fs/cgroup/tenant-1/cgroup.procs\n```\n\n### Barrier and Flush Tuning\n- **Disable barriers** for battery-backed write cache (BBU) or disable for non-critical tenants\n- **Tune flush intervals** based on durability requirements (e.g., `echo 500 > /proc/sys/vm/dirty_writeback_centisecs`)\n- **Use fdatasync** instead of fsync for lower latency with acceptable durability\n\n## Test Plan\n\n### fio Patterns for Validation\n```bash\n# Burst write test per tenant\nfio --name=tenant1_burst --rw=write --bs=4k --iodepth=32 --numjobs=1 --direct=1 --filename=/dev/nvme0n1\n\n# Latency percentile test\nfio --name=latency_test --rw=write --bs=4k --iodepth=1 --numjobs=1 --direct=1 --runtime=60 --time_based --percentile=99\n\n# Mixed workload simulation\nfio --name=mixed_workload --rw=randwrite --bs=4k --iodepth=16 --numjobs=4 --direct=1\n```\n\n### Validation Metrics\n- p99 tail latency < 10ms under burst loads\n- No tenant experiences > 20% latency degradation during neighbor's peak\n- Journal write latency remains stable regardless of tenant I/O patterns\n\n## Rollback Path\n1. Revert cgroup settings to default (unlimited)\n2. Restore original I/O scheduler (`echo mq-deadline > /sys/block/nvme0n1/queue/scheduler`)\n3. Remount filesystems with original barrier settings\n4. Revert LVM volume allocations to shared pool\n\n## Key Takeaways\n1. **Physical isolation** via NVMe namespaces provides the strongest tenant separation\n2. **cgroup v2 blkio** enables fine-grained throttling without kernel modifications\n3. **BFQ scheduler** prioritizes latency-sensitive tenants during contention\n4. **Journal isolation** prevents noisy neighbor problems from log append operations\n5. **Always test** under realistic burst conditions before production deployment",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-5",
+        "questionId": "q-20041",
+        "question": "On a Linux host running a multi-tenant analytical DB cluster with dozens of tenants sharing a single NVMe-backed WAL and data path, tail latency spikes under contention due to WAL flush storms. Design a concrete production plan to isolate per-tenant WAL traffic and stabilize tail latency without sacrificing throughput. Include per-tenant IO-uring queues, per-tenant device binding, NUMA-aware layout, WAL directory strategy, observability with iostat/blktrace/bpftrace, and a staged load-test with rollback?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Configure the system with dedicated CPU isolation: boot with `isolcpus=4-7 nohz_full=4-7`, disable irqbalance service and pin network/controller IRQs to CPUs 0-3. Create a dedicated `rt.slice` cgroup v2 slice, assign re…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use systemd ExecReload to send SIGHUP to the daemon and a small validator script. Create /usr/local/bin/myapp_reload to validate /etc/myapp/config.yaml (e.g., ensure .port and .log_level exist) and th",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement per-tenant WAL streams with isolated io_uring queues and dedicated WAL directories; pin WAL I/O to the local NUMA node to minimize cross-NUMA access latency; leverage cgroupv2 IO throttling to prevent any sing…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Isolate replication and audit traffic to dedicated NICs/queues; enable mqprio on both NICs; tag replication/audit with net_cls and pin their threads to isolated CPUs; apply tc clsact for upstream/down",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question evaluates a candidate's ability to design production plans for multi-tenant I/O contention on fast storage, bridging kernel instrumentation with operational safety considerations.\n\n## Key Concepts\n- NVMe WAL contention and per-tenant isolation strategies\n- NUMA-aware I/O binding to minimize cross-node latency\n- cgroupv2 IO controls for tenant-level resource limiting\n- io_uring patterns for efficient asynchronous I/O\n- WAL directory strategy and partition layout\n- Observability tooling: iostat, blktrace, bpftrace, and perf\n\n## Implementation Approach\n\n### Phase 1: Per-Tenant WAL Isolation\n- Create dedicated WAL directories per tenant (e.g., `/nvme/wal/tenant-{id}/`)\n- Configure io_uring instances bound to specific tenant queues\n- Use `iosched` settings or multi-block device partitions to distribute load\n\n### Phase 2: NUMA-Aware Device Binding\n- Pin WAL I/O threads to the NUMA node owning the NVMe controller using `numactl` or `sched_setaffinity`\n- Map tenant queues to corresponding NVMe submission queues\n- Verify local vs. remote NUMA access using `numastat`\n\n### Phase 3: cgroupv2 IO Throttling\n- Configure `io.max` and `io.latency` c tenant\n- Setgroup settings per `rbps` (read bytes/sec) and `wbps` (write bytes/sec) limits\n- Monitor throttling events via `cgroup.events`\n\n### Phase 4: Observability Stack\n- **iostat**: Track per-device and per-partition utilization and queue depth\n- **blktrace**: Capture block layer events to identify contention patterns\n- **bpftrace**: Trace io_uring submissions and completions with latency histograms\n- **perf**: Profile kernel functions in the I/O path\n\n### Phase 5: Staged Load-Test with Rollback\n1. **Baseline**: Capture tail latency (p99/p999) with current configuration\n2. **Ramp**: Increase tenant traffic in 10% increments over 30-minute windows\n3. **Trigger**: Rollback if p999 latency exceeds 2x baseline for >60 seconds\n4. **Validation**: Confirm stable throughput after each stage",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-6",
+        "questionId": "q-29896",
+        "question": "On a Linux host with multiple tenants, implement per-tenant CPU and memory isolation using cgroups v2. Create a simple hierarchy, map each tenant to a slice, set CPU and memory limits, run a controlled stress test per tenant with stress-ng, and define a rollback plan if limits cause service timeouts?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Plan to diagnose I/O contention: assign per-tenant io_uring queues and cgroup v2 io.max limits; bind tenants to dedicated NUMA nodes; tune blk-mq with per-tenant weights; isolate page cache with zcach",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement per-tenant I/O isolation with a v2 cgroup: assign each tenant to /sys/fs/cgroup/tenantX and enforce io.max limits for read/write. Test with fio bursts; compare bfq vs mq-deadline tuning; con",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Mount cgroup2, create per-tenant slices (tenant1.slice, tenant2.slice), and run services in those slices via Slice=tenant1.slice. Apply limits: memory.max=2G and cpu.max=25000 100000 for 25% of a CPU.",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Isolate per-tenant metadata by giving each tenant its own subvolume/file system (ext4/XFS) with dir_index enabled and, if feasible, separate inode tables; tune inode density, raise fs.file-max and ino",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis tests practical container-less isolation using cgroups v2, a core sysadmin skill for multi-tenant hosts. It probes understanding of hierarchical slices, controller usage, and safe rollback.\n\n## Key Concepts\n- cgroups v2 hierarchy and memory/cpu controllers\n- systemd slices and resource accounting\n- non-destructive rollback and test planning\n\n## Code Example\n```bash\n# Example: mount and create slices (simplified)\nsudo mount -t cgroup2 none /sys/fs/cgroup\nsudo mkdir /sys/fs/cgroup/tenant1.slice\nsudo systemctl set-property --runtime tenant1.service Slice=tenant1.slice\n```\n\n## Follow-up Questions\n- How would you extend quotas to disk I/O?\n- How would you handle bursty traffic that exceeds quotas without dropping availability?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-7",
+        "questionId": "q-28251",
+        "question": "On a Linux host running a multi-tenant data ingestion service writing to a shared NVMe pool, tail I/O latency spikes during bursts due to IO scheduler contention on block layers. Design a production plan to diagnose and minimize tail latency while preserving throughput. Include: IO schedulers (mq-deadline, kyber, bfq), per-tenant QoS via cgroups or blk QoS, per-device virtualization (NVMe sharing, IO queues), driver tuning (nomerges, elevator hints), and a staged load-test with perf, iostat, and blktrace; rollback steps?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "A comprehensive plan to diagnose and minimize tail I/O latency in a multi-tenant Linux environment with a shared NVMe pool: **Diagnosis Phase:** Instrument the I/O path with blktrace, iostat, and perf to identify delays…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Isolate the WAL to a dedicated, high-performance device (e.g., NVMe SSD). Enable barrier=1 with data journaling (ext4) or barrier=0 with wunsafe semantics (xfs, requires storage battery backup) to protect durability. Us…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a systemd unit with Type=forking, PIDFile, and ExecStartPre that checks and clears a stale lock: if /var/lib/backup/backup.lock exists and its PID is not running, delete it. Stop uses KillMode=con",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Isolate tenants with per-tenant io_uring contexts or shard SQ/CQ; tailor SQ/CQ depths to burst profiles; pin worker threads to dedicated CPU rings; cap bandwidth with cgroup v2 io.max; align IRQs to t",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question tests the practical ability to diagnose I/O path bottlenecks in a multi-tenant environment and to select appropriate kernel features for workload isolation without sacrificing throughput.\n\n## Key Concepts\n\n- **I/O Schedulers:** mq-deadline, kyber, and bfq each offer distinct trade-offs between latency and throughput\n- **cgroup v2 per-tenant I/O QoS:** io.max provides hard limits and guaranteed bandwidth allocation\n- **NVMe multi-queue tuning:** Driver parameters like nomerges and elevator hints reduce submission path overhead\n- **Observability stack:** blktrace, iostat, and perf provide complementary views of block layer performance",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-8",
+        "questionId": "q-6103",
+        "question": "On a Linux host running mixed workloads (real-time audio path on NUMA node0 and analytics on node1), tail latency spikes occur due to cross-NUMA memory access and interconnect contention. Design a production plan to enforce strict NUMA locality and interconnect fairness: hardware topology checks, BIOS NUMA settings, kernel boot params (isolcpus, nohz_full), IRQ affinity, CPU/memory binding, cgroups v2 usage for CPU/membind, and a test plan with cyclictest and synthetic multi-channel load. What exact steps would you take and how would you verify?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Map tenants to watch budgets; instrument with /proc/fs/inotify metrics and synthetic burst tests. Enforce per-tenant limits: ulimit -n, inotify.max_user_watches, max_user_instances via per-tenant cgro",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Disable THP completely for the DB path, reserve dedicated hugepages, pin memory (memlock) via rlimits/mlockall, bind the process to specific NUMA nodes, and isolate it in its own cgroup. Verify p95 la",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a fair IO scheduler (BFQ or Kyber) for NVMe; cap per-tenant I/O with cgroup2 io.max/io.weight; pin each tenant to a dedicated CPU set and bind its memory to a NUMA node; tune min_free_kbytes and v",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Isolate the RT path on NUMA node0 and bind CPUs/memory tightly. Boot with isolcpus=0-7 nohz_full=0-7; route IRQ to node0; disable irqbalance. Put RT tasks in rt.slice with SCHED_FIFO 99. Bind with num",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nInterleaved workloads on multi-NUMA systems cause tail latency spikes in real-time paths. This question probes practical NUMA-aware isolation, IRQ routing, and disciplined binding under production pressures.\n\n## Key Concepts\n- NUMA locality and memory binding\n- IRQ affinity and interrupt steering\n- isolcpus and nohz_full for RT isolation\n- cgroups v2 for resource containment\n- scheduler choices (SCHED_FIFO) and real-time guarantees\n\n## Code Example\n```bash\n# Example bindings (illustrative)\n# Boot: isolcpus=0-7 nohz_full=0-7\n# Bind RT task:\nnumactl --physcpubind=0-7 --membind=0 -p <rt_pid>\n```\n\n## Follow-up Questions\n- How would you adapt if node0 has degraded memory bandwidth?\n- What instrumentation would you add to detect regression after kernel upgrades?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-9",
+        "questionId": "q-23904",
+        "question": "On a Linux host running multiple tenants in LXD containers, a single container performing a large file upload saturates the NIC and disk IO, causing latency for others. Design a beginner-friendly plan to isolate network and I/O using cgroups v2 and tc: assign per-tenant bandwidth caps and IO quotas, plus a simple test plan and rollback?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Choose a patching method (kpatch or KSPP-based) and limit live patch scope to the running kernel. Validate NVIDIA driver compatibility in a test build and module signing. Run a staged rollout with a h",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Diagnose using BPF programs tracing kmem:kmalloc and kmem:mm_page_alloc_extended_zone failures, combined with analysis of /proc/slabinfo and /proc/buddyinfo for fragmentation metrics. Apply SLUB tuning parameters: set s…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement per-tenant isolation by mapping each container to a cgroup v2 group. Apply a tc root qdisc with HTB to limit egress bandwidth per tenant (e.g., 2–5 Mbps). Use ionice to cap disk I/O per container and set appro…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement cgroups v2 with per-tenant slices, configure MemoryMax and MemorySwapMax for hard limits, set MemoryHigh for soft limits, pin tenants to dedicated CPUs, and configure io.max and cpu.max for fair resource distr…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests practical, beginner-friendly resource isolation in Linux containers with concrete, implementable steps.\n\n## Key Concepts\n- **cgroups v2**: Provides per-tenant resource isolation for CPU, memory, and I/O\n- **tc/qdisc HTB**: Hierarchical Token Bucket for bandwidth shaping on egress traffic\n- **ionice**: Sets disk I/O priority and throughput caps for container processes\n- **Test tools**: iperf3 for network bandwidth testing, fio for disk I/O benchmarking\n\n## Simple Implementation Plan\n\n### 1. Network Isolation\nCreate a tc HTB root qdisc on the host NIC, then add per-tenant classes with rate limits:\n```bash\n# Add root qdisc\ntc qdisc add dev eth0 root handle 1: htb default 10\n\n# Add per-tenant class (example for container with ID 1001)\ntc class add dev eth0 parent 1: classid 1:1001 htb rate 5mbit ceil 5mbit\n```\n\n### 2. Disk I/O Quotas\nUse ionice to constrain disk I/O for container processes:\n```bash\n# Apply I/O limits (class 3 = best effort, priority 7 = lowest)\nionice -c 3 -n 7 -p $(pgrep -f container_pid)\n```\n\n## Test Plan\n1. **Baseline**: Run iperf3 server in one container, measure throughput without limits\n2. **Apply limits**: Implement tc and ionice restrictions\n3. **Verify**: Re-run iperf3 and fio tests to confirm bandwidth and I/O are capped\n4. **Latency check**: Ping other containers to verify latency remains acceptable under load\n\n## Rollback Procedure\n```bash\n# Remove tc rules\nexp ip link delete dev eth0\n\n# Restore full I/O priority for affected containers\nionice -c 0 -n 0 -p $(pgrep -f container_pid)\n```\n\nThis approach provides immediate, reversible isolation with minimal complexity for beginners.",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-10",
+        "questionId": "q-27441",
+        "question": "On a Linux host running a multi-tenant streaming service with a single 100 GbE NIC, tail latency spikes during bursts due to queue contention and XDP overhead. Design a production plan to reduce packet loss and tail latency while preserving peak throughput. Include per-tenant QoS (cgroups/v2, tc), XDP/BPF load balancing with per-tenant queues, IRQ affinity, NUMA awareness, and staged load tests with rollback?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Baseline: quantify per-tenant eBPF overhead and tail latency. Implement per-tenant maps with tenant_id keys and fixed max_entries to bound memory. Pin BPF programs to CPUs; avoid heavy per-event work.",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Configure per-tenant I/O weight using cgroups v2 slices (e.g., tenantA: io.weight=1000, tenantB: io.weight=2000). Monitor with iostat -dx 1, pidstat -d 1, and iotop to observe latency improvements during write bursts. R…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Configure per-tenant memory limits using cgroup v2 (memory.high for soft limits, memory.max for hard limits), and pin tenants to isolated CPU cores via cgroup v2 cpu.max or taskset. Disable transparent hugepages (THP) s…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Diagnose contention points using perf and bpftrace. Implement per-tenant tc queues with HTB for bandwidth allocation and fq_codel for flow pacing. Redirect packets to per-tenant receive rings via XDP_REDIRECT, leveragin…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Question Is Asked\nThis question evaluates practical skills in diagnosing and resolving tail latency issues in a multi-tenant Linux environment constrained by shared hardware resources (single NIC, XDP processing overhead). It tests expertise in performance instrumentation, QoS architecture, and safe deployment practices.\n\n## Key Concepts\n- **Per-tenant QoS**: cgroups v2 for resource isolation combined with tc (HTB, fq_codel) for bandwidth shaping and flow scheduling\n- **XDP/BPF load balancing**: Kernel-bypass packet processing with per-tenant queue isolation to eliminate contention\n- **Hardware affinity**: IRQ pinning and NUMA-aware CPU/memory topology to reduce latency introduced by cross-socket communication\n- **Staged testing**: Incremental load validation with defined rollback criteria ensures safe production deployment\n\n## Code Example\n```c\nstruct bpf_map_def SEC(\"maps\") tenant_queue_map = {\n    .type = BPF_MAP_TYPE_HASH,\n    .key_size = sizeof(__u32),\n    .value_size = sizeof(struct tenant_queue),\n    .max_entries = 1024,\n};\n\nstruct tenant_queue {\n    __u32 rx_packets;\n    __u32 rx_drops;\n    __u64 last_tstamp;\n};\n\nSEC(\"xdp\") int redirect_per_tenant(struct xdp_md *ctx) {\n    void *data = (void *)(long)ctx->data;\n    void *data_end = (void *)(long)ctx->data_end;\n    struct ethhdr *eth = data;\n    \n    if (data + sizeof(*eth) > data_end)\n        return XDP_PASS;\n    \n    __u32 tenant_id = get_tenant_id(eth);\n    struct tenant_queue *q = bpf_map_lookup_elem(&tenant_queue_map, &tenant_id);\n    \n    if (q)\n        q->rx_packets++;\n    \n    return XDP_REDIRECT;\n}\n```",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-11",
+        "questionId": "q-19616",
+        "question": "On a Linux host running multiple LXC containers sharing a single HDD, tenants burst-write to /mnt/data causing 1–2s I/O latency during peak. Design a beginner-friendly plan to diagnose and mitigate IO contention without modifying tenant apps. Include lightweight monitoring (iostat, pidstat, iotop), a simple per-tenant IO isolation using cgroups v2 io.weight (fallback: CFQ/blkio), a test rollout plan, and rollback steps?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use nfsiostat and perf plus eBPF to trace stall sources and confirm if NFS lease contention or server I/O is the culprit. Mitigations: split into per-tenant subexports to isolate locks; upgrade to NFS",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Partition CPU resources using CGroups v2: allocate cores 0-3 for data ingestion and cores 4-5 for alerting; configure alerting within a dedicated systemd.slice with CPUAffinity=4-5 and CPUQuota=60%; execute alerting wit…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "To reduce container startup latency while preserving tenant isolation, implement the following staged approach: **1. Pre-provision per-tenant resources at tenant setup time** Create namespace and cgroup hierarchies duri…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Configure per-tenant I/O weight using cgroups v2 slices (e.g., tenantA: io.weight=1000, tenantB: io.weight=2000). Monitor with iostat -dx 1, pidstat -d 1, and iotop to observe latency improvements during write bursts. R…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question assesses practical I/O contention diagnosis and safe tenant isolation using standard Linux tooling and cgroup controls within a real-world, low-risk rollout scenario.\n\n## Key Concepts\n\n- I/O scheduling and measurement (iostat, iotop, pidstat)\n- Per-tenant isolation via cgroups v2 io.weight (fallback: blkio cgroups)\n- Canary rollout and rollback planning\n\n## Code Example\n\n```bash\n# Create per-tenant I/O group\nmkdir -p /sys/fs/cgroup/io/tenantA\n\n# Set I/O weight (100-10000, higher = more bandwidth)\necho 1000 > /sys/fs/cgroup/io/tenantA/io.weight\n\n# Add tenant PID to the group\necho $TENANT_PID > /sys/fs/cgroup/io/tenantA/cgroup.procs\n\n# Verify the configuration\ncat /sys/fs/cgroup/io/tenantA/io.weight\n```",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-12",
+        "questionId": "q-26875",
+        "question": "On a Linux host with multi-tenant workloads contending on a shared NVMe backend, latency spikes to 150–350 ms during burst I/O. Provide a production plan to diagnose and reduce I/O latency while preserving tenant isolation: specify kernel/FS tunables, I/O scheduler choices, per-tenant QoS with cgroups v2, PCIe/NUMA affinities, and a staged test/rollback plan with measurable SLAs?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Plan: Isolate tenants to dedicated storage layers (separate LUNs or datasets) to eliminate shared pool contention. Implement cgroup v2 io.max to cap per-tenant I/O throughput, and pin tenant buffers to their respective…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Configure per-tenant IO QoS using cgroups v2 blkio and per-tenant quotas, assign dedicated NVMe queues, set io.scheduler to bfq or deadline, enable io_uring for async IO, tune vm.dirty_bytes and vm.di",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Patch kernel live with Kpatch/KSPP. Build patch, deploy to 1 canary host, run representative load for 2–4 hours, monitor PMU counters, dmesg, and latency; if clean, expand to 25%, then full fleet with",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement per-tenant CPU isolation using cgroups v2 on your Linux host with these steps. **1. Verify cgroups v2** Check that cgroups v2 is active: ``` cat /sys/fs/cgroup/cgroup.controllers ``` **2. Create slice hierarch…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question tests practical I/O isolation, QoS, and safe tuning under multi-tenant workloads in production.\n\n## Key Concepts\n\n- per-tenant IO QoS using cgroups v2 blkio and per-tenant quotas\n- I/O schedulers and device queue tuning\n- NUMA affinity and PCIe queueing\n- Observability: iostat, blktrace, perf\n\n## Code Example\n\n```bash\n# Example validation commands\nlsblk\niostat -xd 1\n```\n\n## Follow-up Questions\n\n- How would you detect if a change impacts one tenant more than others?\n- What rollback criteria would you implement if SLA violations occur?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-13",
+        "questionId": "q-9017",
+        "question": "On a Linux host running a multi-tenant build server, six tenants/teams run parallel builds that write artifacts into a shared /builds directory on a single HDD. When bursts occur, builds pause briefly due to inode pressure and metadata churn. Design a beginner-friendly plan to diagnose and mitigate this bottleneck without changing build scripts. Include isolation strategy, simple quotas, and a test/rollback plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Isolate the WAL to a dedicated, high-performance device (e.g., NVMe SSD). Enable barrier=1 with data journaling (ext4) or barrier=0 with wunsafe semantics (xfs, requires storage battery backup) to protect durability. Us…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement per-tenant L3 cache partitions with CAT, enable MBM to cap per-tenant bandwidth, pin workers to NUMA-affinitized CPUs, set IRQ affinity, measure with perf, pmu, turbostat, and mem bandwidth;",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Isolate tenants by creating per-tenant subdirectories under /builds, check inode usage with df -i, and implement simple quotas (per-tenant inode and block limits). Use iotop and iostat to observe duri",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "A strong answer notes per-tenant CPU pinning via cpuset, strict cgroup v2 quotas, and NUMA-aware memory policies; tunes sched_latency_ns and sched_min_granularity_ns to the worst-case deadline across tenants; sets CPUfr…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis tests practical diagnosis of inode pressure and metadata churn in a real multi-tenant build habitat, plus beginner-friendly mitigation.\n\n## Key Concepts\n- Inodes and directory metadata\n- Per-tenant isolation and simple quotas\n- Basic tooling: df -i, iostat, iotop\n\n## Code Example\n```javascript\n// Diagnostic checklist (pseudo-shell in JS notation)\nconst steps = [\n  'df -i /builds',\n  'find /builds -mindepth 2 -type d | wc -l',\n  'iostat -dx 1',\n  'iotop -oa',\n  'setup-quotas --per-tenant /builds',\n];\n```\n\n## Follow-up Questions\n- What if the FS doesn't support quotas; alternatives?\n- How would you validate rollback after quota changes?\n- What long-term strategies balance performance and isolation?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-14",
+        "questionId": "q-14154",
+        "question": "On a Linux host running a multi-tenant ML inference service, with a shared pool of NVMe SSDs, tail latency spikes occur under load due to storage contention. Design a production plan to guarantee per-tenant I/O isolation and predictable inference latency: include storage topology, cgroup v2 I/O controllers (io.max/io.weight), per-tenant CPU/NUMA binding, IRQ affinity, block-layer scheduler choice, and observability/tests (iostat, blktrace, fio). Describe exact steps and rollback?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Isolate tenants with memory.max and memory.high in a cgroup v2, pin processes to NUMA nodes, tune vfs_cache_pressure and min_free_kbytes, set per-tenant IO priorities with BFQ/Deadline, and hint page",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Pin each tenant to a dedicated NUMA node and CPU set. Create per-tenant cgroups v2 with io.max to cap bandwidth and IOPS. Use the NVMe path with mq-deadline and bind each tenant’s I/O to its cgroup. S",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Isolate latency-sensitive tenants to dedicated CPUs using nohz_full and isolcpus, pin workloads with taskset, keep background services on the rest; disable Turbo, set performance governor, and tune th",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement per-tenant user, mount, pid, and network namespaces; mount a private root via a read-only bind of a tenant base plus an overlay for writable state. Drop capabilities, enable seccomp-bpf, and",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests practical ability to enforce storage QoS in multi-tenant workloads, balancing throughput with tail latency guarantees. It probes knowledge of cgroup v2 I/O controllers, NUMA/topology, and block-layer tuning.\n\n## Key Concepts\n- Per-tenant cgroup v2 I/O limits (io.max/io.weight)\n- NUMA binding and CPU affinity for isolation\n- IRQ affinity and per-device RQ binding\n- Block-layer scheduler choice (mq-deadline) for predictable latency\n- Storage topology and tiering (hot NVMe vs colder pools)\n- Observability (iostat, blktrace) and synthetic testing (fio tail latency)\n\n## Code Example\n```bash\n# create per-tenant cgroup and apply io.max (example values)\nmkdir -p /sys/fs/cgroup/tenant-A\necho \"10485760 10\" > /sys/fs/cgroup/tenant-A/io.max\n# assign a process to the tenant-A group (replace <pid>)\necho <pid> > /sys/fs/cgroup/tenant-A/cgroup.procs\n```\n\n## Follow-up Questions\n- How would you measure success metrics and determine if latency targets are met?\n- What rollback steps would you implement if p99 latency degrades after deployment?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-15",
+        "questionId": "q-1954",
+        "question": "On a Linux host running three CI runners as systemd services sharing a single NVMe and a 10 Gb NIC, a long-running build on one runner starves CPU and I/O, delaying others. Propose a production plan to guarantee fair CPU and I/O while preserving peak throughput: (a) per-service CPU limits via cgroup v2 and CPU affinity; (b) per-service I/O throttling with io.max and a suitable I/O scheduler (BFQ/mq-deadline); (c) CPU pinning and IRQ isolation; (d) validation with bursts and latency metrics?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Per-tenant cgroups v2 slices: create slices tenantA and tenantB, set cpu.max to cap CPU time and io.weight to limit disk I/O, and run a lightweight watcher (Python) logging per-tenant usage every 5s w",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Plan using cgroup v2: create ci.slice with per-service sub-slices (ci-runner-A/B/C). Assign cpu.max and io.max per service; pin CPUs via cpuset and set IRQ affinity. Use BFQ for per-service I/O schedu",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Propose isolating tenants with cgroup v2, pinning CPU and memory resources, and comparing ext4 (with dir_index) vs XFS metadata performance under mixed workloads. Tune directory indexing and inode/dentry cache parameter…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Production plan to guarantee deterministic timekeeping and per-tenant deadline isolation on a Linux single-node control plane: Configure stable clocksource (prefer invariant TSC, fallback to HPET), implement PTP for pre…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests practical mastery of isolating CPU and I/O in a multi-tenant CI environment under hardware contention, a common production challenge.\n\n## Key Concepts\n- cgroup v2: cpu and io controllers for per-service quotas.\n- systemd slices: grouping services under a parent for unified controls.\n- CPU affinity and cpuset: bind runners to dedicated CPUs.\n- I/O schedulers: BFQ or mq-deadline for per-service throttling.\n- Observability: latency, throughput, tail latency, and backlog.\n\n## Code Example\n```javascript\n# Systemd override example (pseudo)\n[Slice]\nCPUAccounting=true\n\n[Service]\nSlice=ci.slice\nCPUQuota=33%\n```\n```javascript\n# cgroup v2 quota (pseudo)\necho 0.33 > /sys/fs/cgroup/ci.slice/ci-runner-A/cpu.max\n```\n\n## Follow-up Questions\n- How would you monitor and adapt quotas during a bursty workload?\n- What rollback strategy would you use if a quota regresses build reliability?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-16",
+        "questionId": "q-7827",
+        "question": "On a Linux host serving a multi-tenant S3-compatible gateway fronting a local object store, bursts from a single tenant cause long tail I/O latency for others. Design a production plan to guarantee per-tenant IO isolation and preserve throughput: hardware topology, NUMA binding for IO workers, per-tenant cgroup v2 io.max, IO scheduler tuning (BFQ or Kyber), per-tenant cache sizing, and a test/rollback plan using synthetic tenants with burst workloads and latency targets?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement per-tenant CPU limits with systemd slices. For each container, create tenantX.slice and apply CPUQuota=20000 CPUQuotaPeriodUS=100000 to cap at 20% per CPU. Add a monitor that watches systemd",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement per-tenant QoS with cgroups v2: create tenant.slice and assign io.max quotas (bandwidth and IOPS); pin IO workers to fixed CPUs and NUMA nodes; use BFQ (or Kyber) as the IO scheduler; isolat",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use per-tenant user namespaces with unique IDs, enforce Landlock policies tuned per tenant, and precompute/seccomp filters. Assign tenants to their own cgroup paths (cpu,memory,io) under a shared root",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Pin each tenant to dedicated CPU cores and map NIC RX queues to those cores; disable irqbalance; configure per-IRQ affinity, and tune RPS/RFS so flows steer to the tenant’s CPUs; preserve memory isola",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nGauges ability to design IO isolation in multi-tenant Linux storage hosts.\n\n## Key Concepts\n- per-tenant cgroups v2 io.max quotas for bandwidth/IOPS\n- IO schedulers (BFQ or Kyber) for fairness under bursts\n- NUMA-bound IO workers and CPU affinity\n- per-tenant caching and data tiering to prevent cache leakage\n- observability, test plan, and safe rollback strategy\n\n## Code Example\n```javascript\n# Conceptual example: apply per-tenant IO quotas (pseudo)\n# mkdir /sys/fs/cgroup/tenant-a\n# echo 'read_bps=1048576;write_bps=1048576' > /sys/fs/cgroup/tenant-a/io.max\n```\n\n## Follow-up Questions\n- How would you adapt quotas for NVMe-oF or remote storage?\n- What failure modes if a tenant ignores quotas and overwhelms the pool?\n- How would you monitor fairness and automatically adjust quotas over time?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-17",
+        "questionId": "q-4151",
+        "question": "On a Linux host running a high-fidelity trading UI service that must meet a 5 ms end-to-end latency SLA under mixed workloads, design a production plan to guarantee deterministic latency for the critical path. Specify hardware topology (NUMA, CPU pinning), kernel params (isolcpus, nohz_full, rcu_nocb), per-group scheduling using SCHED_DEADLINE with deadlines, IRQ affinity, cgroups v2 (rt.slice) and memory bindings, plus a test plan using cyclictest and a synthetic tick workload. What exact steps would you take and how would you verify?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use cgroup v2 IO throttling to cap per-container I/O. Baseline with iostat -dx 1, iotop, pidstat to identify the offender. Apply per-container io.max (and optional io.weight) in its cgroup or systemd.",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement per-tenant latency tracing with eBPF: attach to sched_switch and key events, map samples to tenants via cgroup v2 paths; accumulate p95/p99 latency in a BPF map keyed by tenant ID; keep overhead under 2% CPU a…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Partition NUMA node 0 for the critical path; pin the UI worker to CPUs 0–3; boot with isolcpus=0-3, nohz_full=0-3, rcu_nocb; use SCHED_DEADLINE on rt.slice with period=5ms, runtime=4ms, slack=1ms; bin",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Isolate the critical I/O on dedicated CPUs and NVMe channel. Bind ingest threads to rt cpus via cpuset; boot with isolcpus,nohz_full; pin NVMe IRQs to those CPUs; use cgroup v2 io.max to cap tenants a",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis probes real-time scheduling, NUMA binding, and cgroup isolation under mixed workloads, focusing on concrete tunables rather than theory.\n\n## Key Concepts\n- NUMA-aware CPU/memory binding\n- Kernel boot knobs: isolcpus, nohz_full, rcu_nocb\n- SCHED_DEADLINE configuration per group\n- Cgroups v2 rt.slice and memory bindings\n- IRQ affinity and memory locking considerations\n\n## Code Example\n```javascript\nconst sched = {\n  policy: 'SCHED_DEADLINE',\n  periodNs: 5000000,\n  runtimeNs: 4000000,\n  deadlineNs: 5000000\n};\n```\n\n## Follow-up Questions\n- How would you monitor for deadline misses in production?\n- What would you adjust if a single non-critical process causes cache pressure?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-18",
+        "questionId": "q-2573",
+        "question": "On a Linux host running a real-time audio processing pipeline that must meet deterministic latency, a single 8-core CPU shows occasional dropouts during peak input. Design a production plan to guarantee latency isolation for the critical path: specify hardware topology, kernel boot params (isolcpus, nohz_full), IRQ affinity, CPU sets, cgroups v2 with a dedicated rt.slice using SCHED_FIFO priorities, memory locking, and a test plan with cyclictest and a synthetic workload simulating 16-channel 192 kHz audio. What exact steps would you take and how would you verify?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a cgroups v2 unified hierarchy, create per-tenant slices, and set memory.max caps (e.g., 1G) with memory.high for bursts. Bind each tenant's containers to its slice via --cgroup-parent. Add",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Begin by mapping log paths and selecting a backend (journald vs rsyslog). Enable persistent log storage on a dedicated partition; tune journald: Storage=persistent, SystemMaxUse, RateLimitBurst; or co",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Configure the system with dedicated CPU isolation: boot with `isolcpus=4-7 nohz_full=4-7`, disable irqbalance service and pin network/controller IRQs to CPUs 0-3. Create a dedicated `rt.slice` cgroup v2 slice, assign re…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement a live kernel patch using kpatch or livepatch modules; verify ABI compatibility against the running kernel; execute a canary deployment on a spare host, migrate tenants using cpuset/v2 isolation with fixed IRQ…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question evaluates practical expertise in real-time Linux systems engineering, specifically CPU isolation, interrupt management, and deterministic scheduling under load. It assesses a candidate's ability to design hardware topology-aware solutions that guarantee audio processing latency requirements.\n\n## Key Concepts\n- CPU isolation with isolcpus and nohz_full for deterministic execution\n- IRQ affinity management and irqbalance service control\n- cgroups v2 hierarchy with dedicated real-time slices\n- SCHED_FIFO real-time scheduler with priority management\n- Memory locking strategies for preventing cache misses and swapping\n- Performance validation using cyclictest and synthetic workloads\n\n## Code Example\n```bash\n# GRUB configuration for CPU isolation\nGRUB_CMDLINE_LINUX=\"isolcpus=4-7 nohz_full=4-7\"\n\n# Systemd rt.slice configuration\n[Slice]\nCPUQuota=100%\nCPUAffinity=4 5 6 7\nMemoryAccounting=yes\nMemoryLimit=infinity\n\n# Real-time service configuration\n[Service]\nSlice=rt.slice\nCPUSchedulingPolicy=fifo\nCPUSchedulingPriority=99\nLimitMEMLOCK=infinity\n```",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-19",
+        "questionId": "q-14198",
+        "question": "On a Linux host that runs a multi-tenant CI cache, the system clock occasionally jumps backwards by 1-2 seconds under peak I/O, breaking time-based eviction and flaky builds. Create a beginner-friendly diagnostic plan to identify and fix time synchronization without touching tenant applications. Include checks for chrony/NTP, kernel timekeeping (clocksource), and a rollback strategy?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Map tenants to distinct PCIe devices and IOMMU groups; pin transcoding processes to dedicated NUMA nodes and assign each tenant its own device affinity. Enforce per-tenant I/O quotas (io.max) and cont",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Create per-tenant scopes: tenant-foo.scope and tenant-bar.scope; assign CPUQuota=50% and MemoryLimit=1024M, and BlockIOWeight=500 as a starting point. Use cgroup v2 with systemd. Add a simple monitori",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Plan: confirm a time sync service is active (chrony or systemd-timesyncd), verify drift with chronyc tracking and sources, ensure NTP servers are reachable, then resync and revalidate. Inspect current",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Develop a low-overhead eBPF tracing plan to profile container lifecycle events (namespace creation, cgroup setup, mounts, network namespace) during startup bursts. Tag events with per-tenant identifie",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis tests practical time-sync troubleshooting in a multi-tenant context where clock drift hurts caches and logs.\n\n## Key Concepts\n- Time synchronization with chrony/systemd-timesyncd\n- Clock source stability (TSCT/HPET) vs TSC\n- Reproducible rollback of config changes\n\n## Code Example\n```javascript\n# example commands (bash)\nsystemctl is-active chronyd\nchronyc tracking\nchronyc sources\ncat /sys/devices/system/clocksource/clocksource0/current_clocksource\nsudo chronyc makestep\n```\n\n## Follow-up Questions\n- How would you automate drift monitoring across tenants?\n- How do you validate rollback safety during a maintenance window?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-20",
+        "questionId": "q-12563",
+        "question": "On a Linux host running multiple tenants with a shared /tmp backed by tmpfs, bursts of short jobs trigger heavy paging and swap thrash, impacting latency. Propose a beginner-friendly, production-ready plan to diagnose and mitigate paging pressure without altering tenant apps. Include monitoring steps, lightweight memory isolation (per-tenant cgroups), kernel tunables (swappiness), and a rollback procedure?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Run vmstat 1 and free -m to confirm paging. If paging is high, apply basic controls: 1) set vm.swappiness=10; 2) enable zram swap (2GB); 3) create per-tenant memory limits via cgroups; 4) mount /tmp a",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use systemd-analyze to identify boot bottlenecks and map the critical chain, enable parallel startup and socket-activation for essential units, isolate the SLA-critical service with a dedicated cpuset and systemd v2 cgr…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Isolate tenants with per-tenant io_uring contexts or shard SQ/CQ; tailor SQ/CQ depths to burst profiles; pin worker threads to dedicated CPU rings; cap bandwidth with cgroup v2 io.max; align IRQs to t",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Mount cgroup2, create per-tenant slices (tenant1.slice, tenant2.slice), and run services in those slices via Slice=tenant1.slice. Apply limits: memory.max=2G and cpu.max=25000 100000 for 25% of a CPU.",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\\n\\nTests fundamental root-cause analysis and safe, incremental mitigation for shared resources.\\n\\n## Key Concepts\\n- Paging and swap pressure monitoring\\n- Lightweight memory isolation (cgroups/systemd slices)\\n- Kernel tuning (swappiness) and temporary swap devices\\n- Safe rollback and validation\\n\\n## Code Example\\n```bash\\n# measure paging\\nvmstat 1 60\\nfree -m\\n```\\n\\n## Follow-up Questions\\n- How would you scale the solution for dozens of tenants?\\n- What are risks of enabling zram in production and how would you mitigate them?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "linux-foundation-sysadmin-q-21",
+        "questionId": "q-6463",
+        "question": "On a Linux host running a multi-tenant data-processing cluster with containers pinned to NUMA nodes, peak load causes latency spikes due to memory locality. Design a production plan to diagnose and fix NUMA-related bottlenecks while preserving tenant isolation. Include topology validation (lscpu, lstopo), per-tenant binding (cpuset, memory.high), memory interleaving vs per-node binding strategy, kernel settings (numa_balancing, numactl bias), and a test/rollback plan with SLA targets and controlled rollout?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Plan: verify NUMA topology with lscpu/lstopo, identify hot memory regions and tenant-node mapping, then enforce cpuset-based CPU affinity and per-tenant memory.high with cgroup v2. Prefer node-local allocation for laten…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Plan: Isolate tenants to dedicated storage layers (separate LUNs or datasets) to eliminate shared pool contention. Implement cgroup v2 io.max to cap per-tenant I/O throughput, and pin tenant buffers to their respective…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Enable key-based auth, disable password logins and root login, restrict SSH by IP or AllowUsers, and ensure emergency console access. Use sshd_config: PasswordAuthentication no; PermitRootLogin no; Pu",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Disable THP completely for the DB path, reserve dedicated hugepages, pin memory (memlock) via rlimits/mlockall, bind the process to specific NUMA nodes, and isolate it in its own cgroup. Verify p95 la",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nExplores NUMA awareness, container isolation, and dynamic reconfiguration in production, highlighting practical trade-offs and rollback safety.\n\n## Key Concepts\n\n- NUMA topology, memory locality, and cross-node access costs\n- cpuset and cgroups v2 memory controllers (memory.high, memory.min)\n- Per-tenant binding strategies: node-local vs interleaved allocations\n- numactl/libnuma for biased allocations; topology discovery with lscpu, lstopo\n- Instrumentation: latency/throughput metrics (p95, tail latency), perf tools, synthetic workloads\n\n## Code Example\n\n```bash\n# Bind a",
         "difficulty": "advanced"
       },
       {
         "id": "linux-foundation-sysadmin-q-22",
-        "questionId": "q-5725",
-        "question": "On a Linux host running a multi-tenant streaming ingest service (shared NVMe pool), sporadic 1–2s pauses occur under bursts. Design a production plan to diagnose and mitigate using eBPF-based observability and per-tenant I/O throttling. Specify: probes (tracepoints/kprobes), metrics (per-tenant latency, stall duration, queue depth), tenancy mapping (cgroup v2 io, io.max), dashboards, and a safe rollback strategy. Include a test script using fio and cyclictest to validate latency isolation?",
+        "questionId": "q-11630",
+        "question": "On a Linux host running a multi-tenant streaming analytics pipeline that uses io_uring for asynchronous file I/O to a single NVMe pool, tail latency spikes under micro-bursts due to per-tenant starvation in submission/completion queues. Design a production plan to diagnose and reduce tail latency while preserving throughput. Include per-tenant io_uring rings, submission/completion ring sizing, I/O bandwidth quotas, filesystem considerations, observability, and a staged test/rollback plan with realistic micro-bursts?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Plan: validate patch in CI against prod-like workloads; deploy to a canary group (5%), run automated smoke and latency tests for several hours; then roll to 20%, 50%, and 100%. Monitor patch state, SL",
+            "text": "Use systemd ExecReload to send SIGHUP to the daemon and a small validator script. Create /usr/local/bin/myapp_reload to validate /etc/myapp/config.yaml (e.g., ensure .port and .log_level exist) and th",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement per-tenant user, mount, pid, and network namespaces; mount a private root via a read-only bind of a tenant base plus an overlay for writable state. Drop capabilities, enable seccomp-bpf, and",
+            "text": "Plan to diagnose and mitigate file descriptor pressure: 1. **Diagnose**: Use `lsof` or `/proc/<pid>/fd` to identify which tenants are hitting FD limits. Monitor with inotify-watch or simple `ls /proc/<pid>/fd | wc -l` s…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Plan uses eBPF: attach probes to blk_start_request, blk_mq_request_issue, and iowait; tag events by cgroup v2 tenant IDs; emit per-tenant latency, stall duration, and queue depth to Prometheus. Enforc",
-            "isCorrect": true
+            "text": "Use an HTB-based qdisc on the host's outbound interface. Create per-tenant classes (e.g., 1:10, 1:20, 1:30) under a root qdisc, then map each container's IP address to its corresponding class using tc filters. Configure…",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Baseline IO metrics with iostat and iotop. Move /var/log to its own partition on a dedicated disk with ext4, noatime. Tighten logrotate: smaller max size, more frequent rotations. Enable rsyslog/journ",
-            "isCorrect": false
+            "text": "Implement per-tenant io_uring rings with isolated submission/completion queues, bound to tenant cgroups v2 IO limits, and fixed ring sizes to prevent starvation. Enforce per-tenant bandwidth quotas on",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical use of intrusive observability (eBPF) and real I/O isolation in a multi-tenant setting, plus a rollback strategy.\n\n## Key Concepts\n- eBPF tracing (tracepoints/kprobes) for block layer I/O\n- Per-tenant mapping via cgroup v2 identifiers\n- IO throttling with io.max and optional BPF-based throttling\n- Metrics pipeline to Prometheus/Grafana\n- Safe rollback and minimal overhead\n\n## Code Example\n```c\n// pseudo eBPF sketch (conceptual)\nstruct bpf_map_def SEC(\"maps\") tenant_latency = {\n  .type = BPF_MAP_TYPE_HASH,\n  .key_size = sizeof(u32),\n  .value_size = sizeof(struct metrics),\n  .max_entries = 1024,\n};\n```\n\n## Follow-up Questions\n- How would you adapt quotas for tenants with bursty workloads?\n- How do you quantify eBPF overhead and ensure it remains under control?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nAssesses practical mastery of io_uring in multi-tenant settings, including isolation, QoS, and observability under bursty workloads. It probes the ability to translate theory into a concrete production plan with testing and rollback.\n\n## Key Concepts\n\n- io_uring architecture: SQ/CQ rings, submission/completion paths\n- Per-tenant isolation: separate rings, cgroups v2 io.max\n- Bandwidth QoS on NVMe and IRQ isolation\n- Observability: latency percentiles, CQ occupancy, queue depth, IRQ counts\n- Validation: realistic micro-bursts with fio; staged rollouts\n\n## Code Example\n\n```bash\n# Example: create per-tenant IO cgroup and limit throughput\nsudo mkdir -p /sys/fs/cgroup/io/tenant01\necho \"8:0 50M\" > /sys/fs/cgroup/io/tenant01/io.max\n```\n\n## Follow-up Questions\n\n- How would you adapt if multiple NVMe namespaces are shared across tenants?\n- What changes if tenant workloads skew toward metadata vs. streaming data?",
+        "difficulty": "advanced"
       },
       {
         "id": "linux-foundation-sysadmin-q-23",
-        "questionId": "q-27758",
-        "question": "On a Linux host hosting logs for multiple tenants under /var/log/tenants, bursts cause log files to balloon, risking disk pressure and IO slowdown for others. Design a beginner-friendly plan to implement per-tenant log rotation that caps sizes, preserves history, and requires no app changes. Include configuration templates, a test scenario, rollback steps, and validation?",
+        "questionId": "q-15318",
+        "question": "On a Linux host running a multi-tenant batch processing platform with NUMA nodes and Intel CAT/RDT-enabled caches, tail latency spikes under peak load due to cache contention. Design a production plan to diagnose and eliminate cross-tenant cache contention while preserving throughput. Include per-tenant cache allocation (CAT), memory bandwidth control (MBM), NUMA pinning, IRQ affinity, observability with perf/pmu/turbostat, and a staged load-test with rollback?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use XDP with a per-tenant BPF map keyed by tenant_id to maintain counters and enforce rate via a token-bucket limiter. Attach an XDP program to the primary NIC to tag packets and steer excess traffic",
+            "text": "Implement per-tenant latency tracing with eBPF: attach to sched_switch and key events, map samples to tenants via cgroup v2 paths; accumulate p95/p99 latency in a BPF map keyed by tenant ID; keep overhead under 2% CPU a…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Plan: isolate backups to a dedicated block device pool and throttle with cgroups v2 io.max; pin backup tasks to a reserved CPU set and use a fixed I/O scheduler (deadline); separate WAL archiving path",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement per-tenant logrotation: place a separate file in /etc/logrotate.d/tenants-<tenant> for each tenant, with maxsize=100M, rotate 7, compress and delaycompress, missingok, notifempty, create. Ru",
+            "text": "Implement per-tenant L3 cache partitions with CAT, enable MBM to cap per-tenant bandwidth, pin workers to NUMA-affinitized CPUs, set IRQ affinity, measure with perf, pmu, turbostat, and mem bandwidth;",
             "isCorrect": true
           },
           {
+            "id": "c",
+            "text": "Check current limits (fs.inotify.max_user_watches, max_user_instances) and count watches per pid via /proc/*/fd, reproducing with a large repo. If exhausted, raise limits (sysctl -w fs.inotify.max_use",
+            "isCorrect": false
+          },
+          {
             "id": "d",
-            "text": "Enable XFS project quotas and map each tenant to a project ID; create per-tenant subdirectories under /data and assign them to their projects with xfs_quota. Set per-project inode/block limits. Use bf",
+            "text": "Plan to diagnose I/O contention: assign per-tenant io_uring queues and cgroup v2 io.max limits; bind tenants to dedicated NUMA nodes; tune blk-mq with per-tenant weights; isolate page cache with zcach",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question probes practical log management in multi-tenant Linux environments, teaching the candidate to implement isolation without touching apps, and to plan testing and rollback.\n\n## Key Concepts\n- Per-tenant log management\n- logrotate configuration and scheduling\n- Disk space and inodes\n- Safe rollout and rollback\n- Non-disruptive testing\n\n## Code Example\n```javascript\n// logrotate snippet example\n/var/log/tenants/*/*.log {\n  weekly\n  rotate 7\n  compress\n  delaycompress\n  missingok\n  notifempty\n  maxsize 100M\n  create\n}\n```\n\n## Follow-up Questions\n- How would you monitor per-tenant disk usage and alert on thresholds?\n- How would you handle a tenant writing logs into a shared file vs separate per-tenant files?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\n\nTail latency due to cache contention is a realistic production risk in multi-tenant Linux hosts. This question probes understanding of hardware cache partitioning (CAT), memory bandwidth control (MBM), NUMA awareness, IRQ affinity, and deep observability to diagnose and mitigate contention without sacrificing throughput.\n\n## Key Concepts\n\n- Intel RDT: CAT and MBM for cross-tenant cache and bandwidth control\n- NUMA pinning and CPU affinity for locality\n- IRQ affinity and cache locality considerations\n- Observability: perf, pmu, turbostat, numastat, LLC occupancy\n- Safe rollout: staged load tests with rollback criteria\n\n## Code Example\n\n```bash\n# Example: create resctrl group and allocate L3 cache to tenantA (illustrative)\nsudo mkdir -p /sys/fs/resctrl/schemata/tenantA\nsudo bash -lc 'echo \"L3:0-3\" > /sys/fs/resctrl/schemata/tenantA'\n# Bind processes to CPUs 0-3 for tenantA\nsudo taskset -pc 0-3 <pid>\n```\n\n## Follow-up Questions\n\n- How would you verify no regressions under mixed workloads after rollout?\n- What trade-offs exist between strict CAT partitioning vs dynamic reallocation in response to load spikes?",
+        "difficulty": "advanced"
       },
       {
         "id": "linux-foundation-sysadmin-q-24",
-        "questionId": "q-15161",
-        "question": "On a Linux host running a multi-tenant HPC-style analytics cluster with shared hugepages and kata-containers, tail latency spikes occur during weekly batch windows due to THP fragmentation and NUMA page distribution. Design a production plan to diagnose and eliminate THP-induced latency while preserving throughput. Include per-tenant hugepage reservations, THP and NUMA tunables, KSM considerations, observability, and a staged load-test with rollback plan?",
+        "questionId": "q-21214",
+        "question": "On a Linux host running a multi-tenant streaming analytics service with NUMA nodes, bursts cause tail latency spikes due to memory management (THP, page migration) under shared cgroups. Design a production plan to diagnose and mitigate this without hurting throughput. Include memcg v2 quotas (memory.max/high), THP policy, per-tenant NUMA binding, page cache/Slab tuning, BPF-based visibility, staged load tests, and rollback?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Measure with perf, ftrace, and slabtop to see THP pauses during bursts; check /sys/kernel/mm/transparent_hugepage/enabled. If THP stalls are real, disable THP (echo never > enabled). Enforce per-tenan",
+            "text": "Propose a zero-downtime TLS cert rotation using systemd.path to trigger on an updated certificate symlink, plus a dedicated systemd service that ExecReloads the proxy. Use atomic cert updates (place n",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement per-tenant hugepage reservations (hugetlb), disable THP on latency-critical paths, and tighten NUMA pinning. Use numa_maps and taskset to bind tenants to specific nodes; monitor reclaim with",
-            "isCorrect": true
+            "text": "Create per-tenant slices with systemd (tenantA.slice…tenantF.slice), assign processes via systemd-run --slice, and set CPUWeight/IOWeight to distribute CPU/I/O fairly. Monitor with systemd-cgtop and c",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement per-tenant I/O isolation using systemd slices and cgroup v2 io.max. Create tenant-<name>.slice, assign services to it, and throttle devices (e.g., 8:0 rbps=50M wbps=50M). Include per-device",
+            "text": "Establish per-tenant labels and dedicated NIC resources, pin Rx rings and IRQs to tenant-specific CPUs, and deploy an XDP/eBPF program that enforces per-tenant rate limits while redirecting traffic to per-tenant queues.",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Isolate per-tenant traffic with separate network namespaces, use tc clsact with per-tenant HTB rates, and enforce with eBPF maps plus XDP offload for fast policing. Pin RX/TX queues to CPUs, enable ir",
-            "isCorrect": false
+            "text": "Plan: enforce per-tenant memcg quotas (memory.max/high); disable or tune THP; bind tenants to local NUMA nodes; pin page cache and slab to tenants; use BPF to monitor page_faults, page_allocs, and mig",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question probes knowledge of memory management, hugepages, THP, NUMA, and multi-tenant isolation in production Linux. It tests practical thinking for diagnosing latency, implementing per-tenant isolation, and rollback plans.\n\n## Key Concepts\n- HugeTLB/hugetlb\n- Transparent Huge Pages (THP)\n- NUMA affinity and memory policies\n- Observability: slabinfo, slabtop, pidstat, perf\n- Staged load testing and rollback\n\n## Code Example\n```bash\n# Pin a tenant process to NUMA node 0\nnumactl --membind=0 --cpubind=0 ./tenant1_app &\n```\n\n## Follow-up Questions\n- How would you validate per-tenant hugepage contention?\n- What risks come from disabling THP on a multi-tenant cluster?",
+        "explanation": "## Why This Is Asked\nTests ability to craft a concrete, measurable plan for a real production issue involving memory management in a multi-tenant, NUMA-aware host.\n\n## Key Concepts\n- Memory cgroups v2 quotas (memory.max, memory.high)\n- THP behavior and policy controls\n- NUMA binding and memory locality\n- Page cache and slab/page allocator pressure\n- Observability with BPF (page_faults, migrated_pages, slabinfo)\n\n## Code Example\n```javascript\n// Example: BPF trace snippet wiring for page faults (conceptual)\n#include <linux/bpf.h>\nint on_page_fault(struct bpf_context *ctx){\n  // collect per-tenant metrics via cgroup_id map\n  return 0;\n}\n```\n\n## Follow-up Questions\n- How would you validate rollback safety under surge traffic?\n- Which metrics signal readiness to scale or rollback?",
         "difficulty": "advanced"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-07-23T05:25:28.239Z",
+    "createdAt": "2026-07-23T10:38:53.334Z",
     "version": 1
   }
 ]
