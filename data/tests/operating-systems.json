@@ -8,188 +8,398 @@
     "questions": [
       {
         "id": "operating-systems-q-0",
-        "questionId": "q-21717",
-        "question": "Design a NUMA-aware online memory expansion feature for a Linux-like kernel with multiple containers (cgroups). On hot-add of DIMMs, allocate into a pool and migrate hot pages from overloaded NUMA nodes to new nodes while enforcing per-container quotas and avoiding eviction storms. Describe end-to-end flow from first access to migration, per-page state, CAS-based synchronization, destination-node selection, TLB shootdown impacts, and a minimal C-like migration sketch plus a test plan?",
+        "questionId": "q-6230",
+        "question": "In a Linux-like kernel, implement lazy splitting of hugepages for a memory-mapped, file-backed region: when a first write touches a region originally backed by a 2MB hugepage, the kernel should split it into 4KiB pages and preserve correctness across multiple processes mapping the same region. Describe the end-to-end flow from the write fault to the completion of splitting, including how to coordinate with per-page tables, TLB invalidation, and writeback semantics for sharing processes, while keeping latency low under high concurrency?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a circular buffer, a mutex, and two condition variables: not_full and not_empty. try_send locks, checks full, returns false if full; otherwise enqueues and signals not_empty. blocking_recv waits o",
+            "text": "I would implement a NUMA-aware page migration policy with per-page affinity state tracking (owner_node, migrating flag, access_frequency) and a cost-based decision model. The policy compares the cumulative penalty of re…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "End-to-end path: on first touch, verify container quota; if quota available, pick destination node (least-loaded with spare capacity and lowest migration cost); use CAS to atomically claim migration ownership; allocate…",
-            "isCorrect": true
+            "text": "Translate VA 0x1234ABCD using 2-level paging: L1 = (va>>22)&0x3FF; L2 = (va>>12)&0x3FF; offset = va&0xFFF. If L1 entry present, fetch L2; if L2 entry present, PPN = PTE & ~0xFFF; phys = (PPN<<12) | of",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Per-tenant memory pressure notifier: enforce per-container quotas (cgroups) with a NUMA hint. On pressure threshold, enqueue work into per-CPU batch queues and reclaim or migrate pages in bulk. Apply",
+            "text": "On a two-socket NUMA Linux server, cross-node touches trigger page migration, TLB shootdowns, and cache coherence traffic, causing latency spikes and lower throughput under bursts. A microbenchmark sh",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "read() blocks the thread, moves it to a blocked state, queues a disk-read request, and yields the CPU. The I/O subsystem issues the request; on completion, the IRQ marks the request done, wakes the bl",
-            "isCorrect": false
+            "text": "On first write fault to a hugepage, serialize with per-region lock; split the 2MB page into 4KiB frames by materializing new PTEs and updating the page-table tree. If shared, perform Copy-On-Write and",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design dynamic memory management at a kernel level, with NUMA awareness, multi-tenant isolation, and concurrency control during live hardware changes.\n\n## Key Concepts\n- **NUMA-aware online memory expansion**: Hot-add DIMMs create new NUMA nodes; memory must be allocated and distributed intelligently across nodes\n- **Per-container quotas**: cgroups enforce memory limits; allocations must check quota before proceeding\n- **Page migration with CAS synchronization**: Use compare-and-swap on per-page state to atomically claim ownership and prevent concurrent migrations of the same page\n- **TLB shootdown impact**: Broadcasting TLB invalidations across CPUs is expensive; batched/deferred flushes mitigate this\n- **Eviction storm avoidance**: Rate-limit migrations, use hysteresis thresholds, and prioritize hot pages over warm pages\n\n### Code Example\n```c\n// Minimal C-like migration sketch\ntypedef enum {\n    PAGE_STATE_FREE,\n    PAGE_STATE_ALLOCATED,\n    PAGE_STATE_MIGRATING,\n    PAGE_STATE_MIGRATED\n} page_state_t;\n\ntypedef struct {\n    volatile page_state_t state;\n    unsigned int src_node;\n    unsigned int dst_node;\n    void *page_ptr;\n} migration_entry_t;\n\nint migrate_page(migration_entry_t *entry, struct container_quota *quota) {\n    // 1. Verify container quota on destination node\n    if (!quota_has_headroom(quota, entry->dst_node)) {\n        return -ENOMEM;\n    }\n    \n    // 2. CAS to claim migration (prevent races)\n    if (!atomic_cas(&entry->state, PAGE_STATE_ALLOCATED, PAGE_STATE_MIGRATING)) {\n        return -EBUSY;  // Already being migrated\n    }\n    \n    // 3. Allocate new page on destination\n    void *new_page = alloc_pages_node(entry->dst_node, 0);\n    if (!new_page) {\n        atomic_cas(&entry->state, PAGE_STATE_MIGRATING, PAGE_STATE_ALLOCATED);\n        return -ENOMEM;\n    }\n    \n    // 4. Copy page contents\n    memcpy(new_page, entry->page_ptr, PAGE_SIZE);\n    \n    // 5. Update page tables (arch-specific)\n    update_pte(entry->page_ptr, new_page, entry->dst_node);\n    \n    // 6. Batch TLB shootdown\n    tlb_flush_batch(entry->dst_node);\n    \n    // 7. Release source page\n    free_pages(entry->src_node, entry->page_ptr);\n    \n    // 8. Mark migration complete\n    atomic_cas(&entry->state, PAGE_STATE_MIGRATING, PAGE_STATE_MIGRATED);\n    \n    return 0;\n}\n```\n\n### Test Plan\n\n| Test Case | Description | Expected Result |\n|-----------|-------------|-----------------|\n| **T1: Basic migration** | Allocate page, trigger migration to target node | Page migrates successfully, contents preserved |\n| **T2: Quota enforcement** | Container at quota limit; attempt allocation on new node | Allocation fails with -ENOMEM |\n| **T3: Concurrent migration race** | Two threads attempt to migrate same page simultaneously | Only one succeeds; other returns -EBUSY |\n| **T4: NUMA distance priority** | Multiple target nodes available with different distances | Migration targets nearest node with capacity |\n| **T5: Eviction storm prevention** | High migration rate triggers; observe migration throttling | Migrations rate-limited; no CPU spike |\n| **T6: TLB shootdown batching** | Migrate many pages from one container | Single batched TLB flush, not per-page |\n| **T7: Hot-add DIMM integration** | Simulate DIMM hot-add; allocate from new node | Memory allocated from newly exposed node |\n| **T8: Partial migration with failure** | Migration fails mid-copy (e.g., ECC error) | Rollback to source; error reported |\n\n**Testing Tools**: Custom kernel module for injection, `numactl` for NUMA topology, `perf` for migration latency/cost, cgroup v2 memory controller for quota validation.",
+        "explanation": "## Why This Is Asked\nTests practicality of handling on-demand page fragmentation, cross-process consistency, and low-latency fault handling. It touches page-table walking, synchronization, TLB invalidation, and cache coherence under contention.\n\n## Key Concepts\n- Hugepage fragmentation and 4KiB granularity\n- Copy-On-Write semantics for shared mappings\n- CAS-based page-table updates and memory barriers\n- TLB shootdown and cross-CPU visibility\n- Interaction with the file-backed page cache\n\n## Code Example\n```c\n// Pseudo: split_hugepage(...) { /* acquire region lock, allocate 4KiB pages, update PTEs, invalidateTLBs */ }\n```\n\n## Follow-up Questions\n- How would you extend to mixed page sizes or partial splits?\n- How would you test correctness under high contention and NUMA configurations?",
         "difficulty": "advanced"
       },
       {
         "id": "operating-systems-q-1",
-        "questionId": "q-1299",
-        "question": "Scenario: two threads share a global 32-bit counter. Thread A increments it in a tight loop; Thread B logs the value once per second. Without synchronization, describe a concrete interleaving that yields a stale read or lost update, and explain the cache/coherence mechanics behind it. Then outline the minimal fix and how it ensures atomicity and visibility (e.g., atomic fetch_add or a mutex)?",
+        "questionId": "q-12884",
+        "question": "In a Linux-like kernel with heterogeneous cores (big.LITTLE), implement a scheduler policy that assigns threads to fast vs slow cores based on recent burstiness and per-core utilization, with a migration rate limiter to prevent thrash. Provide a minimal C-like sketch for enqueue, next-task selection, and the migrator, and outline a practical test plan for throughput and tail latency under mixed CPU-bound and I/O-bound workloads?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a crash-safe metadata journaling layer: a write-ahead log of inode and directory-entry updates, a two-phase commit, and a durable log flush before applying changes. Support atomic mkdir/rename,",
+            "text": "Implement preemptive RR with quantum=4 ticks. On each timer tick: decrement running.remaining_quantum; if zero then enqueue the running process at tail and pop next from the ready queue; perform a con",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a per-tenant, per-queue path: map flows to fixed TX queues with a hash; preserve per-flow order using monotonic sequence numbers and per-flow credits; enforce tenant rate limits via a token-buc",
+            "text": "Use a balanced interval tree (such as a red-black tree or AVL tree) where each node represents a locked byte range [start, end). Each node contains a mutex and a wait-queue for threads blocked on that range. To acquire…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Interleaving: A reads 0, B reads 0, A increments to 1 and writes 1, B logs 0. The write may not be visible immediately due to per-core caches and cache-coherence delays, so B observes 0. Fix with atom",
+            "text": "I would implement a two-tier scheduler with per-core queues for fast and slow cores. Each thread tracks recent_burst, last_core, and a migration_count. Enqueue prefers fast cores when burst > threshol",
             "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Use a circular buffer of size N with head, tail, and count. Synchronize with a mutex and two condition variables: not_full and not_empty. put(x): lock; while count==N, wait on not_full; buf[head] = x;",
+            "text": "Per-page state: is_compressed, compressed_size, density. On eviction or lazy compression, CAS-mark the page, compress with a fast algorithm (e.g., LZ4), store data in swap cache, set flags. On fault,",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nConveys understanding of data races and real hardware behavior, not just theory.\n\n## Key Concepts\n\n- Data races and undefined behavior\n- Cache coherence and MESI, visibility across cores\n- Atomic operations vs locking; memory ordering guarantees\n- How preemption and context switches interact with shared data\n\n## Code Example\n\n```javascript\n// Pseudocode demonstrating the race (not executable in JS)\nlet counter = 0;\nfunction A(){ while(true){ let x = counter; counter = x + 1; } }\nfunction B(){ setInterval(()=> console.log(counter), 1000); }\n```\n\n## Follow-up Questions\n\n- How does memory_order_seq_cst affect visibility on modern CPUs?\n- How would you test this race condition in a real system?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nTests scheduling on heterogeneous hardware, migration overhead, and practical heuristics.\n\n## Key Concepts\n- Heterogeneous cores and cache locality\n- Per-thread burst tracking and migration policies\n- Rate-limited migration and fairness\n\n## Code Example\n```javascript\n// Pseudo C-like sketch (actual types omitted for brevity)\ntypedef struct { int id; int recent_burst; int last_core; int migrated; } thread_t;\ntypedef struct { queue_t fast; queue_t slow; int migr_rate_limit; } sched_t;\n```\n\n## Follow-up Questions\n- How would you measure fairness and starvation risk?\n- How would thresholds adapt under bursty workloads?",
+        "difficulty": "intermediate"
       },
       {
         "id": "operating-systems-q-2",
-        "questionId": "q-6524",
-        "question": "Design a simple 3-level MLFQ scheduler for a toy OS. Levels have quantum 4, 8, and 16 ticks; aging promotes waiting tasks to higher levels after a threshold to prevent starvation. Given two processes arriving together—P1 CPU-bound, P2 I/O-bound—describe their scheduling order, how aging affects priorities, and provide a minimal C-like sketch for enqueue, dequeue, and choosing the next task. How would you test fairness?",
+        "questionId": "q-4692",
+        "question": "Design a robust lock-free multi-producer, single-consumer ring buffer used for inter-thread messaging with two producers and one consumer. Each slot holds a 64-bit key, a 64-bit value, and a 64-bit sequence. Describe the protocol (indices, per-slot sequence), the exact memory barriers required on x86_64 and ARM64, and a minimal code sketch for enqueue and dequeue. Include a concrete test plan that stresses visibility, wrap-around, and ABA issues?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Pin the latency-sensitive task to a dedicated CPU core using taskset, isolate CPUs via the isolcpus kernel parameter, and redirect device interrupts away using smp_affinity. Employ ftrace with trace_irq_handler_entry/ex…",
+            "text": "In a COW fork, parent and child initially share all physical pages marked as read-only. On a write fault to a shared page: (1) Check the reference count; if greater than 1, allocate a new page, copy the old content, dec…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Per-container metrics: track runnable_ns and blocked_ns, plus cpu_quota_ns and a base weight. Compute dynamic weight w = base * (runnable_ns / max(1, total_ns)); ensure a latency floor for interactive",
-            "isCorrect": false
+            "text": "Use a lock-free MPMC-like scheme with a per-slot sequence and a shared head counter updated via CAS. Producers obtain an index, write data, then publish by updating the slot’s sequence with a release-",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "False sharing occurs when multiple threads write to nearby fields within a single cache line, causing repeated invalidations and cross-core traffic. If thread i updates its own counter in a shared lin",
+            "text": "A reusable barrier for N threads using the sense-reversing technique: ```c #include <stdatomic.h> typedef struct { atomic_int count; atomic_int sense; int N; } barrier_t; void barrier_init(barrier_t* b, int N) { b->N =…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Three ready queues Q0–Q2 with quanta 4, 8, 16. Aging promotes waiting tasks by one level after A ticks to prevent starvation. On quantum expiry, move the running task to the next lower level; on IO co",
-            "isCorrect": true
+            "text": "Allocate 8 MB per thread with a guard page below the stack. A touch on the guard triggers a page fault; runtime unwinds thread-local state, marks the thread dead, cleans resources, and yields to the s",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of practical scheduling design, aging to avoid starvation, and handling preemption in a simple OS.\n\n## Key Concepts\n- Multi-level feedback queue structure\n- Quantum slicing and preemption\n- Aging to prevent starvation\n- Correctness under concurrent events and IO wakeups\n\n## Code Example\n```javascript\n// Minimal MLFQ skeleton\nconst QUANTUM = [4,8,16];\nlet queues = [[], [], []];\nfunction enqueue(t){ queues[t.level].push(t); }\nfunction dequeue(){ for(let i=0;i<3;i++) if(queues[i].length) return queues[i].shift(); return null; }\nfunction pick(){ let t = dequeue(); if(!t) return null; t.remaining = QUANTUM[t.level]; return t; }\n```\n\n## Follow-up Questions\n- How would you test aging effectiveness and starvation resistance?\n- What edge cases (burstiness, bursty IO) would you simulate to validate correctness?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nExposes real-world lock-free design pitfalls: memory ordering, ABA, and visibility in a high-throughput ring buffer.\n\n## Key Concepts\n- Lock-free data structures and CAS\n- Per-slot sequencing to avoid ABA\n- Memory ordering on x86_64 vs ARM64\n- Correctness under contention and wrap-around\n\n## Code Example\n```c\n// Minimal enqueue (producer)\nbool enqueue(slot_t* buf, int n, uint64_t key, uint64_t val) {\n  static thread_local uint64_t prod = 0; // per-producer sequence\n  uint64_t idx = atomic_fetch_add(&head, 1) % n;\n  slot_t* s = &buf[idx];\n  s->key = key;\n  s->val = val;\n  atomic_store_explicit(&s->seq, prod*2+1, memory_order_release);\n  prod++;\n  return true;\n}\n\n// Minimal dequeue (consumer)\nbool dequeue(slot_t* buf, int n, uint64_t* out_key, uint64_t* out_val) {\n  static uint64_t tail = 0;\n  slot_t* s = &buf[tail % n];\n  uint64_t seq = atomic_load_acquire(&s->seq);\n  if ((seq & 1) == 0) return false; // empty\n  *out_key = s->key;\n  *out_val = s->val;\n  atomic_store_explicit(&s->seq, seq+1, memory_order_release);\n  tail++;\n  return true;\n}\n```\n\n## Follow-up Questions\n- How would you adapt to multiple consumer threads?\n- How to test for ABA and late-arriving writes under high contention?",
+        "difficulty": "intermediate"
       },
       {
         "id": "operating-systems-q-3",
-        "questionId": "q-11475",
-        "question": "You have a tiny OS with a per-CPU sleep queue. Implement sleep(n) for threads and wake them on timer interrupts. What data structure and flow would you use to guarantee exact wake times, handle timer jitter, and avoid missing wakeups under contention? Provide minimal pseudo-code for enqueueing, the timer handler, and waking threads?",
+        "questionId": "q-10249",
+        "question": "Design a ticket-based readers-writers lock to avoid writer starvation. Use atomics: next_ticket, now_serving, an active_readers counter, and a waiting_writer flag. Readers grab a ticket and spin until now_serving==their_ticket and no writer is waiting ahead. Writers grab a ticket and spin until active_readers==0 and now_serving==ticket?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement a per-CPU sleep queue keyed by wake_time. On sleep(n), enqueue {tid, wake_at=now+n}. On timer tick, pop all entries with wake_at <= now and wake them. Re-check the time after dequeue to handle timer jitter; re…",
-            "isCorrect": true
+            "text": "Per-task fault budgets cap latency and a per-CPU worker pool ensures predictability. On a TLB miss, an atomic CAS claims a fault slot; a granted worker performs the page-in with strict deadline, other",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "On a non-present page fault, allocate a frame and lock the page. Re-check presence; if still missing and backed by a file, read into the frame and map it; otherwise zero-fill and map. Use a per-page C",
+            "text": "Use an atomic tail for producers and an atomic head for the consumer, with per-slot validity and memory barriers: producer reserves a slot with fetch_add, writes data, then release-store; consumer rea",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Interleaving: V0 = 0x00000000_00000000. A writes high 32 bits to 0x00000001; B reads; low 32 still 0, so B sees 0x00000001_00000000—a torn value. Minimal fixes: (1) atomic 64-bit stores on 64-bit CPUs",
-            "isCorrect": false
+            "text": "Design a ticket-based readers-writers lock to avoid writer starvation. Use atomics: next_ticket, now_serving, an active_readers counter, and a waiting_writer flag. Readers grab a ticket and spin until",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Serialization is required. If truncation and access race, the mapping may serve stale data or fault with SIGBUS. A safe pattern is to lock around both operations, unmap the region before truncation an",
+            "text": "On a write, a page fault splits the 2MB THP into 512 4KB pages via split_huge_page, coordinated by khugepaged or on-demand. The kernel copies the write into the new 4KB page, updates the PTEs to point",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question assesses practical understanding of timer-driven thread wakeups, race condition handling, and efficient data structures in a kernel-like environment. It tests a candidate's ability to design a concrete mechanism that works correctly under contention while maintaining precise timing guarantees.\n\n## Key Concepts\n\n- Sleep queues and timer interrupt handling\n- Min-heap data structure for efficient wake-time ordering\n- Concurrency safety and time rechecking to mitigate timer jitter\n- Correctness guarantees: ensuring no missed wakeups and exact timing\n\n## Code Example\n\n```c\n// Minimal sketch of a per-CPU sleep queue\ntypedef struct SleepEntry {\n  uint64_t wake_at;\n  int tid;\n  struct SleepEntry *next;\n} SleepEntry;\n\n// Enqueue thread for timed sleep\nvoid sleep(int tid, uint64_t duration) {\n  uint64_t now = get_time();\n  SleepEntry entry = {now + duration, tid};\n  minheap_insert(&cpu->sleep_queue, entry);\n  block_thread(tid);\n}\n\n// Timer interrupt handler\nvoid timer_interrupt() {\n  uint64_t now = get_time();\n  while (!minheap_empty(&cpu->sleep_queue)) {\n    SleepEntry entry = minheap_peek(&cpu->sleep_queue);\n    if (entry.wake_at > now) break;\n    \n    entry = minheap_pop(&cpu->sleep_queue);\n    if (entry.wake_at <= now) {\n      wake_thread(entry.tid);\n    } else {\n      minheap_insert(&cpu->sleep_queue, entry);\n    }\n  }\n}\n```",
+        "explanation": "## Why This Is Asked\nUnderstanding synchronization primitives at OS level is essential for beginners. A ticket-based approach guarantees fairness and prevents writer starvation under contention.\n\n## Key Concepts\n- Atomic counters, memory order\n- Read/write fairness, no starvation\n- Spin-wait vs blocking\n- Testing under concurrent readers/writers\n\n## Code Example\n```javascript\n// Placeholder pseudo-code in C-like style; see explanation for full sketch\n```\n\n## Follow-up Questions\n- How would you extend to handle reader-priority vs writer-priority tunables?\n- How would you test with randomized thread interleavings to catch edge cases?",
         "difficulty": "beginner"
       },
       {
         "id": "operating-systems-q-4",
-        "questionId": "q-25121",
-        "question": "Design an NVMe I/O scheduler for a Linux-like kernel that enforces per-container IO quotas (IOPS and bandwidth) while preserving low tail latency for latency-sensitive services. Include a data locality tag to favor intra-CPU submissions, a starvation-prevention mechanism, and burst handling. Describe end-to-end from submission through completion, including per-container accounting, queue selection, and a minimal C-like sketch for enqueue, dequeue, and a test plan?",
+        "questionId": "q-19878",
+        "question": "Design and implement a simple kernel timer wheel to handle thread sleep and wakeup. Use 64 buckets, a fixed tick, and each sleeping task provides a duration in ms. Explain data structures, how a thread is inserted, how time advances, and how you safely wake tasks on tick with concurrent interrupts. Include wraparound and race considerations?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Per-tenant credits, per-tenant I/O queues, and a global arbiter that selects by priority and remaining quota. In-flight I/O tracked in a hash map; enqueue/dequeue are lock-free with CAS; a completion",
+            "text": "Implement a thread-safe coalescer using a sorted map of pending IO by [start,end). On each Request(offset,len,op), locate overlaps or adjacency, merge spans and combine ops; otherwise insert a new nod",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use per-container quotas (memcg-like), and a NUMA-aware LRU eviction. Track per-page flags (hot, referenced) and per-node residency. Evict non-hot pages first from far NUMA nodes, migrate evicted page",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Per-container quotas via token buckets for bandwidth and IOPS; latency-sensitive streams get a fast path; data locality tag guides dispatch to local NUMA queues; CAS-based credit claims prevent races;",
+            "text": "Use a 64-bucket timer wheel with per-bucket lock. Each sleeping task records target_bucket = (current_tick + ceil(ms/TICK_MS)) % 64 and remaining_cycles = floor((current_tick + ceil(ms/TICK_MS))/64).",
             "isCorrect": true
           },
           {
+            "id": "c",
+            "text": "Trap page faults via userfaultfd and implement a per-page guard to serialize concurrent faults. When a fault occurs, one thread fills the 4 KiB page from the backing file (pread) or zeros it, then use",
+            "isCorrect": false
+          },
+          {
             "id": "d",
-            "text": "Total tickets = sum(tickets of all ready procs). On dispatch, winner = 1 + rand()%Total; choose process whose cumulative tickets covers winner. Maintain ready queue with per-pid tickets; on block, sub",
+            "text": "When a worker process accesses the memory-mapped dataset for the first time, the CPU generates a page fault. The kernel's page fault handler checks the Process Table Entry (PTE), finds the page not present, and initiate…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nReal workloads are multi-tenant; tail latency for latency-sensitive apps matters; this tests practical scheduling, fairness, and locality.\n\n## Key Concepts\n\n- I/O scheduling and fairness\n- Per-container quotas and tokens\n- Data locality and NUMA-aware dispatch\n- Lock-free queues and CAS for race-free updates\n- Burst handling and starvation prevention\n\n## Code Example\n\n```javascript\n// Minimal enqueue sketch\ntypedef struct {\n  int container_id;\n  int bytes;\n  int latency_sensitive;\n} io_req_t;\n\ntypedef struct {\n  volatile int iops_credits;\n  volatile int bw_credits;\n} quota_t;\n\nquota_t quotas[MAX_CONTAINERS];\nqueue_t *queues[MAX_CONTAINERS];\n\nvoid enqueue_io(io_req_t *r){\n  int c = r->latency_sensitive ? 1 : 0; // quick path flag\n  // naive atomic update for illustration\n  if (__sync_bool_compare_and_swap(&quotas[r->container_id].iops_credits, c, c-1)) {\n    push(&queues[r->container_id], r);\n  } else {\n    // fall back to slow path\n    enqueue_slow(r);\n  }\n}\n```\n\n## Follow-up Questions\n\n- How would you validate fairness under bursty traffic?\n- What metrics would you monitor in production?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests a practical, low-level OS data structure and concurrency concept in a minimal timer subsystem.\n\n## Key Concepts\n- Timer wheel with buckets and tick progression\n- Safe insertion and wakeup under interrupts\n- Wraparound handling and long sleeps\n\n## Code Example\n```javascript\n// pseudo-C-like sketch omitted for brevity\n```\n\n## Follow-up Questions\n- How would you extend for dynamic bucket sizing and multi-CPU wakeups?\n- How would you test correctness under tick jitter and preemption?",
+        "difficulty": "beginner"
       },
       {
         "id": "operating-systems-q-5",
-        "questionId": "q-12055",
-        "question": "In a tiny OS with a preemptive scheduler and a fixed-size kernel mailbox (FIFO queue) of N slots, implement a bounded mailbox with two API calls: bool try_send(msg) and void blocking_recv(msg*). Ensure thread-safety, wakeups for waiting senders when space frees, and waiting receivers when empty. Provide a minimal C sketch of the mailbox, enqueue/dequeue, and a test scenario with two producers and one consumer. How would you verify correctness and absence of deadlocks?",
+        "questionId": "q-2734",
+        "question": "In a Linux‑like system, a user‑space producer and a kernel driver share a lock‑free 256‑entry ring buffer using per‑entry sequence numbers. Describe a safe publish/claim/consume protocol that guarantees no lost entries and a consistent view under concurrent updates, specifying the exact write order and memory barriers on x86‑64. Include a concrete test harness to validate under contention?",
         "type": "single",
         "options": [
           {
             "id": "a",
+            "text": "Maintain a min-heap of sleeping threads by wake_time. Each thread stores wake_time and a per-thread semaphore. sleep(ms) computes wake = now + ms, inserts thread into the heap, blocks on its semaphore",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use per-slot sequence numbers and release/acquire semantics. Producer writes data, then performs a release write of slot.seq to signal readiness; consumer reads slot.seq with acquire, validates, then",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use an MCS-style queue lock with per-thread stack-allocated nodes, linking to the predecessor and spinning on a private flag. Place each node in the thread’s NUMA domain and pad to a cache line to red",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design and implement a kernel-space circular log buffer with fixed capacity. Multiple producer threads write constant-size log records into the buffer while a single consumer thread drains records to storage. Implement…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nProbes practical lock-free IPC correctness between user space and kernel with memory ordering.\n\n## Key Concepts\n- Lock-free ring buffers with per-slot sequence numbers\n- Release/acquire semantics on x86-64\n- Visibility guarantees under contention\n- Test harness design for correctness\n\n## Code Example\n```c\n// sketch of publish/consume\n```\n\n## Follow-up Questions\n- How to extend to multiple kernel consumers?\n- How would you detect/repair corrupted seq invariants?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "operating-systems-q-6",
+        "questionId": "q-4820",
+        "question": "Design an in-memory, shared-hash-map for a high-concurrency database worker pool. Implement an RCU-based read path so reads never block even during hash-table resizing, and writers perform safe updates by replacing a bucket structure and deferring reclamation. Explain grace periods, memory barriers on x86_64, and how to reclaim old nodes without use-after-free. Include a minimal code sketch and a microbenchmark outline?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "When a guest G touches a page P that is on node N, collect per-node access counters for G and estimate migration cost; select target node T with max(G-locality - cost) within budget; schedule migratio",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "RCU per bucket: readers run non-blocking; writers replace a bucket by allocating a fresh node, copying data, linking into the bucket list, and swapping the head with a release store, followed by synch",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement sleep with a wake_time field and a timer queue (min-heap). sleep(ms) computes wake_time = now() + ms and inserts a (pid, wake_time) entry. The timer interrupt pops all entries with wake_time",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a per-container RSS quota using per-page reference counts and a global quota tree. Track shared pages and COW pages separately, with a soft quota and proportional eviction across containers. Us",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\\nReasoning: probes practical memory reclamation and non-blocking synchronization in kernel-like data structures.\\n\\n## Key Concepts\\n- Read-Copy-Update (RCU) semantics for updates\\n- Grace period, synchronize_rcu, safe reclamation\\n- Memory ordering on x86_64: release stores, READ_ONCE/WRITE_ONCE\\n- Per-bucket isolation to minimize cross-core traffic\\n\\n## Code Example\\n```c\n// Sketch\nstruct bucket { int value; struct bucket *next; };\nvoid reader(struct bucket *head) {\n  rcu_read_lock();\n  struct bucket *b = READ_ONCE(head);\n  int v = READ_ONCE(b->value);\n  rcu_read_unlock();\n}\nvoid writer(struct bucket **head) {\n  struct bucket *nb = malloc(...);\n  nb->value = newval;\n  nb->next = READ_ONCE(*head);\n  if (cmpxchg(head, nb->next, nb)) {\n    synchronize_rcu();\n  }\n}\n```\n\\n## Follow-up Questions\\n- How would you test for use-after-free under concurrency?\\n- Compare performance against a mutex-based approach under varying read/write ratios.",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "operating-systems-q-7",
+        "questionId": "q-4786",
+        "question": "Explain end-to-end how the Linux-like kernel handles a page fault that triggers stack growth for a thread due to deep recursion. Describe the steps from faulting instruction to resumed execution: fault diagnosis, stack VMA checks, guard pages, allocating a zero-filled page, updating the stack PTE, and issuing a TLB shootdown; address synchronization for multi-threaded growth and potential performance costs?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "On first touch under memory pressure, the page is migrated into a per-CPU compression cache. The kernel allocates a compressed block, uses a CAS operation to atomically transition the page state to COMPRESSED, performs…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "On fault, kernel checks if the address is in the thread's stack VMA and if growth is allowed. If yes, allocate a zero-filled page, map it into the user page table, and perform a TLB shootdown. The fau",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "On first write fault to a hugepage, serialize with per-region lock; split the 2MB page into 4KiB frames by materializing new PTEs and updating the page-table tree. If shared, perform Copy-On-Write and",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design and implement a kernel-space robust futex primitive to synchronize user-space threads on a shared address, addressing termination safety, spurious wakeups, and wake-order guarantees under preemption. Provide end-…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests understanding of on-demand stack growth, page faults, and VM synchronization in multi-threaded contexts.\n\n## Key Concepts\n\n- Stack growth via page faults\n- Stack guard pages and VMA checks\n- Page table updates and TLB coherence\n- Concurrency control for per-thread stack growth\n\n## Code Example\n\n```javascript\n// Pseudo steps for stack growth\n```\n\n## Follow-up Questions\n\n- How would guard-page mispredictions impact performance?\n- What optimizations or data structures help reduce contention during growth?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "operating-systems-q-8",
+        "questionId": "q-8917",
+        "question": "In a tiny Linux-like OS, after fork, pages are shared as read-only via Copy-On-Write. When a write occurs to a shared page, describe the exact page-fault path to create a private copy: how to allocate the new page, copy data, update the per-process page table, adjust per-page reference counts, and invalidate the TLB. How do you ensure race-freedom when two threads fault on the same page concurrently?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use per-CPU circular buffers with atomic head/tail and a small version tag to avoid ABA. Local enqueue uses MPSC CAS on tail; steal uses CAS to pop from the victim's head, with a random neighbor and a",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "On first touch, CAS-claim the target page, load from backing store or zero-fill, and then either allocate a new frame or reuse a deduplicated frame identified by a fingerprint. Maintain per-container",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement Copy-On-Write with per-page reference counting. After fork, pages are mapped read-only while sharing physical frames. When a write fault occurs, allocate a new physical page, copy the contents from the origina…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "An I/O scheduler per cgroup with quotas. Track per-cgroup bytes and requests, plus a global credit pool. Enqueue checks quota; if exhausted, block or delay until credit refresh. choose_next picks the",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests practical virtual memory implementation skills including COW semantics, page table management, reference counting, synchronization, and TLB consistency. It evaluates the ability to handle concurrent page faults without memory leaks or race conditions.\n\n## Key Concepts\n- Copy-On-Write (COW) optimization\n- Page table updates and TLB invalidation\n- Race condition handling and synchronization primitives\n- Concurrent memory management\n\n## Code Example\n```c\nvoid handle_write_fault(PTE *pte) {\n  acquire(pte->lock);\n  if (pte->refcount > 1) {\n    Page *newpage = alloc_page();\n    memcpy(newpage->addr, pte->frame->addr, PAGE_SIZE);\n    pte->frame = newpage;\n    pte->writable = 1;\n    pte->refcount--;\n    invalidate_tlb(pte->vaddr);\n  } else {\n    pte->writable = 1;\n  }\n  release(pte->lock);\n}\n```",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "operating-systems-q-9",
+        "questionId": "q-25280",
+        "question": "Describe a tiny OS memory-mapped file support: when a non-present page in the mapped region is touched, load from the backing file or zero-fill. Explain the end-to-end fault path for two threads faulting the same page concurrently, per-page locking, IO vs zero-fill, page-table updates, TLB invalidation, and waking waiters. Provide a minimal C-like pseudocode for the fault handler?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Compute per-page scores from hotness and per-tenant quotas; eviction favors local NUMA pages first. Under node A pressure, move candidates to per-node queues, batch-evict, and synchronize with a light",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "On fault: lock the page; if present return; if loading flag is set, wait; else set loading, allocate page, unlock, read backing file into page or zero-fill, then lock again to clear loading, mark pres",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
             "text": "I propose a NUMA-aware ballooning and page compaction subsystem design. Per-container quotas are enforced through cgroups memory controller, with reclaim logic prioritizing clean, unreferenced, low-RSS, and least-recent…",
             "isCorrect": false
           },
           {
-            "id": "b",
-            "text": "Use a circular buffer, a mutex, and two condition variables: not_full and not_empty. try_send locks, checks full, returns false if full; otherwise enqueues and signals not_empty. blocking_recv waits o",
+            "id": "d",
+            "text": "Use per-page state with CAS transitions: UNCLAIMED → INFLIGHT (the first fault), then → FILLED. The first waiter triggers I/O from the nearest NUMA node; others sleep on a per-page waitqueue. After fi",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of demand paging, synchronization, and TLB consistency in a realistic but simple setup.\n\n## Key Concepts\n- Demand paging and lazy page-in\n- Per-page locking to serialize concurrent faults\n- Correct handling of IO vs zero-fill paths\n- Page-table updates and TLB invalidation\n- Wakeup semantics for waiters\n\n## Code Example\n```javascript\n// Minimal fault handler sketch (C-like)\nvoid handle_fault(Page* p){\n  acquire(p->lock);\n  if (p->present) { release(p->lock); return; }\n  if (p->loading) { wait_on(p); release(p->lock); /* queue waiter */ return; }\n  p->loading = true; release(p->lock);\n  // IO or zero-fill\n  if (has_backing_file(p)) read_file_into(p);\n  else zero_fill(p);\n  acquire(p->lock);\n  p->loading = false; p->present = true; update_pte(p);\n  flush_tlb(p);\n  wake_waiters(p);\n  release(p->lock);\n}\n```\n\n## Follow-up Questions\n- How would you test race conditions with two faulting threads? \n- How would you handle I/O errors from the backing file? \n- How would this scale to many pages in parallel?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "operating-systems-q-10",
+        "questionId": "q-21636",
+        "question": "In a toy OS, two interrupts arrive: a periodic timer and a disk I/O completion. Propose a clean interrupt handling model using a top-half and a bottom-half (deferred) approach. Explain how to avoid deadlock and ensure fairness among processes, and give a minimal C-like sketch for the ISRs and the per-CPU workqueue?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a two-stage ISR: a fast top-half updates tick and flags, queues heavy work to a per-CPU workqueue managed by a softirq/bottom-half thread. Disk IO ISR records completion and pushes an event. Botto",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "A candidate would describe: set both PTEs to read-only with a refcount; on write fault, allocate a new page, copy data, update both mappings to point to the private page, atomically clear RO flag, and",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "Explain a NUMA-aware page migration under memory pressure in a Linux-like kernel. Include trigger, candidate selection, source/dest node choice, per-page state, PTE/TLB updates (including lazy invalid",
+            "text": "On a TLB miss, the hardware or software walks the two-level page table to locate the corresponding page table entry (PTE). First, the page directory (PD) index selects the appropriate page directory entry (PDE), which p…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Block the caller by moving its PCB to a sleep list keyed by wakeup_tick = current_tick + n. On timer tick, wake any processes whose wakeup_tick <= now and requeue them to the ready queue. Use a lock t",
+            "text": "On fault, acquire per-page lock; if another thread is loading, wait. If a free frame exists, allocate it and issue async read from swap/file; on completion atomically update the PTE with frame, set pr",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of simple concurrent data structures and basic OS synchronization primitives in a beginner-friendly setting.\n\n## Key Concepts\n- Bounded buffers, circular queues\n- Mutual exclusion, condition signaling\n- Producer-consumer correctness, wakeups, fairness\n- Deadlock avoidance in bounded channels\n\n## Code Example\n```javascript\n// Pseudocode: bounded mailbox in a tiny OS\nclass Mailbox {\n  constructor(cap) {\n    this.buf = new Array(cap);\n    this.head = 0; this.tail = 0; this.count = 0; this.cap = cap;\n    this.lock = new Mutex();\n    this.notEmpty = new CondVar();\n    this.notFull = new CondVar();\n  }\n}\n\nfunction trySend(mb, m) {\n  mb.lock.lock();\n  if (mb.count === mb.cap) { mb.lock.unlock(); return false; }\n  mb.buf[mb.tail] = m;\n  mb.tail = (mb.tail + 1) % mb.cap;\n  mb.count++;\n  mb.notEmpty.signal();\n  mb.lock.unlock();\n  return true;\n}\n\nfunction blockingRecv(mb, out) {\n  mb.lock.lock();\n  while (mb.count === 0) {\n    mb.notEmpty.wait(mb.lock);\n  }\n  *out = mb.buf[mb.head];\n  mb.head = (mb.head + 1) % mb.cap;\n  mb.count--;\n  mb.notFull.signal();\n  mb.lock.unlock();\n}\n```",
+        "explanation": "## Why This Is Asked\nTests understanding of interrupt handling, latency, and concurrency without requiring full kernel onboarding. Two sources with differing workloads highlight top-half vs bottom-half design choices and fairness.\n\n## Key Concepts\n- Top-half vs bottom-half interrupt handling\n- Per-CPU workqueues and lock-free communication\n- Scheduler wakeups and fairness across cores\n\n## Code Example\n```c\n// pseudo\ninterrupt timer_isr() { tick++; if (needs_work()) enqueue(BOTTOM, TIMER_EVENT); }\ninterrupt io_isr() { enqueue(BOTTOM, IO_EVENT); }\nvoid bottom_worker() { while (pop(EVENT)) handle(EVENT); }\n```\n\n## Follow-up Questions\n- How would you test latency under bursty IO?\n- How would you extend to multiple hardware IRQs with prioritization?",
         "difficulty": "beginner"
       },
       {
-        "id": "operating-systems-q-6",
-        "questionId": "q-17523",
-        "question": "In a Linux-like kernel with DRAM + PMEM tiers, implement a transparent in-kernel data tier for an mmap'ed, read-mostly dataset. Explain (a) per-page placement policy and migration trigger on access, (b) how to migrate pages with minimal stalls and respect NUMA locality, (c) eviction and fairness across processes, (d) crash-consistency and power-fail recovery for PMEM-resident data, and (e) a minimal data-structure sketch for per-page metadata and a test plan under memory pressure?",
+        "id": "operating-systems-q-11",
+        "questionId": "q-25039",
+        "question": "In a Linux-like kernel, extend the page cache with a user-space prefetch-hint API to preload pages of a memory-mapped file before touch. Describe end-to-end flow: hint delivery, per-page state transitions, CAS-based deduping of concurrent prefetches, source selection (IO, zero-fill, or read-ahead), per-process quotas, and how to guarantee correctness and fairness under contention when many processes map the same dataset?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a 16-byte circular buffer with head and tail indices. In the ISR, compute next=(head+1)&15; if next==tail, overflow; else buf[head]=byte; head=next; memory barriers; wake reader. In read(), block",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose a 256-bucket timer wheel with per-bucket locks. add_timer(delay, cb) computes slot = (tick + delay) & 0xFF and links the timer into that bucket. timer_tick() increments tick, drains the curren",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "A kernel API exposes prefetch hints via ioctl; a per-page state machine tracks HOLE, PENDING, and LOADED states. Hints enqueue fetch tasks, and CAS (compare-and-swap) operations prevent duplicate I/O when multiple proce…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "On a two-socket NUMA Linux server, cross-node touches trigger page migration, TLB shootdowns, and cache coherence traffic, causing latency spikes and lower throughput under bursts. A microbenchmark sh",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question tests deep understanding of demand paging, race conditions, and kernel-userspace coordination. It probes how prefetch hints interact with the fault path, concurrency control, and memory fairness under high contention.\n\n## Key Concepts\n\n- **Per-page state machine**: HOLE → PENDING → LOADED\n- **CAS-based deduplication**: Prevents duplicate I/O across concurrent hints for the same page\n- **Hint delivery path**: Userspace to kernel paging subsystem via ioctl or equivalent\n- **Source selection**: Read-ahead I/O, zero-fill, or direct I/O based on file state and access pattern\n- **Per-process quotas**: Prevent any single process from dominating memory or I/O resources\n- **Fairness under contention**: Throttling, bounded parallelism, and eviction policies balance competing workloads accessing the same dataset",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "operating-systems-q-12",
+        "questionId": "q-21516",
+        "question": "In a Linux-like kernel, design a cooperative memory reclamation policy that guarantees tail latency bounds for latency-sensitive services by partitioning the page cache into per-service slabs and using a deterministic eviction schedule with per-slab quotas and backpressure signals. Describe the end-to-end flow from memory pressure event to eviction decision, including per-page state, CAS-based claims, cross-slab coordination, and validation under contention?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a kernel feature for a 2–4 GiB file-backed region mapped by multiple containers with per-container permissions. On first write, enable per-page container COW, track ownership in per-page metada",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose per-service slabs in a shared page cache with CAS-serialized eviction. Under pressure, select a victim slab deterministically, CAS a victim page, evict, and replenish from a NUMA-aware source.",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement per-core runqueues with heterogenous cores. Measure contention by queue length, stall cycles, and migration frequency; balance by migrating one ready task from the hottest core to a cooler o",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Introduce acquire/release ordering in a ring buffer. Producer writes data[tail] then tail.store(next, memory_order_release). Consumer loads tail with memory_order_acquire and reads data[head] if head",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question probes memory reclamation under contention, cross-service isolation, and CAS-based synchronization in a NUMA-aware kernel, testing both design and practicality.\n\n## Key Concepts\n\n- Per-service quotas in a shared cache\n- Deterministic eviction scheduling\n- CAS-based victim claims\n- Backpressure signaling to avoid thrash\n- NUMA-aware replenishment and cross-slab coordination\n\n## Code Example\n\n```c\n// Pseudo sketch: CAS-based page claim within a slab\ntypedef struct { int claimed; } page_t;\ntypedef struct { page_t *pages; size_t n; } slab_t;\nint evict_one(slab_t *s) {\n  for (size_t i = 0; i < s->n; i++) {\n    if (__sync_bool_compare_and_swap(&s->pages[i].claimed, 0, 1)) {\n      // evict this page\n      return 1;\n    }\n  }\n  return 0;\n}\n```\n\n## Follow-up Questions\n\n- How would you adapt this policy as slabs resize dynamically under changing workloads?\n- What tests would prove tail-latency guarantees across bursty traffic and multi-tenant workloads?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "operating-systems-q-13",
+        "questionId": "q-24226",
+        "question": "In a Linux-like kernel powering thousands of containers, design a scalable, low-latency I/O prioritization subsystem that guarantees per-container I/O budgets while avoiding head-of-line blocking on shared devices. Describe data structures, how you handle dynamic quotas, enforcement across devices, and how you test fairness under mixed workloads (CPU-bound, IO-bound) and bursty contention. Provide a minimal pseudo-code path for enqueue and dispatch?",
         "type": "single",
         "options": [
           {
@@ -199,72 +409,252 @@
           },
           {
             "id": "b",
-            "text": "Three ready queues Q0–Q2 with quanta 4, 8, 16. Aging promotes waiting tasks by one level after A ticks to prevent starvation. On quantum expiry, move the running task to the next lower level; on IO co",
+            "text": "An interleaving: a writer performs a compare-and-swap to publish a new node pointer before fully initializing its fields; a reader loads the pointer and dereferences it before initialization completes, reading partially…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Decrement current->time_slice on each timer tick; if it hits zero, push current to the end of the ready queue and switch to the next ready task. Use a brief interrupt lock around the scheduler state.",
+            "text": "Waiters are enqueued in a per-futex bucket using a compact lock-free queue. A per-CPU wake-batch aggregates sleepers and issues a single IPI to wake target CPUs where the predicate may hold. Wakes drain the queue in bat…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Per-page hotness tracking uses recency and frequency metrics to drive tiering decisions. Hot pages remain in DRAM while cold pages are demoted to PMEM. On first access (touch) of a page, migrate it to DRAM asynchronousl…",
+            "text": "Design a hierarchical I/O scheduler with per-container credits, per-device queues, and adaptive budgets that allow bursting within safe limits. Use per-core run queues combined with token buckets and a global budget all…",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question assesses understanding of memory tiering, NUMA-aware page migration, and crash-safe PMEM handling in kernel development.\n\n## Key Concepts\n- Memory tier hierarchy with per-page metadata and migration triggers\n- Asynchronous batch migrations maintaining NUMA locality\n- Cross-node eviction fairness with backpressure mechanisms\n- Crash-consistency using PMEM redo logs and recovery procedures\n- Validation under memory pressure with fault injection testing\n\n## Code Example\n```c\n// Minimal in-kernel metadata sketch (pseudo-C)\ntypedef struct {\n    uint8_t  tier;        // 0=PMEM, 1=DRAM\n    uint8_t  hotness;     // Access counter/recency\n    uint32_t owner;       // Owning process PID\n    bool     dirty;       // Needs persistence sync\n} PageMeta;\n\nvoid migrate_to_dram(Page *p) { /* ... */ }\nvoid migrate_to_pmem(Page *p) { /* ... */ }\n```",
+        "explanation": "## Why This Is Asked\nThis question evaluates candidates' ability to design scalable, multi-tenant operating system components that handle real-world production workloads. It tests understanding of kernel-level I/O subsystems, resource isolation, and fairness algorithms.\n\n## Key Concepts\n- Per-container quotas via cgroups blkio controller\n- Per-device I/O queues with hierarchical scheduling\n- Lock-free vs. locking trade-offs in hot paths\n- Fairness and starvation prevention mechanisms\n- Burst handling, credit reclamation, and idle time bonuses\n\n## Minimal Pseudo-Code\n\n```javascript\n// Enqueue: add request to per-container queue, attempt to acquire device ticket\nfunction enqueue(container_id, request) {\n  container_queue = get_container_queue(container_id)\n  container_queue.push(request)\n  \n  // Try to acquire dispatch token for this container\n  if (container_credits[container_id] > 0) {\n    device_queue = get_device_queue(request.device)\n    if (device_queue.try_acquire_lock(container_id)) {\n      dispatch(container_id, request.device)\n    }\n  }\n}\n\n// Dispatch: select next request using DRR, respecting weights and deficits\nfunction dispatch(container_id, device) {\n  device_queue = get_device_queue(device)\n  \n  // DRR: serve quantum, carry deficit to next round\n  while (device_queue.has_pending(container_id)) {\n    quantum = container_weight[container_id] * base_quantum\n    deficit[container_id] += quantum\n    \n    while (deficit[container_id] > 0 && !container_queue.empty(container_id)) {\n      request = container_queue.pop(container_id)\n      service_time = estimate_cost(request)\n      deficit[container_id] -= service_time\n      issue_to_device(device, request)\n    }\n    \n    // Move to next container if depleted\n    container_id = device_queue.next_container(container_id)\n  }\n}\n\n// Budget reclaimer: periodic task to reclaim unused credits\nfunction reclaim_credits() {\n  for each container in active_containers {\n    if (idle_time[container] > idle_bonus_threshold) {\n      container_credits[container] += idle_bonus\n    }\n    // Burn-in period for newly activated containers\n    container_credits[container] = min(\n      container_credits[container] + base_allocation,\n      max_burst_limit\n    )\n  }\n}\n```",
         "difficulty": "advanced"
       },
       {
-        "id": "operating-systems-q-7",
-        "questionId": "q-2220",
-        "question": "Scenario: A process has two threads: T1 holds a mutex to update a shared log buffer; T2 is blocked trying to acquire the same mutex. A SIGINT is delivered to the process while T1 is in the middle of updating. Explain the sequence of events from signal delivery to termination, including the mutex state, potential race conditions, and safe patterns for signal handling in multi-threaded programs (like async-signal-safe handlers and deferred cleanup via a dedicated signal-handling thread or self-pipe)?",
+        "id": "operating-systems-q-14",
+        "questionId": "q-19837",
+        "question": "Implement a minimal user-space stack growth mechanism for a toy OS. Each thread's stack grows downward and is protected by a guard page. When a fault occurs touching memory below the current stack, describe end-to-end how to grow the stack safely: (1) detect and coordinate concurrent growth races, (2) allocate/zero-fill the new page and update page tables, (3) enforce per-thread stack limits and fairness under contention. Provide a concise pseudo-implementation outline?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "A per-core circular deque with a head/tail index and a small version stamp to guard against ABA; local enqueue/dequeue use atomic fetch_add/ncas with release/acquire semantics; other cores steal by CA",
+            "text": "Use a parent loop to reap children without races. Method A: in main thread, repeatedly call waitpid(-1, &status, 0) and process each pid; break when returns -1 with errno==ECHILD. Method B: install a",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Two-tier I/O scheduler in the block layer: assign per-tenant tokens and per-flow budgets. Fast path handles latency-sensitive small I/O via a shared ring; larger or backlogged requests move to per-ten",
+            "text": "On fault below stack base, perform an atomic CAS to subtract one page from the thread's stack-base. If CAS wins, allocate a new page, zero-fill or load from swap, map it with user permissions, and flu",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "On fault, acquire per-page lock; if another thread is loading, wait. If a free frame exists, allocate it and issue async read from swap/file; on completion atomically update the PTE with frame, set pr",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "An interleaving: a writer performs a compare-and-swap to publish a new node pointer before fully initializing its fields; a reader loads the pointer and dereferences it before initialization completes, reading partially…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of demand paging, stack growth, race conditions, and memory protection at OS level; evaluates handling of concurrency and TLB effects.\n\n## Key Concepts\n- Guard pages and demand paging\n- Atomic CAS for lock-free growth\n- Per-thread stack limits and fairness\n- Page table updates and TLB flush semantics\n\n## Code Example\n```c\n// Pseudo-code: grow_stack(thread, fault_addr)\nsize_t new_base;\nif (fault_addr < thread->stack_base - PAGE_SIZE) {\n  if (atomic_cas(&thread->stack_base, fault_addr_base, fault_addr_base - PAGE_SIZE)) {\n     page_t *p = allocate_page();\n     map_page(thread->pid, new_base, p, PERM_READ_WRITE);\n     flush_tlb(thread);\n     return RESUME;\n  } else {\n     // another thread grew\n     return retry_fault();\n  }\n}\n```\n\n## Follow-up Questions\n- How would you test for race conditions in stack growth?\n- What are edge cases when many threads fault concurrently?\n- How would you enforce a hard per-thread stack limit without starving others?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "operating-systems-q-15",
+        "questionId": "q-2943",
+        "question": "Describe a robust strategy for a parent process to collect exit statuses of multiple forked children in Linux. Include waitpid usage in a loop, handling of SIGCHLD, and zombie prevention. Also cover edge cases like stopped/continued children and race-free accounting?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Signals target a single thread; if that thread holds a mutex, the handler runs with the mutex still held, risking deadlock or data corruption unless the handler uses only async-signal-safe calls. Prac",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a parent loop to reap children without races. Method A: in main thread, repeatedly call waitpid(-1, &status, 0) and process each pid; break when returns -1 with errno==ECHILD. Method B: install a",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "On a touch fault for a 4KB page not resident and without a backing file, the handler first checks page presence and performs an atomic test-and-set operation to reserve the page. A 4KB page is allocated from the buddy a…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Allocate 8 MB per thread with a guard page below the stack. A touch on the guard triggers a page fault; runtime unwinds thread-local state, marks the thread dead, cleans resources, and yields to the s",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of process lifecycle, waitpid usage, and zombie avoidance in a practical multi-child scenario.\n\n## Key Concepts\n- waitpid semantics and looping\n- SIGCHLD handling and reaping\n- WNOHANG and non-blocking variants\n- Zombie processes and edge cases (stopped/continued)\n\n## Code Example\n```javascript\n#include <sys/types.h>\n#include <sys/wait.h>\n#include <unistd.h>\n#include <errno.h>\n\nint main() {\n  // spawn N children ...\n  int finished = 0; int status;\n  while (finished < N) {\n    pid_t pid = waitpid(-1, &status, 0);\n    if (pid > 0) { finished++; /* process status */ }\n    else if (pid == -1 && errno == ECHILD) break;\n  }\n  return 0;\n}\n```\n\n## Follow-up Questions\n- How would you adapt this for SIGCHLD storms or large N?\n- What are the risks of ignoring zombie cleanup in long-running daemons?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "operating-systems-q-16",
+        "questionId": "q-3892",
+        "question": "Two processes write concurrently to the same file opened with O_APPEND. Describe end-to-end how the kernel ensures atomic appends, what can cause atomicity to fail (buffered I/O, network FS), and how you would guarantee visibility and ordering in practice?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "On a Linux-like kernel, O_APPEND makes each write execute atomically with respect to other O_APPEND writes by updating the per-file offset in an atomic operation and appending the data to the inode bu",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Describe a per-page in-flight flag and a CAS-based owner election. On fault, a thread atomically claims ownership, populates via file I/O or zero-fill, then updates page-table entries and notifies wai",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Signals target a single thread; if that thread holds a mutex, the handler runs with the mutex still held, risking deadlock or data corruption unless the handler uses only async-signal-safe calls. Prac",
-            "isCorrect": true
+            "text": "Design a per-cgroup memory reclaim policy that prevents noisy neighbor scenarios. Implement per-cgroup memory accounting with distinct watermarks for low, high, and urgent pressure levels. Track separate counters for an…",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Propose a NUMA-aware page migration that moves hot pages to the process home node on first touch, with per-page state, pinning during migration, batched TLB shootdowns, and contention-aware scheduling",
+            "text": "Demand paging loads pages only on first access, triggering page faults handled by the OS. Page replacement algorithms like LRU, FIFO, or Clock evict pages when memory is full. The TLB caches recent translations to reduc…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nAssess understanding of signal semantics in multi-threaded processes and safe cleanup patterns.\n\n## Key Concepts\n- Signals and thread-level delivery\n- Async-signal-safety and mutex interactions\n- Self-pipe trick and deferred cleanup\n\n## Code Example\n```javascript\n#include <signal.h>\n#include <unistd.h>\n#include <stdlib.h>\n#include <stdio.h>\n\nint pipefd[2];\n\nvoid sigint(int s){\n  char c = 1;\n  write(pipefd[1], &c, 1);\n}\n\nint main(){\n  pipe(pipefd);\n  struct sigaction sa;\n  sa.sa_handler = sigint;\n  sigemptyset(&sa.sa_mask);\n  sa.sa_flags = 0;\n  sigaction(SIGINT, &sa, NULL);\n\n  char buf;\n  while (read(pipefd[0], &buf, 1) > 0) {\n    // termination requested\n  }\n  return 0;\n}\n```\n\n## Follow-up Questions\n- What happens if multiple signals arrive rapidly?\n- How would you implement a robust termination sequence in a real program?",
+        "explanation": "## Why This Is Asked\nTests understanding of atomic file semantics, VFS buffering, and real-world filesystem behavior under concurrent writes.\n\n## Key Concepts\n- Atomic appends with O_APPEND\n- VFS inode buffering and writeback\n- fsync/fdatasync for visibility guarantees\n- Atomicity caveats on network/remote FS\n\n## Code Example\n```c\nint fd = open(\"data.log\", O_WRONLY | O_APPEND);\nssize_t n = write(fd, buf, len);\n// Expect write to append atomically with respect to other O_APPEND writes\n```\n\n## Follow-up Questions\n- How would you test atomicity across a network filesystem? \n- What changes when using O_SYNC or writing via a dedicated append-logging mechanism?",
         "difficulty": "beginner"
       },
       {
-        "id": "operating-systems-q-8",
+        "id": "operating-systems-q-17",
+        "questionId": "q-16661",
+        "question": "Design and implement a kernel-level, NUMA-aware I/O throttler that enforces per-process I/O bandwidth on a multi-queue NVMe device. Provide end-to-end flow from IO submission to completion, describe per-task quotas, per-IO-queue limits, and a token-bucket mechanism; include a minimal C-like sketch for token consumption and queueing logic, and a test plan to validate fairness and throughput?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a thread-safe coalescer using a sorted map of pending IO by [start,end). On each Request(offset,len,op), locate overlaps or adjacency, merge spans and combine ops; otherwise insert a new nod",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement per-device submission queues and a shared completion path. Submissions enqueue atomically into a device queue; a per-core worker pool dequeues and issues I/O. Upon completion, an entry is po",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a circular buffer with head, tail, and count trackers. Use a mutex for synchronization and two wait queues for readers and writers. Reads block when count==0 (unless O_NONBLOCK is set, returning -EAGAIN); writes…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a per-task I/O quota in task_struct, a per-NUMA IO queue, and a token-bucket throttler that refills tokens at the assigned bandwidth. On IO submit, atomically deduct tokens; if insufficient,",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis probes low-level I/O pacing, NUMA locality, and concurrency under contention; it tests both design and practical skeleton implementation.\n\n## Key Concepts\n- I/O throttling and quotas\n- Token bucket algorithm\n- NUMA-aware data structures and per-CPU queues\n- Atomic CAS and lock-free coordination\n- Wakeups, timers, and tail-latency testing\n\n## Code Example\n```c\n// Pseudo-C implementation sketch\ntypedef struct io_quota {\n  atomic_long tokens;\n  long refill_rate; // tokens/ms\n  wait_queue_t *wait;\n} io_quota_t;\n\nbool submit_io(io_task_t *t, size_t bytes) {\n  long old = atomic_fetch_sub(&t->quota->tokens, bytes);\n  if (old >= (long)bytes) return true; // enough tokens\n  atomic_fetch_add(&t->quota->tokens, bytes); // revert\n  enqueue_wait(t->quota->wait, t);\n  return false;\n}\n```\n\n## Follow-up Questions\n- How would you test fairness and prevent starvation under bursty I/O? \n- How do you handle NUMA migrations and quotas when a task moves between nodes?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "operating-systems-q-18",
+        "questionId": "q-30366",
+        "question": "In a NUMA-enabled Linux-like hypervisor hosting dozens of KVM guests across many CPU sockets, implement a scalable, low-latency page-migration mechanism to rebalance memory across NUMA nodes under sustained memory pressure. Describe data structures (per-node free lists, per-VM quotas, migration work-stealers), synchronization, and when to trigger migrations. Provide a minimal path sketch for moving a page from source to target node and updating mappings safely?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Per-core buffers with local free-lists; allocation uses the local pool with O(1) amortized cost. Under memory pressure, a background migrator shifts a batch of idle buffers to the busiest cores using CAS-based handoff,…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a NUMA-aware migrator that uses per-node free lists plus per-VM quotas, with a central migration pool and per-core work-stealers. On memory pressure, pick cold pages, compute target node by acc",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use a global 16-bit PID bitmap with a generation counter per PID and a small lock. On alloc, scan for a free slot, mark in_use, bump generation, and return pid = (gen << 16) | index. On release, clear",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "A candidate would describe: set both PTEs to read-only with a refcount; on write fault, allocate a new page, copy data, update both mappings to point to the private page, atomically clear RO flag, and",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design NUMA-aware memory management at scale. Evaluates page migration planning, coherence, and interaction with TLB shootdowns.\n\n## Key Concepts\n- NUMA-aware balancing and migration policies\n- Per-node freelists and per-VM quotas\n- Synchronization and per-core work-stealing\n- PTE updates, TLB coherence, and IPI coordination\n- Contention, thrash, and batch processing\n\n## Code Example\n```c\n// Pseudo-path sketch\nvoid migrate_page(page_t *p, node_t *target) {\n  lock(p->lock);\n  if (p->state != PAGE_ONLINE) return;\n  move_to_node(p, target);\n  update_pte(p);\n  barrier();\n  tlb_shootdown(p);\n  unlock(p->lock);\n}\n```\n\n## Follow-up Questions\n- How would you test under sustained memory pressure and multiple VM instances?\n- How would you ensure fairness and prevent migration thrash?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "operating-systems-q-19",
+        "questionId": "q-21965",
+        "question": "In a Linux-like kernel with a shared per-process page cache backed by a remote object store, implement a quota-aware eviction policy that keeps per-process limits, never evicts dirty pages before writeback, and handles concurrent eviction races. Describe end-to-end eviction flow, per-page state, and provide a minimal C-like sketch for an eviction decision and CAS-based claim?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use per-VM memory credits and a global pressure estimator. The ballooner tracks a deficit for each VM; when host pressure rises, it reclaim increasingly from the VM's local free list, marking pages re",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a quota-aware eviction path for a shared per-process page cache backed by a remote store. Track per-process credit, per-page flags (clean/dirty, claimed, evicted), and select candidates from a",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use per-node free lists with per-tenant quotas; try local allocation first, then source from other nodes only if under quota, using CAS to claim pages and update per-tenant counters. Maintain per-page",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose a 256-bucket timer wheel with per-bucket locks. add_timer(delay, cb) computes slot = (tick + delay) & 0xFF and links the timer into that bucket. timer_tick() increments tick, drains the curren",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests understanding of memory cache eviction with per-process quotas, correctness under concurrency, and interaction with remote backends.\n\n## Key Concepts\n\n- Per-process quotas and accounting\n- Per-page state (clean/dirty, eviction-claimed, evicted) and CAS-based races\n- Eviction flow: candidate selection, quota enforcement, writeback coordination\n- Data structures: per-CPU LRU, global eviction gate, writeback queues\n- Remote store latency impact and fairness guarantees\n\n## Code Example\n\n```c\n// Minimal eviction sketch\ntypedef struct page {\n  atomic_int ref;\n  int owner;                  // pid\n  atomic_bool dirty;\n  atomic_bool evicted;\n  atomic_bool claimed;\n} page_t;\n\nbool evict_candidate(page_t *p, int owner_quota) {\n  if (atomic_load(&p->dirty)) return false;      // never evict dirty before writeback\n  if (atomic_load(&p->claimed)) return false;    // another thread claiming it\n  if (atomic_compare_exchange_strong(&p->claimed, 0, 1)) {\n    // update owner quota here atomically (pseudo)\n    atomic_store(&p->evicted, 1);\n    return true;\n  }\n  return false;\n}\n```\n\n## Follow-up Questions\n\n- How would you test fairness and prevent starvation under bursty eviction pressure?\n- How do you handle re-accesses to recently evicted pages from the remote store to avoid thrashing?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "operating-systems-q-20",
+        "questionId": "q-17783",
+        "question": "Design and implement a fixed-size circular buffer to connect two threads (producer and consumer). Provide put(byte) and get() with blocking semantics for full/empty, plus minimal synchronization scaffolding. Include a small C-like patch showing indices wrap-around and how to test for correctness under contention?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a balanced interval tree (such as a red-black tree or AVL tree) where each node represents a locked byte range [start, end). Each node contains a mutex and a wait-queue for threads blocked on that range. To acquire…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Describe the fault path: the trap handler checks the fault address against the process's stack growth policy and RLIMIT_STACK; if allowed, allocate a 4KB page, zero it, map it at the next lower addres",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use per-page state with CAS transitions: UNCLAIMED → INFLIGHT (the first fault), then → FILLED. The first waiter triggers I/O from the nearest NUMA node; others sleep on a per-page waitqueue. After fi",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a circular buffer of size N with head, tail, and count. Synchronize with a mutex and two condition variables: not_full and not_empty. put(x): lock; while count==N, wait on not_full; buf[head] = x;",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis tests understanding of a classic OS primitive: inter-thread communication via a bounded buffer, with correct blocking and wakeup semantics. It demonstrates practical handling of wrap-around, fairness, and race-free handoffs.\n\n## Key Concepts\n- Circular buffer mechanics (head/tail wrap) \n- Blocking synchronization with mutex and condition variables\n- Correct full/empty checks and wakeups to avoid deadlock\n- Memory visibility between producer and consumer\n\n## Code Example\n```javascript\ntypedef struct {\n  int *buf;\n  int size;\n  int head, tail, count;\n  pthread_mutex_t m;\n  pthread_cond_t not_full, not_empty;\n} circbuf;\n// put/get implementations outlined in answer snippet\n```\n\n## Follow-up Questions\n- How would you generalize to multiple producers/consumers?\n- How would you test with thread sanitizers and measure throughput?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "operating-systems-q-21",
         "questionId": "q-10720",
         "question": "Design a NUMA-aware memory allocator extension for a 4-socket server running latency-sensitive trading workloads and background analytics. It should prefer local pages, collect per-node pressure, and migrate a thread’s affinity when cross-node access latency crosses a threshold. Describe data structures and provide a minimal C sketch for alloc, migrate, and free; plus a test plan to validate remote-miss reduction?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Detect sequential access by tracking the previous block number and stride; when a run of 3+ consecutive accesses is observed, prefetch a window of the next 4–8 blocks asynchronously. Mark prefetched b",
+            "text": "Three ready queues Q0–Q2 with quanta 4, 8, 16. Aging promotes waiting tasks by one level after A ticks to prevent starvation. On quantum expiry, move the running task to the next lower level; on IO co",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement a per-CPU sleep queue keyed by wake_time. On sleep(n), enqueue {tid, wake_at=now+n}. On timer tick, pop all entries with wake_at <= now and wake them. Re-check the time after dequeue to handle timer jitter; re…",
+            "text": "Assign each tenant a dedicated I/O queue with a credit balance. Refill credits at a rate aligned with target latency; enqueue only if credits remain, else enter overdraft with decay. Dequeue selects t",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Describe an asynchronous I/O completion pipeline: devices enqueue events into a lock-free ring; a reactor dequeues and wakes waiters via per-task queues. Explain end-to-end flow, how to avoid loss und",
+            "text": "Use a per-slot seqlock-like protocol. Writer: publish 0 to seq, write payload, then set seq to 1 (commit). Reader: read seq; if 0 or if seq changes before reading payload, retry; otherwise read payloa",
             "isCorrect": false
           },
           {
@@ -277,488 +667,98 @@
         "difficulty": "intermediate"
       },
       {
-        "id": "operating-systems-q-9",
-        "questionId": "q-26388",
-        "question": "Design and implement an in-kernel adaptive file prefetcher that switches between sequential read-ahead and random-access patterns based on observed stride and hit rates. Provide data structures to track per-file access patterns, a policy for adjusting prefetch distance, and a test plan showing correctness and performance under mixed workloads?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a kernel-level deduplicated shared page cache keyed by page content hash, featuring a global page table with compare-and-swap (CAS) based claiming on page faults, lazy loading from the backing file, per-page refe…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use a FIFO ticket lock with a wait queue. Acquire: ticket = fetch_add(&lk->next, 1); spin until nowServing == ticket; Enter critical section; Release: nowServing++ and wake the next waiter via the que",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement an adaptive file prefetcher using per-file state tracking with a pattern classification engine that distinguishes between sequential, strided, and random access patterns based on offset deltas and cache hit ra…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a hierarchical I/O scheduler with per-container credits, per-device queues, and adaptive budgets that allow bursting within safe limits. Use per-core run queues combined with token buckets and a global budget all…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests candidates' practical skills in I/O optimization by combining read-ahead mechanisms with workload-adaptive strategies—a common challenge at scale.\n\n## Key Concepts\n- Per-file I/O pattern tracking via offset delta analysis\n- Adaptive prefetch distance based on cache hit/miss feedback\n- Concurrency control using RCU and per-CPU data structures\n- Avoiding cache pollution from misdirected prefetch requests\n\n## Implementation Considerations\n- **Stride confidence**: Require N consecutive consistent deltas before classifying as strided\n- **Prefetch distance**: Start conservative (e.g., 4 pages) and adjust based on observed hit rates; increase distance for sequential workloads, decrease or disable for random access\n- **Pattern transitions**: Allow graceful switching between patterns as workload characteristics evolve over time",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "operating-systems-q-10",
-        "questionId": "q-3243",
-        "question": "Explain a concrete race in a Linux-like kernel when a memory-mapped page is faulted in while a concurrent writeback evicts the same page. How does page cache coherence, dirty flags, and TLB invalidation interact to yield a stale read or lost write? Propose a minimal fix to guarantee visibility without sacrificing performance?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "A concrete race: a reader faults in a mmap’d page while a writer’s writeback evicts that same page, yielding a stale read. Coherence relies on page dirty flags, writeback, and cache invalidation on fa",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use a power-of-two circular buffer with atomic indices. The producer on core A increments head using fetch-and-add, writes data to the corresponding slot, then publishes via a release fence. The consumer on core B incre…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "On a two-socket NUMA Linux server, cross-node touches trigger page migration, TLB shootdowns, and cache coherence traffic, causing latency spikes and lower throughput under bursts. A microbenchmark sh",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use an MCS-style queue lock with per-thread stack-allocated nodes, linking to the predecessor and spinning on a private flag. Place each node in the thread’s NUMA domain and pad to a cache line to red",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests understanding of page fault paths, page cache coherence, TLB/invalidation, and race conditions between page cache eviction and fault handling.\n\n## Key Concepts\n- Page cache lifecycle (cache hits, misses, eviction)\n- Page fault handling and faulting threads\n- TLB invalidation and cache coherence across cores\n\n## Code Example\n```javascript\n// Simplified fault path sketch (not actual kernel code)\nfunction handleMmapFault(page, proc) {\n  if (!page.inCache) {\n    loadPageIntoCache(page, proc);\n  }\n  // else, return cached data\n}\n```\n\n## Follow-up Questions\n- How would you implement per-page pinning to prevent eviction during fault handling without harming performance?\n- How would you test this race with stress tests and performance counters?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "operating-systems-q-11",
-        "questionId": "q-20116",
-        "question": "Build a tiny user-space thread library that uses a timer interrupt to preempt threads. Describe data structures, how setjmp/longjmp are used for context switches, how you implement a ready queue with minimal synchronization, and a minimal C-like sketch of yield() and the timer handler providing the next thread to run?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a per-thread control block with a stack and a stored jmp_buf. A timer signal (SIGALRM) preempts the running thread; the handler saves context via setjmp, appends the thread to the tail of a lock-f",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use per-namespace queues and a global arbiter. On submit, io_req CAS-claims a slot in the namespace, then enqueues; arbiter assigns slots from a shared window based on QoS tokens. Device submission us",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Propose a NUMA-aware, per-node cache with per-dataset index. On fault, CAS to claim a page, allocate locally, issue IO from NVMe, insert into per-node LRU, and update cross-node credits to throttle ev",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Only one thread performs the IO: acquire per-page lock, set state LOADING, issue disk read, then set READY and release lock. Other threads wait on a condition/wait-queue; on wakeup they re-check, map",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests knowledge of user-space threading, signals, and context switching in a simple runtime. It probes correctness under preemption and reasonable performance in a beginner setting.\n\n## Key Concepts\n\n- User-space threads\n- setjmp/longjmp context switches\n- Signals and masking\n- Race conditions in ready queue\n- Preemption vs cooperative scheduling\n\n## Code Example\n\n```c\n#include <setjmp.h>\n#include <signal.h>\n\ntypedef struct TCB { jmp_buf ctx; void *stack; int id; } TCB;\n// simplified enqueue/dequeue and scheduler stubs\n```\n\n## Follow-up Questions\n\n- How would you test for correctness under timer bursts?\n- How would you extend to multiple cores?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "operating-systems-q-12",
-        "questionId": "q-16224",
-        "question": "Design a cross-container shared memory region backed by a single hugepage pool in a Linux-like kernel. On first touch by any container, allocate, possibly deduplicate identical pages, load from backing store if needed, and track per-container quotas and NUMA placement. Describe end-to-end flow from first touch to eviction, including per-page state, CAS-based claim to prevent double fetch, and how to ensure fairness under high contention?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a NUMA-aware cross-VM shared page cache with per-VM quotas on a Linux-like host. Pages load lazily on first touch and are cached globally, guarded by per-VM credits to throttle prefetches and prevent cache-floodi…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "On unmapped page touch, trap -> page fault handler checks PTE; if not present, allocate a free frame or zero-fill; map page in PTE, set present, flush TLB, resume faulting thread. To prevent concurren",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "On first touch, CAS-claim the target page, load from backing store or zero-fill, and then either allocate a new frame or reuse a deduplicated frame identified by a fingerprint. Maintain per-container",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a NUMA-aware page cache eviction policy with per-container quotas. On a page fault, look up local node cache; if miss, fetch from disk and assign to container quota. Eviction uses a global LRU",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nInterviews a new angle: cross-container memory sharing with dedup under contention and NUMA-aware eviction.\n\n## Key Concepts\n- CAS-based first-touch serialization\n- Per-page metadata and state machine\n- Fingerprint dedup across containers\n- Per-container quotas and NUMA placement\n- Barrier-based correctness under race conditions\n\n## Code Example\n```c\ntypedef struct page {\n  atomic_uint refcount;\n  uint32_t owner_id;\n  uint8_t state; // FREE/RESIDENT/LOADED/DEDUPED\n  uint64_t fingerprint;\n  void* frame;\n}\n```\n\n## Follow-up Questions\n- How would you test contention and eviction fairness across NUMA nodes?\n- How would you handle load failures to backing store?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "operating-systems-q-13",
-        "questionId": "q-3625",
-        "question": "In a Linux kernel driver for a PCIe DMA device, the host uses a shared descriptor ring with the device. A producer thread writes descriptors and updates a head pointer; the device consumes descriptors and raises an interrupt on completion. Describe a concrete interleaving that could yield a lost or out-of-order completion if there is no proper synchronization between producer writes and device processing. Propose a minimal fix using per-descriptor sequence numbers and memory barriers (e.g., smp_wmb, dma_wmb) and explain how this guarantees in-order, at-least-once completion, including cache coherence and DMA semantics?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "On fault for page P not in RAM: allocate a frame, set P.state=LOADING, submit disk read for P. If another thread faults P during LOADING, it waits on a per-page wait-queue. When IO completes, map the",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Maintain a bidirectional ordered queue sorted by sector number, with a current travel direction flag. The disk head serves requests in sector order along the current direction until reaching either end of the disk. Upon…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a crash-safe metadata journaling layer: a write-ahead log of inode and directory-entry updates, a two-phase commit, and a durable log flush before applying changes. Support atomic mkdir/rename,",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Interleaving: producer writes desc0, then desc1, then updates head to 1; device may observe head=1 and fetch desc1 before desc0 is visible due to missing barriers. Fix: add a per-descriptor seq field; device validates s…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests concrete reasoning about DMA rings, ordering guarantees, and barrier semantics in drivers.\n\n## Key Concepts\n- PCIe DMA descriptor rings, producer/consumer synchronization\n- Per-descriptor sequence numbers, publish semantics\n- Memory barriers (dma_wmb, smp_wmb) and DMA coherence\n- Cache lines and visibility between CPU and device\n\n## Code Example\n```c\n// pseudo-C like\nstruct desc { uint64_t addr; uint32_t len; uint32_t flags; uint64_t seq; };\ndesc[i].addr = data; \ndesc[i].len = n; \ndma_wmb();\ndesc[i].seq = i; \nsmp_wmb();\nhead = i; // publish\n```\n\n## Follow-up Questions\n- How would you handle sequence number wraparound?\n- What if the device doesn't support sequence numbers?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "operating-systems-q-14",
-        "questionId": "q-15253",
-        "question": "Design a scalable TLB shootdown mechanism for a Linux-like kernel on a multi-socket NUMA system with frequent page migrations. Describe the end-to-end path from a page table entry change to TLB invalidations across CPUs, including batching, IPI strategies, and race handling with concurrent migrations; discuss correctness guarantees and performance trade-offs under memory pressure?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Two-tier invalidation: per-CPU queues plus a global batched shootdown. On PTE change, mark the VPN range dirty, enqueue the local CPU shootdown, and periodically drain to broadcast an IPI to other CPU",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use per-VM memory credits and a global pressure estimator. The ballooner tracks a deficit for each VM; when host pressure rises, it reclaim increasingly from the VM's local free list, marking pages re",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a per-process I/O budget QoS scheduler: each process has credits; I/Os consume credits; when credits run out, requests are delayed until replenished. Use per-device WFQ-like queues and a glo",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a NUMA-aware memory allocator extension for a 4-socket server running latency-sensitive trading workloads alongside background analytics. The allocator should prefer local memory pages, track per-node pressure me…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nEvaluates understanding of TLB semantics, cross-CPU coordination, and NUMA memory behavior under churn.\n\n## Key Concepts\n\n- TLB shootdown guarantees\n- Batched IPI invalidations\n- Race conditions with page migrations\n- Memory pressure effects on latency\n\n## Code Example\n\n```c\n// Pseudo: mark and enqueue\nvoid on_pte_change(pte_t *pte){\n   lock(pte);\n   pte->valid = 0;\n   enqueue_shootdown(pte->vpn_start, pte->vpn_end);\n   unlock(pte);\n}\n```\n\n## Follow-up Questions\n\n- How would you measure worst-case latency?\n- How would you extend to handle huge batches without starving CPUs?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "operating-systems-q-15",
-        "questionId": "q-15711",
-        "question": "Design a virtual I/O bridge in a Linux-like kernel that routes block I/O requests from multiple isolated namespaces to a single RDMA-capable NVMe device. Each namespace has a QoS target and a bounded I/O budget. Describe the end-to-end path from user submission to device completion, including per-namespace queues, slot arbitration, race-free claim of slots (CAS), and how to guarantee fairness under bursty workloads. Provide a minimal C sketch for enqueue, dequeue, and a test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use per-namespace queues and a global arbiter. On submit, io_req CAS-claims a slot in the namespace, then enqueues; arbiter assigns slots from a shared window based on QoS tokens. Device submission us",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Propose a NUMA-aware page migration that moves hot pages to the process home node on first touch, with per-page state, pinning during migration, batched TLB shootdowns, and contention-aware scheduling",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use 64-frame cache with per-frame locks and a global eviction lock. Each frame stores page_id, dirty flag, pin count, and an LRU linkage. On miss, load and pin. On eviction, if dirty, perform write-ba",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "On a TLB miss, the hardware or software walks the two-level page table to locate the corresponding page table entry (PTE). First, the page directory (PD) index selects the appropriate page directory entry (PDE), which p…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nEvaluate ability to design cross-tenant I/O sharing with tight QoS control, including race-free arbitration, lock-free data structures, and high-throughput completion paths.\n\n## Key Concepts\n\n- Cross-namespace isolation\n- CAS-based slot claiming\n- Per-namespace and global queues\n- Fairness under bursts\n- Completion pathways to userspace\n\n## Code Example\n\n```javascript\n// Minimal enqueue/dequeue sketch\ntypedef struct io_req { uint64_t addr; uint32_t len; uint32_t ns_id; uint32_t slot; } io_req;\n```\n\n## Follow-up Questions\n\n- How would you test for fairness under simultaneous bursty workloads?\n- How would you recover from a stuck namespace or a partial device failure?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "operating-systems-q-16",
-        "questionId": "q-28325",
-        "question": "In a Linux-like kernel on a multi-tenant NUMA system, implement a scalable per-device I/O budgeter that enforces bounded tail latency for high-priority disks under bursty load. Describe end-to-end from interrupt arrival to task reschedule, including per-device credits, cross-NUMA coordination, and policing across cgroups. Provide a minimal C-like sketch for budget debit and interrupt path?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement per-device I/O credits with NUMA-aware local pools and a global limiter. In the ISR, atomically debit the device's credit; if exhausted, enqueue requests to a throttle queue and defer completion. Credit replen…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Per-core lock-free deques; local producers push/pop; idle cores steal from the least-local non-empty deque via CAS; a central pool provides fallbacks; track per-task affinity and epoch for fairness; t",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "I'd implement per-tenant budgets and per-page ownership with a NUMA-aware eviction score. Under pressure, select pages by score = reclaim_cost + cross_node_penalty − locality_benefit, prioritizing ten",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-container metrics: track runnable_ns and blocked_ns, plus cpu_quota_ns and a base weight. Compute dynamic weight w = base * (runnable_ns / max(1, total_ns)); ensure a latency floor for interactive",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "This question evaluates deep understanding of real-time-like guarantees in a scalable kernel I/O path. Strong candidates should articulate: per-device credit data structures with cache-line isolation, a fast path for normal I/O with minimal overhead, a slow path for throttling with appropriate backpressure, NUMA-aware coordination to avoid cross-node contention, and correctness under burst and contended I/O scenarios. Candidates must address critical edge cases including credit underflow, refill races between timer ticks and concurrent requests, and QoS isolation across cgroups.",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "operating-systems-q-17",
-        "questionId": "q-3028",
-        "question": "In Linux, two processes map the same 4 KiB file region with MAP_SHARED. One writer updates eight bytes; a reader loops to read the same region concurrently. Describe end-to-end what happens from the write through the page cache to the reader, including dirty/writeback, cache coherence, and TLB; then propose a minimal synchronization mechanism (e.g., a 4-byte lock or seqlock in the shared mapping) to guarantee a predictable visibility order and discuss tradeoffs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a lock-free MPMC ring with per-slot sequence counters and atomic head/tail indices in a page-aligned shared memory region. Each slot is cache-line padded (~64 bytes) and contains a sequence number initialized to its…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use a balanced interval tree (such as a red-black tree or AVL tree) where each node represents a locked byte range [start, end). Each node contains a mutex and a wait-queue for threads blocked on that range. To acquire…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "End-to-end: Process A writes to a MAP_SHARED mmap page; the update propagates to the page cache and marks the page dirty, then the kernel may write it back during writeback or page eviction. CPU cache coherence ensures…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "On fault, acquire per-page lock; if another thread is loading, wait. If a free frame exists, allocate it and issue async read from swap/file; on completion atomically update the PTE with frame, set pr",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis tests understanding of inter-process sharing via mmap, page cache semantics, and memory visibility without user-space locking.\n\n## Key Concepts\n- MAP_SHARED page mappings\n- Page cache dirty bits and writeback\n- Cache coherence and TLB effects\n- Lightweight synchronization in shared memory (CAS, acquire/release)\n\n## Code Example\n```c\n// Pseudo: writer uses CAS to acquire lock, writes, then releases\nuint32_t *lock = (uint32_t*)addr; // shared region\nwhile (__sync_lock_test_and_set(lock, 1)) {}\n// write 8 bytes to region after lock\nmemcpy((void*)(addr+8), data, 8);\n__sync_lock_release(lock);\n\n// Reader checks lock before reading\nwhile (*lock) {} // wait for writer\nmemcpy(data, (void*)(addr+8), 8);\n```\n\n## Tradeoffs\nLock: Simple, ensures exclusive access but blocks readers during writes.\nSeqlock: Readers can proceed concurrently but must retry if write occurs mid-read; better for read-heavy workloads.",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "operating-systems-q-18",
-        "questionId": "q-5255",
-        "question": "In a multi-core OS scheduler, design a scalable per-core work queue that supports work-stealing across cores. Implement as a lock-free double-ended queue used by local producers and the local dequeuer, with a theft path from other cores. Describe data structures, memory ordering (acquire/release), ABA avoidance, and how you ensure correctness under high contention and preemption. Provide pseudo-code for enqueue, dequeue, and steal and discuss testing?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Propose per-page metadata including last_access, refcount, and owner_mask; impose per-process quotas; use an aging score combining recency and per-process fairness to pick eviction candidates. On faul",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "On a two-socket NUMA Linux server, cross-node touches trigger page migration, TLB shootdowns, and cache coherence traffic, causing latency spikes and lower throughput under bursts. A microbenchmark sh",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a per-CPU run queue architecture with a global I/O-priority bitmap. Each task tracks wait time and recent I/O latency; boost I/O-bound tasks when wait time exceeds threshold W, and demote CPU-bound tasks when lat…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "A per-core circular deque with a head/tail index and a small version stamp to guard against ABA; local enqueue/dequeue use atomic fetch_add/ncas with release/acquire semantics; other cores steal by CA",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question probes lock-free concurrency, memory ordering, and real-world scheduler design under high contention across many cores.\n\n## Key Concepts\n\n- Lock-free deques and work-stealing semantics (Chase-Lev style)\n- Acquire/release semantics and memory barriers\n- ABA avoidance (version stamps, pointer tagging)\n- Safe memory reclamation (hazard pointers, epochs)\n- Correctness under preemption and high thread counts\n\n## Code Example\n\n```c\n// Pseudo: Chase-Lev style per-core deque (simplified)\ntypedef struct {\n  void* slots[DEQUE_SIZE];\n  _Atomic size_t head; // stealing/read by others\n  _Atomic size_t tail; // local producer/consumer index\n  // versioning to mitigate ABA\n  _Atomic size_t stamp;\n} Deque;\n\nvoid enqueue_bottom(Deque* d, void* v){\n  size_t t = atomic_load_explicit(&d->tail, memory_order_relaxed);\n  d->slots[t & MASK] = v;\n  atomic_store_explicit(&d->tail, t+1, memory_order_release);\n}\n\nvoid* dequeue_bottom(Deque* d){\n  size_t t = atomic_load_explicit(&d->tail, memory_order_relaxed);\n  if (t == atomic_load_explicit(&d->head, memory_order_acquire)) return NULL;\n  void* v = d->slots[(t-1) & MASK];\n  atomic_store_explicit(&d->tail, t-1, memory_order_relaxed);\n  return v;\n}\n\nvoid* steal_top(Deque* d){\n  size_t h = atomic_load_explicit(&d->head, memory_order_acquire);\n  size_t t = atomic_load_explicit(&d->tail, memory_order_acquire);\n  if (t <= h) return NULL;\n  void* v = d->slots[h & MASK];\n  if (atomic_compare_exchange_weak_explicit(&d->head, &h, h+1, memory_order_acquire, memory_order_relaxed))\n    return v;\n  return NULL;\n}\n```\n\n## Follow-up Questions\n\n- How would you extend for priority tasks and dynamic resizing?\n- How would you validate absence of ABA, memory leaks, and task loss under stress?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "operating-systems-q-19",
-        "questionId": "q-23180",
-        "question": "Implement a barrier primitive for N threads in a shared-memory process using atomic operations. The barrier should block threads until all N have arrived, then release them for the next cycle using a sense-reversing technique to support reuse. Explain handling of spurious wakeups, memory ordering on weak systems, and a minimal C-like init/wait/reuse sketch. Include a simple test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a hash map for O(1) lookup and a doubly linked LRU list to order blocks. Each block has a simple spinlock or mutex and a per-block state: valid, dirty, refcount. On miss, atomically acquire the bl",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "On a TLB miss, the hardware or software walks the two-level page table to locate the corresponding page table entry (PTE). First, the page directory (PD) index selects the appropriate page directory entry (PDE), which p…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Per-tenant credits, per-tenant I/O queues, and a global arbiter that selects by priority and remaining quota. In-flight I/O tracked in a hash map; enqueue/dequeue are lock-free with CAS; a completion",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "A reusable barrier for N threads using the sense-reversing technique: ```c #include <stdatomic.h> typedef struct { atomic_int count; atomic_int sense; int N; } barrier_t; void barrier_init(barrier_t* b, int N) { b->N =…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## What Is a Barrier?\nA barrier synchronizes N threads so all must arrive before any can proceed. A *reusable* barrier can be called multiple times.\n\n## The Sense-Reversing Technique\n\n### Core Idea\nEach thread holds a \"local sense\" (0 or 1). The barrier maintains a toggling \"global sense.\" A thread knows it's the last to arrive when `fetch_add(&count, 1)` returns N-1. The last thread flips global sense, releasing all waiting threads.\n\n### Handling Spurious Wakeups\nOn systems where `pthread_cond_wait` can return without signal (e.g., OS kernel artifacts), our spin loop handles this naturally:\n\n```c\nwhile (atomic_load_explicit(&b->sense, memory_order_acquire) != local_sense) {\n    // re-check condition; spurious wakeup causes immediate re-loop\n}\n```\n\nEven if woken spuriously, the thread re-checks the condition and continues spinning if global sense hasn't actually changed.\n\n### Memory Ordering on Weak Systems\nMemory ordering is critical on relaxed-memory architectures (ARM, POWER):\n\n- **`memory_order_acquire` on sense load:** Ensures all prior loads in the spinning thread happen-before the sense check. Without this, a thread might read stale data from before another thread's `release` store.\n- **`memory_order_release` on sense store:** Ensures the count reset and all prior stores in the last-arriving thread are visible to other threads that subsequently acquire.\n- **`memory_order_acq_rel` on fetch_add:** Provides both acquire (for the value read) and release (for the increment), ensuring proper synchronization of both the arrival detection and the memory visibility.\n\nOn x86/TSO, these orderings are effectively free; on ARM/Power, they prevent subtle races where threads observe the barrier \"passing\" without having seen prior writes.\n\n### Minimal Test Plan\n1. **Correctness:** 2 threads call barrier N times; verify alternating execution phases.\n2. **Stress:** N threads call barrier in a loop; check for deadlocks/livelocks under heavy load.\n3. **Reuse:** Single thread calls barrier N times with 1 wait call; ensure no premature unblock.\n4. **Stress with sleep:** Add random `usleep()` before wait calls to expose timing-dependent races.",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "operating-systems-q-20",
-        "questionId": "q-25713",
-        "question": "Implement a minimal kernel-space ring-buffer IPC for two or more producers and a single consumer using shared memory. The buffer is 256 slots. Describe how to implement producers and the consumer with atomic head/tail indexes and memory barriers to guarantee visibility and ordering on a multi-core CPU. Provide a concise C-like sketch for enqueue and dequeue, and outline how you'd test for race conditions and overflow?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-block cache entry with states: EMPTY, PENDING, LOADED, ERROR. Fast path reads LOADED; on cache miss, thread atomically transitions state to PENDING using compare-and-swap, enqueues a disk fetch request, and blocks o…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement per-VM paging budgets on a NUMA host. Maintain a NUMA-local token bucket per VM counting page faults per second (anonymous and file-backed). On a fault, atomically consume tokens; if insuffi",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Fault flow: if a free frame exists, bind it to the faulting page, set the PTE valid, and load the page; else choose the oldest frame as victim, write back if dirty, invalidate victim PTE, assign victi",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use an atomic tail for producers and an atomic head for the consumer, with per-slot validity and memory barriers: producer reserves a slot with fetch_add, writes data, then release-store; consumer rea",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nUnderstanding safe concurrent data sharing is fundamental for OS-level IPC. This task tests practical use of atomics, memory ordering, and race testing.\n\n## Key Concepts\n\n- Ring buffer basics, head/tail invariants\n- Atomic operations: CAS, fetch_add, acquire/release\n- Memory ordering and visibility on multi-core CPUs\n- Overflow handling and backpressure\n\n## Code Example\n\n```c\ntypedef struct {\n  _Atomic uint32_t head;\n  _Atomic uint32_t tail;\n  int slots[256];\n} ring_t;\n\nbool enqueue(ring_t *r, int val){\n  uint32_t t = atomic_fetch_add_explicit(&r->tail, 1, memory_order_relaxed);\n  uint32_t h = atomic_load_explicit(&r->head, memory_order_acquire);\n  if (t - h >= 256) return false; // full\n  r->slots[t & 255] = val;\n  atomic_thread_fence(memory_order_release);\n  return true;\n}\n\nbool dequeue(ring_t *r, int *out){\n  uint32_t h = atomic_load_explicit(&r->head, memory_order_relaxed);\n  uint32_t t = atomic_load_explicit(&r->tail, memory_order_acquire);\n  if (h == t) return false; // empty\n  *out = r->slots[h & 255];\n  atomic_fetch_add_explicit(&r->head, 1, memory_order_release);\n  return true;\n}\n```\n\n## Follow-up Questions\n\n- How would you extend to multiple consumers?\n- How would you mitigate false sharing and cache contention?\n- How would you test liveness and bounded-buffer guarantees?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "operating-systems-q-21",
-        "questionId": "q-25039",
-        "question": "In a Linux-like kernel, extend the page cache with a user-space prefetch-hint API to preload pages of a memory-mapped file before touch. Describe end-to-end flow: hint delivery, per-page state transitions, CAS-based deduping of concurrent prefetches, source selection (IO, zero-fill, or read-ahead), per-process quotas, and how to guarantee correctness and fairness under contention when many processes map the same dataset?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a shared ring buffer placed in a mapped page. Producers CAS to reserve a slot at tail, write the payload, then publish with a release store. The single consumer uses an acquire load of head, reads",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "A kernel API exposes prefetch hints via ioctl; a per-page state machine tracks HOLE, PENDING, and LOADED states. Hints enqueue fetch tasks, and CAS (compare-and-swap) operations prevent duplicate I/O when multiple proce…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "On first write to a COW page, the kernel traps the fault, allocates a private page for the child, copies data from the shared page, updates the child's PTE to the new page with write permission, clear",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a circular buffer, a mutex, and two condition variables: not_full and not_empty. try_send locks, checks full, returns false if full; otherwise enqueues and signals not_empty. blocking_recv waits o",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question tests deep understanding of demand paging, race conditions, and kernel-userspace coordination. It probes how prefetch hints interact with the fault path, concurrency control, and memory fairness under high contention.\n\n## Key Concepts\n\n- **Per-page state machine**: HOLE → PENDING → LOADED\n- **CAS-based deduplication**: Prevents duplicate I/O across concurrent hints for the same page\n- **Hint delivery path**: Userspace to kernel paging subsystem via ioctl or equivalent\n- **Source selection**: Read-ahead I/O, zero-fill, or direct I/O based on file state and access pattern\n- **Per-process quotas**: Prevent any single process from dominating memory or I/O resources\n- **Fairness under contention**: Throttling, bounded parallelism, and eviction policies balance competing workloads accessing the same dataset",
-        "difficulty": "advanced"
-      },
-      {
         "id": "operating-systems-q-22",
-        "questionId": "q-2966",
-        "question": "Scenario: A latency‑sensitive service pins 32 worker threads to NUMA node 0 on a dual‑node server. A background writer allocates a large shared ring buffer used by all workers, but allocator fragmentation causes many pages to reside on Node 1. Explain how page allocation, NUMA policies, and TLB coherence interact to produce remote misses and increased cross‑node traffic. Propose a minimal policy (e.g., mbind/sysfs knobs or numactl) to keep hot data local and describe validation via microbenchmarks?",
+        "questionId": "q-15568",
+        "question": "Design a cache-aware, per-core runqueue scheduler for a toy multi-core OS. Each task has priority and a data-affinity hint; implement enqueue, dequeue, and next-task for a 4-core system, minimizing cross-core cache misses while preserving fairness between CPU- and IO-bound tasks. Include a minimal C-like sketch for the enqueue, dequeue, and next-task functions, plus a test harness that simulates CPU-bound vs IO-bound workloads and measures cache misses and starvation?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "After fork, mark shared pages read-only and increment per-page refcounts. On a write fault, allocate a new frame, copy the source data, update the faulting process’s PTE to the new frame with write pe",
-            "isCorrect": false
+            "text": "Per-core runqueues, each Task{pid,pri,lastCPU,affinity}. Enqueue appends to its core queue. Next-task picks the highest pri in local queue; if tie, pick the one with smallest age to boost locality. Mi",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Per-tenant I/O budgets for reads and writes, using a global deadline-aware queue that enforces per-tenant throughput limits. Each I/O request is tagged with tenant_id, deadline, operation type (read/write), and size. Th…",
+            "text": "On first touch, atomically CAS a per-page flag to claim the page, then load or zero-fill and bind the page to the requesting service’s NUMA node. Maintain per-service, NUMA-aware LRU and per-page owne",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Remote pages cause extra page walks, higher TLB misses, and cross-node memory bandwidth when data sits on Node 1. Bind the ring buffer to Node 0 (mbind, numactl) and allocate producer/consumer data to",
-            "isCorrect": true
+            "text": "Describe a per-page in-flight flag and a CAS-based owner election. On fault, a thread atomically claims ownership, populates via file I/O or zero-fill, then updates page-table entries and notifies wai",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "## Multi-Queue I/O Scheduler Design ### Core Design This scheduler organizes I/O requests into per-NUMA-node, per-process queues. Each NUMA node maintains a separate queue for every process, allowing both NUMA locality…",
+            "text": "On a miss, allocate a page, attach it to the requesting cgroup, and charge that cgroup. Track per-page flags (ref, dirty, exclusive) and per-cgroup watermarks. Eviction uses a hierarchical LRU with pe",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests understanding of NUMA locality, page allocator behavior under fragmentation, and how TLB coherence affects latency in multi‑node setups; requires concrete mitigation strategies rather than abstract theory.\n\n## Key Concepts\n\n- NUMA memory locality and policy\n- Page allocation and migration\n- TLB coherence and remote memory traffic\n- mbind, numactl, and policy choices\n- Microbenchmark validation of locality\n\n## Code Example\n\n```bash\nnumactl --cpunodebind=0 --membind=0 ./latency_test\n```\n```\n\n## Follow-up Questions\n\n- What if background writer uses large pages to reduce metadata overhead?\n- How would you monitor remote memory traffic with perf or pidstat, and validate improvements across workloads?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests cache-aware scheduling, race-free migration, and fairness in a practical setting.\n\n## Key Concepts\n- Per-core runqueues\n- Cache locality and data affinity\n- Lock-free or CAS-based migrations\n- Scheduling fairness and starvation avoidance\n\n## Code Example\n```javascript\ntypedef struct {\n  int pid; int pri; int lastCPU; int affinity;\n};\n\ntypedef struct {\n  Task* q[128]; int head, tail; int lock;\n};\n\nstatic inline void enqueue(RunQueue* rq, Task* t){ rq->q[rq->tail++] = t; }\nstatic inline Task* dequeue(RunQueue* rq){ return rq->q[rq->head++]; }\nstatic inline Task* next_task(RunQueue* rq){ /* pick highest pri; break ties by age */ return NULL; }\n```\n\n## Follow-up Questions\n- How would you measure cache misses and migrations?\n- How would you handle dynamic priorities and aging?",
+        "difficulty": "intermediate"
       },
       {
         "id": "operating-systems-q-23",
-        "questionId": "q-5001",
-        "question": "Two worker threads share a single io_uring instance and submit I/O to the same file descriptor concurrently. Describe a concrete interleaving where two threads call io_uring_get_sqe() and io_uring_submit() in overlapping fashion, racing the tail pointer and potentially losing a submission or delivering out-of-order completions. What exact synchronization and memory-barrier guarantees are required to ensure atomic reservation of SQEs, and how would you structure code to guarantee in-order completions for logging while preserving high throughput?",
+        "questionId": "q-28155",
+        "question": "In a Linux-like kernel running multiple containers, design and implement a per-container CPU bandwidth limiter using a credit-based scheduler that throttles tasks when a container exceeds its quota, yet allows bursty traffic if credits exist; specify per-task accounting, how credits are updated on context switch, how throttling is enforced, and provide a minimal patch sketch and a test plan to detect budget drift and starvation?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Two worker threads contend for the submission queue tail pointer. Thread A obtains an SQE slot and writes its submission entry, while Thread B races to advance the kernel tail pointer and submit. Without proper memory b…",
-            "isCorrect": true
+            "text": "Design and implement a kernel-space circular log buffer with fixed capacity. Multiple producer threads write constant-size log records into the buffer while a single consumer thread drains records to storage. Implement…",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Track per-page heat with a simple recency-frequency score and a per-zone migrator. On fault, if heat below threshold, enqueue a migration to PMEM and resume with a zero- or read‑daemon upon completion",
+            "text": "## Solution Overview A multi-tenant QoS subsystem for NUMA servers requires coordinated control across CPU scheduling, memory bandwidth, and cache allocation. This design leverages cgroups v2 for CPU isolation, memcg fo…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement a Copy-On-Write (COW) fork mechanism in a toy OS. After fork, parent and child processes share physical pages marked as COW. On a write fault, allocate a new page, copy the contents, update both processes' pag…",
+            "text": "An interleaving: a writer performs a compare-and-swap to publish a new node pointer before fully initializing its fields; a reader loads the pointer and dereferences it before initialization completes, reading partially…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "When a worker process accesses the memory-mapped dataset for the first time, the CPU generates a page fault. The kernel's page fault handler checks the Process Table Entry (PTE), finds the page not present, and initiate…",
-            "isCorrect": false
+            "text": "Use per-container credits (nano-seconds) and per-task accounting. Extend task struct with container_id and rem_credits; on each schedule, deduct rem_credits by the runtime slice; if rem_credits < 0, t",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nRaces in io_uring multi-producer submission and memory ordering are subtle in real systems; candidates demonstrate understanding of ring buffers, memory barriers, and ordering guarantees.\n\n## Key Concepts\n- io_uring submission and completion rings (SQ/CQ)\n- Multi-producer correctness in shared ring buffers\n- Memory barriers (write/read, acquire/release semantics)\n- In-order completion guarantees and request tagging\n\n## Code Example\n```c\n// Example: multi-producer submission with atomic SQE reservation\nstruct io_uring ring;\npthread_mutex_t sqe_mutex = PTHREAD_MUTEX_INITIALIZER;\n\n// Atomic SQE reservation with sequence numbers\nstatic atomic_uint_fast64_t seq_counter = ATOMIC_VAR_INIT(0);\n\nint submit_io_safe(int fd, void *buf, size_t len, uint64_t *seq_out) {\n    // Reserve SQE atomically\n    pthread_mutex_lock(&sqe_mutex);\n    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);\n    if (!sqe) {\n        pthread_mutex_unlock(&sqe_mutex);\n        return -EBUSY;\n    }\n    \n    // Assign sequence number for ordering\n    uint64_t seq = atomic_fetch_add_explicit(&seq_counter, 1, \n                                            memory_order_relaxed);\n    *seq_out = seq;\n    \n    // Prepare submission with sequence tag\n    io_uring_prep_write(sqe, fd, buf, len, 0);\n    sqe->user_data = seq;\n    \n    // Release barrier before submit\n    atomic_thread_fence(memory_order_release);\n    int ret = io_uring_submit(&ring);\n    pthread_mutex_unlock(&sqe_mutex);\n    \n    return ret;\n}\n\n// Completion processing with ordering\nvoid process_completions(void) {\n    struct io_uring_cqe *cqe;\n    \n    while (io_uring_peek_cqe(&ring, &cqe) == 0) {\n        // Acquire barrier before reading completion\n        atomic_thread_fence(memory_order_acquire);\n        \n        uint64_t seq = cqe->user_data;\n        // Process completion in sequence order...\n        \n        io_uring_cqe_seen(&ring, cqe);\n    }\n}\n```\n\n## Implementation Strategy\nFor high-throughput ordered logging, implement per-thread submission queues with a single consumer thread that preserves order while allowing parallel I/O preparation.",
+        "explanation": "## Why This Is Asked\n\nTests container-level CPU bandwidth enforcement and fairness under contention, requiring concrete accounting, throttling paths, and incremental patching.\n\n## Key Concepts\n\n- per-container quotas\n- credits accounting\n- burst windows and throttling\n- starvation testing and correctness under contention\n\n## Code Example\n\n```c\n// Pseudo patch sketch for per-container credit enforcement\ntypedef struct {\n  int container_id;\n  unsigned long rem_credits;\n} task_t;\n\nvoid schedule_tick(task_t *t, unsigned long run_ns) {\n  if (t->rem_credits < run_ns) {\n    throttle(t); // yield until credits recharge\n  } else {\n    t->rem_credits -= run_ns;\n    run_task(t);\n  }\n}\n```\n\n## Follow-up Questions\n\n- How would you simulate realistic bursts and idle periods to validate the recharge model?\n- How would you extend to nested cgroups and multi-tenant fairness guarantees?",
         "difficulty": "intermediate"
       },
       {
         "id": "operating-systems-q-24",
-        "questionId": "q-22957",
-        "question": "In a toy Linux-like OS, implement crash-safe metadata journaling for a small filesystem that stores inodes and directory entries. Describe end-to-end flow from a mkdir/rename to log append, two-phase commit, and crash recovery via log replay; include a minimal C-like sketch for log append/commit and a test plan?",
+        "questionId": "q-9579",
+        "question": "Design and implement a NUMA-aware, remote-backed shared memory page fault handler for a region mapped by multiple processes across a distributed cache. Describe the end-to-end fault path when a first-touch occurs, including per-page states, synchronization to avoid double fetch, source selection (remote cache, local disk, or zero-fill), NUMA-aware worker pools, and a testing plan to validate fairness and stall avoidance under high contention?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "When a guest G touches a page P that is on node N, collect per-node access counters for G and estimate migration cost; select target node T with max(G-locality - cost) within budget; schedule migratio",
+            "text": "Per-core buffers with local free-lists; allocation uses the local pool with O(1) amortized cost. Under memory pressure, a background migrator shifts a batch of idle buffers to the busiest cores using CAS-based handoff,…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "I propose a NUMA-aware ballooning and page compaction subsystem design. Per-container quotas are enforced through cgroups memory controller, with reclaim logic prioritizing clean, unreferenced, low-RSS, and least-recent…",
+            "text": "Trap page faults via userfaultfd and implement a per-page guard to serialize concurrent faults. When a fault occurs, one thread fills the 4 KiB page from the backing file (pread) or zeros it, then use",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Design a crash-safe metadata journaling layer: a write-ahead log of inode and directory-entry updates, a two-phase commit, and a durable log flush before applying changes. Support atomic mkdir/rename,",
-            "isCorrect": true
+            "text": "Explain a NUMA-aware page migration under memory pressure in a Linux-like kernel. Include trigger, candidate selection, source/dest node choice, per-page state, PTE/TLB updates (including lazy invalid",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Propose a per-tenant quotaed page cache with per-NUMA hot/cold lists and an LRU eviction that prioritizes frequently-hit, clean pages. Maintain atomic per-tenant counters and a central reclaim daemon;",
-            "isCorrect": false
+            "text": "On a first-touch fault, the handler CASes the per-page slot from EMPTY to LOADING, wakes waiters, and fetches the page from the remote cache or disk with optional read-ahead. After a successful fetch,",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests understanding of crash-safe metadata updates and recovery in a simple FS. It exercises correctness under failures, not just performance.\n\n## Key Concepts\n\n- Write-ahead logs for metadata\n- Atomic directory operations\n- Two-phase commit and idempotent replay\n- Crash recovery test strategies\n\n## Code Example\n\n```c\n// Minimal sketch for log append/commit\ntypedef struct LogRecord { uint64_t txid; uint8_t type; uint32_t inode; uint32_t dirent; uint32_t len; } LogRecord;\nint log_append(LogRecord *r, void *payload, size_t plen);\nint commit_tx(uint64_t txid);\n```\n\n## Follow-up Questions\n\n- How to guarantee recoverability if power fails after commit but before applying changes?\n- How would you test recovery across crashes?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nInterview context explanation.\n\n## Key Concepts\n\n- Page fault path, per-page state machine (EMPTY, LOADING, RESIDENT)\n- CAS-based synchronization to avoid double fetch\n- NUMA-aware scheduling and remote fetch sources\n- Fairness quotas and backoff to prevent starvation\n- Testing strategies: multi-node, stress, race-condition detection\n\n## Code Example\n\n```c\n// Pseudo-C: per-page state machine\ntypedef enum { EMPTY, LOADING, RESIDENT } state_t;\nstate_t state = EMPTY;\nint fetch_page(page_t *p) {\n  if (atomic_compare_exchange(&p->state, EMPTY, LOADING)) {\n    // load...\n  }\n  return 0;\n}\n```\n\n## Follow-up Questions\n\n- How would you handle stale data due to concurrent invalidations?\n- How would you measure and guarantee livelock-free progress under heavy contention?",
+        "difficulty": "advanced"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-07-30T04:59:35.146Z",
+    "createdAt": "2026-07-30T10:47:54.001Z",
     "version": 1
   }
 ]
