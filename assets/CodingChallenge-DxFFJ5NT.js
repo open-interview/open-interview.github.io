@@ -1,1 +1,0 @@
-import{j as o}from"./vendor-radix-D-g2ZA6z.js";import{aJ as t}from"./index-pNjVEGcl.js";import"./vendor-react-CfabBlKr.js";import"./vendor-charts-pVMSoriS.js";import"./vendor-animation-CjLIXWha.js";function a(){return o.jsx(t,{to:"/code"})}export{a as default};
