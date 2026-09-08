@@ -8,148 +8,178 @@
     "questions": [
       {
         "id": "database-q-0",
-        "questionId": "q-19364",
-        "question": "Design a SQL workflow for a PostgreSQL blog schema: users(id, name), posts(id, user_id, title, body, created_at), tags(id, name), post_tags(post_id, tag_id), comments(id, post_id, created_at). For a given date range and a tag name, return: (1) the number of posts with that tag, (2) the total number of comments on those posts, and (3) the average number of posts per author in that set. Provide SQL and indexing strategy; justify normalization decisions?",
+        "questionId": "q-20047",
+        "question": "Design a global per-tenant API rate limiter using Redis as hot cache, MongoDB for tenant config, Cassandra for event logs, and DynamoDB for daily summaries. Implement a token-bucket rate limiter with explicit key schemas: Redis: rate:<tenantId> with fields tokens,last_refill; DynamoDB: dailyQuota; MongoDB: burst/refill rate; Cassandra: call logs. Provide concrete write paths, TTLs, and cross-store coordination and idempotent retry strategy to avoid double charging on retries?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Begin a SERIALIZABLE transaction and coordinate across shards with either 2PC or a central lock. Lock the customer row (per-customer lock) with FOR UPDATE, read current_outstanding, and check cap. If",
+            "text": "Adopt a 2PC-like cross-region protocol. Each shard runs a SERIALIZABLE transaction: update region_totals and prepare an insert into central_ledger, returning a prepare id. A lightweight coordinator pr",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use SERIALIZABLE isolation and SELECT ... FOR UPDATE to lock matching rows, followed by the update in the same transaction. T2's concurrent insert may trigger a serialization_failure; implement retry",
-            "isCorrect": false
+            "text": "Design a global per-tenant API rate limiter using Redis as the hot cache, MongoDB for tenant configuration, Cassandra for event logs, and DynamoDB for daily summaries. Implement a token-bucket rate limiter with explicit…",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Partition the events table by RANGE on event_time using monthly partitions. For each partition, create a covering index that includes both the partition key and the filtering/aggregation columns: `CREATE INDEX ON events…",
+            "text": "SQL plan (category and top products): SELECT pr.category AS category, SUM(oi.quantity*oi.unit_price) AS revenue FROM orders ord JOIN order_items oi ON oi.order_id = ord.id JOIN products pr ON oi.produ",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Find posts in the date window that have the tag via joins to post_tags and tags, count the posts, sum their comments, and compute per-user post counts to average them. Use left join for comments, subq",
-            "isCorrect": true
+            "text": "- Architecture: Durable WAL per node; a Coordinator plus N Participants; replicated logs ensure durability across failures. - Protocol flow: - PREPARE: Coordinator sends PREPARE to all; each participant logs PREPARE wit…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests joins across many-to-many relationships, aggregation, and indexing in PostgreSQL for a realistic, beginner-level task.\n\n## Key Concepts\n- Joins (inner, left)\n- Aggregation, subqueries\n- Normalization (tags table, join tables)\n- Indexing strategies for multi-table queries in Postgres\n\n## Code Example\n```sql\nWITH tagged_posts AS (\n  SELECT p.id, p.user_id\n  FROM posts p\n  JOIN post_tags pt ON pt.post_id = p.id\n  JOIN tags t ON t.id = pt.tag_id\n  WHERE t.name = $1 AND p.created_at BETWEEN $2 AND $3\n), per_user AS (\n  SELECT user_id, COUNT(*) AS post_count FROM tagged_posts GROUP BY user_id\n), per_post AS (\n  SELECT tp.id, COUNT(c.id) AS comments\n  FROM tagged_posts tp\n  LEFT JOIN comments c ON c.post_id = tp.id\n  GROUP BY tp.id\n)\nSELECT (SELECT COUNT(*) FROM tagged_posts) AS post_count,\n       (SELECT SUM(comments) FROM per_post) AS total_comments,\n       (SELECT AVG(post_count) FROM per_user) AS avg_posts_per_author;\n```\n\n## Follow-up Questions\n- How would the plan change with a very large tag set?\n- How would you adjust if tags.name is not unique?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nThis question tests your ability to design a cross-service data flow, implement low-latency rate limiting enforcement, and handle idempotent retries in a multi-database architecture spanning Redis, MongoDB, Cassandra, and DynamoDB.\n\n## Key Concepts\n- Redis Lua scripting for atomic token bucket operations\n- Token bucket rate limiting algorithm with DynamoDB and MongoDB seeding\n- Cross-store eventual consistency with request_id-based idempotency\n- TTLs for Redis keys and daily aggregation summaries in DynamoDB\n\n## Code Example\n```javascript\n// Redis Lua script for atomic token bucket operations\nconst tokenBucketScript = `\n  local key = KEYS[1]\n  local now = tonumber(ARGV[1])\n  local capacity = tonumber(ARGV[2])\n  local refillRate = tonumber(ARGV[3])\n  local requestCost = tonumber(ARGV[4])\n\n  local tokens = tonumber(redis.call('GET', key .. ':tokens') or capacity)\n  local lastRefill = tonumber(redis.call('GET', key .. ':last_refill') or now)\n\n  local elapsed = now - lastRefill\n  local refillAmount = elapsed * refillRate\n  tokens = math.min(capacity, tokens + refillAmount)\n\n  if tokens >= requestCost then\n    tokens = tokens - requestCost\n    redis.call('SET', key .. ':tokens', tokens)\n    redis.call('SET', key .. ':last_refill', now)\n    redis.call('EXPIRE', key .. ':tokens', 86400)\n    redis.call('EXPIRE', key .. ':last_refill', 86400)\n    return {1, tokens}\n  end\n  return {0, tokens}\n`;\n\n// Rate limiter service with idempotent retry\nclass RateLimiter {\n  async checkRateLimit(tenantId, requestId, cost = 1) {\n    const config = await this.mongo.getTenantConfig(tenantId);\n    const result = await this.redis.eval(\n      tokenBucketScript,\n      1,\n      `rate:${tenantId}`,\n      Date.now(),\n      config.burst,\n      config.refillRate,\n      cost\n    );\n\n    if (result[0] === 0) {\n      throw new RateLimitExceededError(config.burst - result[1]);\n    }\n\n    // Async writes with idempotency key\n    await Promise.all([\n      this.cassandra.logRequest({\n        requestId,\n        tenantId,\n        timestamp: new Date(),\n        cost,\n        status: 'allowed'\n      }),\n      this.dynamoDB.updateDailyQuota({\n        tenantId,\n        date: new Date().toISOString().split('T')[0],\n        requestCount: cost,\n        idempotencyKey: requestId\n      })\n    ]);\n\n    return { allowed: true, remaining: result[1] };\n  }\n}\n```\n\n## Write Paths & TTLs\n\n**Read Path (Hot Path)**:\n1. Query Redis for token bucket state (`rate:<tenantId>`)\n2. Fall back to MongoDB if Redis miss, hydrate cache\n\n**Write Path**:\n1. Redis: Update token bucket atomically via Lua (TTL: 24 hours)\n2. Cassandra: Append to `call_logs` (TTL: 90 days)\n3. DynamoDB: Update daily quota using idempotency key (TTL: 1 year)\n\n## Cross-Store Coordination\n\n- Redis provides sub-millisecond latency for rate check enforcement\n- MongoDB stores tenant configuration (burst limit, refill rate)\n- Cassandra provides ordered event log for audit trails\n- DynamoDB aggregates daily usage for billing and quota tracking\n\n## Idempotent Retry Strategy\n\nUse `request_id` (client-generated UUID) as the idempotency key:\n\n1. Client includes unique `request_id` with each API call\n2. Before processing, check Cassandra for existing `request_id`\n3. If exists, return cached result; if not, proceed with rate limit check\n4. Write to Cassandra and DynamoDB using `request_id` as partition key\n5. On retry, same `request_id` is detected as duplicate and skipped",
+        "difficulty": "advanced"
       },
       {
         "id": "database-q-1",
-        "questionId": "q-5590",
-        "question": "In a Postgres-like data warehouse, a fact table 'sales' is partitioned by month (range partitions) and joined to a 'products' dimension. A typical query filters the last 90 days and aggregates revenue by product category, joining on product_id. EXPLAIN ANALYZE often shows scans across many partitions. How would you diagnose and fix to maximize partition pruning and minimize cross-partition work? Provide concrete steps?",
+        "questionId": "q-23884",
+        "question": "In a fintech ledger, balances live in PostgreSQL (MVCC). A separate data warehouse ingests transfers via streaming. Design a cross-store transfer that debits one account and credits another atomically, while ensuring app reads stay SERIALIZABLE and the warehouse stays consistent. Compare 2PC versus idempotent sinks, propose schemas, and outline a test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement Add-To-Cart with Redis for UI, Cassandra audit, MongoDB snapshot on checkout. Redis key cart:<userId> as hash of itemId->qty, TTL 1 day. On add, HINCRBY; Cassandra insert daily_cart_audit(us",
-            "isCorrect": false
+            "text": "Use SERIALIZABLE isolation in PostgreSQL to prevent write skew during a debit/credit transfer. Coordinate with the warehouse via a cross-store transaction_id, implementing either an idempotent sink or a 2PC-like protoco…",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Join customers c -> orders o -> order_items oi, filter by region and date window, compute total_spent = sum(oi.quantity*oi.unit_price), rank per region, return top N per region. Use window function: r",
+            "text": "Implement an idempotent, versioned cross-store write path: 1) Write to DynamoDB using a composite key (campaign_id:user_id:version) with the new channel preference and version number; 2) Update Redis per-user current_ch…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Normalize to 3NF: users, orders, order_items, products with FKs. Index orders(user_id, created_at) for date filters; order_items(order_id, product_id) for joins; products(category, id) for grouping. E",
+            "text": "Choose a B-tree index for composite queries on (symbol, timestamp, price) when you need range operations, ordered results, or prefix searches. B-tree efficiently handles timestamp ranges and ordered access patterns typi…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Ensure partition pruning by bounding the partition key in WHERE (no function on date), then verify with EXPLAIN ANALYZE that only relevant monthly partitions are scanned. If pruning fails, redesign to",
-            "isCorrect": true
+            "text": "Use a SERIALIZABLE transaction to perform both updates atomically. Steps: BEGIN; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT balance FROM accounts WHERE id = $1 FOR UPDATE; UPDATE accounts SE",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nAssesses ability to reason about partition pruning, explain plans, and real-world trade-offs in a warehouse workload.\n\n## Key Concepts\n- Partition pruning\n- Predicate pushdown\n- Partition-wise joins\n- Statistics and ANALYZE\n- Partition design trade-offs (range vs subpartitioning)\n\n## Code Example\n```sql\nSELECT p.category, SUM(s.revenue)\nFROM sales s\nJOIN products p ON s.product_id = p.id\nWHERE s.order_date >= DATE '2025-01-01' AND s.order_date < DATE '2025-04-01'\nGROUP BY p.category;\n```\n\n## Follow-up Questions\n- How would you validate plans across columnar vs row stores?\n- What changes would you make to partitioning when daily traffic spikes?",
+        "explanation": "## Why This Is Asked\nThis question tests understanding of MVCC, isolation-level trade-offs, and cross-store consistency in a realistic fintech workflow.\n\n## Key Concepts\n- **SERIALIZABLE vs SSI**: SERIALIZABLE eliminates write skew but may cause serialization failures requiring retry. Serializable Snapshot Isolation (SSI) provides similar guarantees with better throughput.\n- **Cross-store commit coordination**: Two-phase commit (2PC) provides atomicity across stores but introduces latency and blocking risk. Idempotent sinks offer eventual consistency with at-least-once delivery and client-side deduplication.\n- **Exactly-once semantics**: Achieved via idempotency keys (transaction_ids) that enable deduplication in the downstream warehouse.\n- **Deterministic replay**: Ensure transfers can be replayed identically using the same transaction_id.\n\n## Schema Proposal\n```sql\n-- Accounts table\nCREATE TABLE accounts (\n  id UUID PRIMARY KEY,\n  balance DECIMAL(19,4) NOT NULL DEFAULT 0,\n  version INTEGER NOT NULL DEFAULT 0\n);\n\n-- Transfers table for idempotency\nCREATE TABLE transfers (\n  id UUID PRIMARY KEY,\n  from_account_id UUID NOT NULL REFERENCES accounts(id),\n  to_account_id UUID NOT NULL REFERENCES accounts(id),\n  amount DECIMAL(19,4) NOT NULL,\n  status VARCHAR(20) NOT NULL DEFAULT 'pending',\n  created_at TIMESTAMP DEFAULT NOW()\n);\n```\n\n## Test Plan\n1. **Concurrent transfer test**: Run parallel transfers from A→B and B→A with same balance to verify no overdraw.\n2. **Idempotency test**: Replay same transfer request; ensure only one deduction occurs.\n3. **Warehouse consistency test**: Verify warehouse receives transfer via streaming and matches Postgres balance.\n4. **2PC failure test**: Simulate failure between prepare and commit; verify no partial state.\n5. **Serialization failure test**: Under high contention, verify retries maintain consistency.",
         "difficulty": "advanced"
       },
       {
         "id": "database-q-2",
-        "questionId": "q-353",
-        "question": "You're building a collaborative design tool where multiple users can edit the same document simultaneously. How would you use database transactions and isolation levels to prevent conflicts while maintaining good performance?",
+        "questionId": "q-8446",
+        "question": "You have a PostgreSQL database for a multi-region service. Tables: regions(id, name), trips(id, rider_id, region_id, pickup_time, distance_km, price). For a given region name, write a query to return total_trips, total_revenue, and avg_distance for trips with pickup_time in the last 24 hours, grouped by region name. Explain normalization/index decisions and discuss how introducing a denormalized trips.region_name field would affect performance and maintainability?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use Redis as the fast read path (feeds:user:<uid>:recent), MongoDB for post metadata, Cassandra for hourly activity logs, and DynamoDB for weekly summaries. Write path: 1) insert post in Mongo with a",
+            "text": "Use a three-way join (plans → subscriptions → invoices) filtered by issued_at in the month and an active window on subscriptions, then group by plan. Example: SELECT p.name, SUM(i.amount) AS total_inv",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Proposed: composite B-tree index on (region, signup_year) INCLUDE (user_id, last_login, status) to cover range scans and point lookups. Skip the separate hash index on user_id since B-tree already handles point lookups…",
-            "isCorrect": false
+            "text": "Write a query joining trips to regions, filter by pickup_time >= now() - interval '24 hours', and group by region name to compute counts, sums, and averages. Index suggestions: trips(pickup_time), trips(region_id), or a…",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Under Read Committed, a concurrent update can overwrite another’s change (lost update). Repeatable Read may prevent re-reading a changed balance but can still allow anomalies with certain patterns. Se",
+            "text": "Use a composite B-tree index on (user_id, event_type, created_at) as primary, with a partial index for recent data. For schema changes, use pg_repack or CONCURRENTLY to avoid blocking.",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use MVCC with READ COMMITTED isolation, implement optimistic locking with version columns, and handle conflicts with retry logic.",
-            "isCorrect": true
+            "text": "Begin by running EXPLAIN ANALYZE to confirm whether partition pruning is occurring as expected. Ensure predicates reference the partition key directly without functions or implicit type conversions, which can prevent pr…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests understanding of concurrent access patterns, transaction isolation, and performance trade-offs - critical for Canva's collaborative editing features.\n\n## Expected Answer\n\nStrong candidates discuss: MVCC benefits, READ COMMITTED vs SERIALIZABLE trade-offs, optimistic vs pessimistic locking, conflict resolution strategies, and how to balance consistency with performance.\n\n## Code Example\n\n```typescript\n// Optimistic locking with version check\nasync function updateDocument(docId: string, changes: any, expectedVersion: number) {\n  const result = await db.transaction(async (tx) => {\n    const doc = await tx.query.documents.findFirst({\n      where: { id: docId, version: expectedVersion }\n    });\n    \n    if (!doc) {\n      throw new Error('Document not found or version mismatch');\n    }\n    \n    return await tx.update(documents)\n      .set({ ...changes, version: expectedVersion + 1 })\n      .where({ id: docId });\n  });\n  \n  return result;\n}\n\n// Conflict resolution with retry\nasync function updateWithRetry(docId: string, changes: any, maxRetries = 3) {\n  for (let attempt = 1; attempt <= maxRetries; attempt++) {\n    try {\n      const doc = await getDocument(docId);\n      return await updateDocument(docId, changes, doc.version);\n    } catch (error) {\n      if (attempt === maxRetries) throw error;\n      await delay(Math.pow(2, attempt) * 100); // Exponential backoff\n    }\n  }\n}\n```",
+        "explanation": "## Why This Is Asked\nEvaluates the ability to craft a time-bound regional aggregation with joins, along with indexing and normalization trade-off analysis.\n\n## Key Concepts\n- SQL joins, GROUP BY aggregation, time-window filtering\n- Index selection: single-column indexes on (pickup_time) and (region_id), composite indexes, or partial indexes\n- Normalization vs denormalization performance and maintainability implications\n\n## Code Example\n```sql\nSELECT r.name AS region_name,\n       COUNT(*) AS total_trips,\n       SUM(t.price) AS total_revenue,\n       AVG(t.distance_km) AS avg_distance\nFROM trips t\nJOIN regions r ON t.region_id = r.id\nWHERE t.pickup_time >= NOW() - INTERVAL '24 hours'\nGROUP BY r.name\n```\n\n## Indexing & Normalization Considerations\n- **Current normalized approach**: Requires join but maintains data integrity and single source of truth\n- **Index strategy**: Composite index (region_id, pickup_time) optimizes the common query pattern\n- **Denormalized alternative**: Adding trips.region_name eliminates join overhead but introduces update anomalies and storage overhead\n- **Trade-off decision**: Normalize for data integrity unless performance testing shows significant join overhead in high-throughput scenarios",
         "difficulty": "beginner"
       },
       {
         "id": "database-q-3",
-        "questionId": "q-10350",
-        "question": "Scenario: An e-commerce platform uses PostgreSQL for orders, Elasticsearch for product search, and Redis for shopping cart sessions. Products have multiple attributes (category, brand, price, rating, inventory) with complex filtering requirements. Design a comprehensive indexing strategy including composite indexes, partial indexes, and expression indexes. How would you handle index maintenance during peak holiday traffic (10x normal load), and what metrics would you monitor to detect index degradation?",
+        "questionId": "q-12888",
+        "question": "Design a cross-region, multi-store write path for a real-time fraud alert system in a global marketplace using Redis for session cache, MongoDB for user profiles, Cassandra for immutable audit logs, and DynamoDB for the real-time alerts feed. When a fraud signal is generated in any region, specify idempotent write paths, dedup strategy, TTL for alerts (e.g., 24h), and how data moves between stores with eventual consistency guarantees?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Redis: key `session:{userId}` with TTL ~30m; MongoDB: trips collection with compound index `(userId, startTime)`; Cassandra: `trips_by_user` with clustering on `startTime`; DynamoDB: `trip_archive` with PK=`userId` and…",
+            "text": "Run EXPLAIN PLAN FOR the query and inspect the plan tree for a Partition Selector showing only 2025 partitions; verify PRUNING. If not pruned, ensure order_date is the leading column in the index and",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement automated index monitoring using database statistics, create adaptive indexing policies that track query execution plans, and use partial or expression-based indexes to handle evolving patte",
+            "text": "Ingest fraud signals with a dedup key {region}:{signalId}, write to DynamoDB alerts with TTL 24h, stream to Cassandra audit logs, update MongoDB user profile with lastFraudAt, and cache a lightweight",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use the outbox pattern: within a single SERIALIZABLE Postgres transaction, insert both the event record and a corresponding outbox entry. A separate background worker polls the outbox, publishes the event to Redis via a…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "- SQL: relational tables with fixed schema and strong constraints; data is normalized across tables. Example: ``` CREATE TABLE users ( id INT PRIMARY KEY, name VARCHAR(100), email VARCHAR(100) UNIQUE ); ``` - NoSQL: sch…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests ability to craft end-to-end cross-region data flows with idempotence, dedup, and TTL across Redis, DynamoDB, MongoDB, Cassandra. Evaluates data movement, consistency guarantees, and failure handling in distributed systems.\n\n## Key Concepts\n\n- Idempotent writes across stores\n- De-duplication using composite keys\n- TTL handling in Redis and DynamoDB\n- Change data capture across regions (streams)\n\n## Code Example\n\n```javascript\n// Pseudocode: dedupe and propagate fraud signal\nasync function handleSignal(region, signalId, userId) {\n  const dedupKey = `${region}:${signalId}`;\n  if (await redis.get(dedupKey)) return;\n  await redis.set(dedupKey, '1', { EX: 60 * 60 * 24 });\n  // DynamoDB put with conditional to avoid duplicates\n  await dynamo.putItem({ id: `${region}#${signalId}`, userId, ts: Date.now() }, { ConditionExpression: 'attribute_not_exists(id)' });\n  await cassandra.log({ region, signalId, userId, ts: Date.now() });\n  await mongodb.updateOne({ userId }, { $set: { lastFraudAt: new Date() } });\n}\n```\n\n## Follow-up Questions\n\n- How would you test fault injection across regions?\n- How would you handle late-arriving signals that predate an existing alert?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "database-q-4",
+        "questionId": "q-6459",
+        "question": "You have a Postgres table 'sales' partitioned by month on sale_date. A query filters by a date range and region, but EXPLAIN shows a Seq Scan across all partitions. How would you diagnose and optimize for partition pruning and indexing to speed the aggregation?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use EXPLAIN (ANALYZE, BUFFERS) to confirm partition pruning via the sale_date predicate. If partitions aren't being pruned, ensure the partition key is used directly without functions and that the date bounds align with…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "READ COMMITTED sees only committed data at query time, allowing non-repeatable reads. REPEATABLE READ uses MVCC snapshots to guarantee consistent reads within a transaction, preventing non-repeatable reads but still all…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Design PostgreSQL indexing strategy for e-commerce product catalog with complex filtering, plan index maintenance during high traffic, and monitor key performance metrics.",
-            "isCorrect": true
+            "text": "- Use a single ACID transaction that debits A and credits B atomically. - Represent money in integer cents, and lock rows with FOR UPDATE to avoid race conditions. - Example (PostgreSQL): ``` BEGIN; UPDATE accounts SET…",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use tenant-specific indexes with partitioning strategies, implement automated index monitoring per tenant, and employ partial indexes with tenant filters to balance performance and storage efficiency.",
+            "text": "For Redis real-time caching, implement sorted sets (zset) for leaderboards with per-user session keys and TTL of 15-60 minutes based on data volatility. MongoDB should shard on user_id with compound indexes on (last_see…",
             "isCorrect": false
           }
         ],
-        "explanation": "For the e-commerce product catalog, start with a composite index on (category, price, rating) to handle common filter combinations. Add a partial index on products with inventory > 0 for available items only: CREATE INDEX idx_available_products ON products (category, price) WHERE inventory > 0. For text search, implement expression indexes using lower() and trigram indexes for brand name searches: CREATE INDEX idx_brand_trgm ON products USING gin (brand gin_trgm_ops). For Elasticsearch, use nested mappings for product variants and implement custom analyzers for brand names with special characters.\n\nDuring holiday traffic, implement index maintenance strategies like using CONCURRENTLY for index creation, scheduling VACUUM ANALYZE during low-traffic periods, and temporarily disabling autovacuum on high-write tables. Consider using pg_stat_progress_create_index to monitor index build progress and implement connection pooling to prevent index operations from blocking application queries. Set appropriate fillfactor values (80-85) on frequently updated tables to reduce page splits and index bloat.\n\nMonitor key metrics including pg_stat_user_indexes.idx_scan to identify unused indexes, pg_stat_user_tables.seq_scan vs index_scan ratios, and index size growth rates. Track query execution times using pg_stat_statements and set alerts for index bloat over 30%. Monitor cache hit ratios with pg_stat_database and watch for increasing autovacuum counts which indicate write amplification.",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nThis question tests your understanding of partition pruning and how predicates on the partition key influence which partitions are scanned. It also assesses your ability to verify execution plans and apply practical indexing strategies on partitioned tables.\n\n## Key Concepts\n\n- Partition pruning\n- Predicate pushdown on partition keys\n- EXPLAIN (ANALYZE, BUFFERS) for plan verification\n- Per-partition indexes in partitioned tables\n\n## Code Example\n\n```sql\nEXPLAIN (ANALYZE, BUFFERS)\nSELECT customer_id, SUM(amount) AS total_amount\nFROM sales\nWHERE sale_date >= DATE '2025-03-01' \n  AND sale_date < DATE '2025-04-01'\n  AND region = 'EMEA';\n```",
+        "difficulty": "beginner"
       },
       {
-        "id": "database-q-4",
+        "id": "database-q-5",
         "questionId": "q-12368",
         "question": "PostgreSQL interview: given a 100M-row events table partitioned by month (range) joined to a large user_dim, a query filters the last 6 months and aggregates by event_type. EXPLAIN ANALYZE shows Seq Scan on events and a naive join. Propose a concrete partitioning and indexing plan to enable partition pruning and fast joins, plus a validation plan using EXPLAIN ANALYZE?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Partition the events table by month using range/interval partitions to enable pruning for the last 6 months. Create a composite index on (user_id, event_ts, event_type) to support both the filter conditions and aggregat…",
-            "isCorrect": true
+            "text": "Write a single query joining students to cohorts and programs, and enrollments to compute per-student completed_courses and avg_grade for a specified cohort year and program. Normalize via foreign key",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement declarative range partitions by month on events(event_date). Ensure WHERE clauses use tight, contiguous date ranges (avoid OR conditions) to guarantee partition pruning. Add a per-partition index on (dim_id, e…",
+            "text": "Use B-tree composite indexes: (user_id, order_date) for range queries and (product_id, category) for exact matches. Hash indexes are unsuitable for order_date range queries because they store data in hash buckets withou…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Create a composite BTREE index on (user_id, created_at DESC) to efficiently fetch the latest 25 events per user. Additionally, create a composite BTREE index on (user_id, event_type, created_at DESC) to support counting…",
-            "isCorrect": false
+            "text": "Partition the events table by month using range/interval partitions to enable pruning for the last 6 months. Create a composite index on (user_id, event_ts, event_type) to support both the filter conditions and aggregat…",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Use EXPLAIN ANALYZE to confirm partition pruning on event_date; rewrite filters to use a direct date range (no function) so only relevant partitions are read; enable constraint_exclusion if needed; co",
+            "text": "Use SERIALIZABLE (or SSI). In one transaction, lock both accounts with FOR UPDATE, verify src balance >= amount, then debit/credit, and insert a ledger row, then COMMIT. On serialization_failure, retr",
             "isCorrect": false
           }
         ],
@@ -157,79 +187,19 @@
         "difficulty": "intermediate"
       },
       {
-        "id": "database-q-5",
-        "questionId": "q-28539",
-        "question": "Context: PostgreSQL MVCC billing system. Tables: usage_events(tenant_id, event_ts, units, billed boolean), daily_invoice(tenant_id, date, total_units, total_amount). A cron task runs per day to aggregate unbilled events for that date: sum units, insert/update daily_invoice, mark corresponding events billed. Propose a transactional design that guarantees exactly-once billing under high concurrency. Compare SERIALIZABLE vs advisory locks or a lightweight 2PC, with schemas, flow, and a practical test plan including at least two conflicting scenarios?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a single transaction that SELECT FOR UPDATE SKIP LOCKED on unbilled events for the target date, then aggregate units and insert or update daily_invoice, and finally set billed=true for those event",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "- Indexes are data structures (most commonly B-tree) that keep pointers to table rows in sorted order, enabling fast lookups, range scans, and ordered results. - They trade extra storage and write overhead for faster re…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Create a composite index for the most common query patterns, include selective columns first, use covering indexes to avoid lookups, and balance read performance with write overhead by monitoring inde",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Create a compound index on messages: {chatId:1, createdAt:-1} and fetch latest 20 with db.messages.find({chatId}).project({_id:0,content:1,createdAt:1}).sort({createdAt:-1}).limit(20). Cache in Redis",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nAssesses mastery of MVCC pitfalls (write skew, phantom reads) and how isolation levels influence correctness in multi-row aggregations. The candidate must justify locking strategies, idempotency, and when to prefer SERIALIZABLE over lighter locks.\n\n## Key Concepts\n\n- MVCC anomalies (write skew, phantom reads)\n- SERIALIZABLE vs locks / 2PC\n- Advised locking (SELECT FOR UPDATE SKIP LOCKED)\n- Idempotency and upserts\n\n## Code Example\n\n```sql\nBEGIN;\n-- lock and fetch unbilled events for the target date\nSELECT id, units FROM usage_events\nWHERE tenant_id = $1 AND date(event_ts) = $2 AND billed = FALSE\nFOR UPDATE SKIP LOCKED;\n-- aggregate\nUPDATE daily_invoice\nSET total_units = total_units + :agg_units,\n    total_amount = total_amount + :agg_amount\nWHERE tenant_id = $1 AND date = $2;\n-- mark as billed\nUPDATE usage_events\nSET billed = TRUE\nWHERE id IN (:ids);\nCOMMIT;\n```\n\n## Follow-up Questions\n\n- How would you test for serialization failures and guarantee retry safety?\n- What are the performance implications of heavy SKIP LOCKED usage at scale?",
-        "difficulty": "advanced"
-      },
-      {
         "id": "database-q-6",
-        "questionId": "q-26858",
-        "question": "In a PostgreSQL-based event-ticketing service with a Redis cache for fast availability, design a safe, high-throughput 'buy ticket' operation that atomically decrements available_seats and creates a ticket row for one buyer. Provide schemas, transaction flow to guarantee no oversell under high concurrency, and a test plan. Compare SERIALIZABLE vs row-level locking and discuss when to use 2PC or advisory locks?",
+        "questionId": "q-5590",
+        "question": "In a Postgres-like data warehouse, a fact table 'sales' is partitioned by month (range partitions) and joined to a 'products' dimension. A typical query filters the last 90 days and aggregates revenue by product category, joining on product_id. EXPLAIN ANALYZE often shows scans across many partitions. How would you diagnose and fix to maximize partition pruning and minimize cross-partition work? Provide concrete steps?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Execute a single transaction that updates available_seats with a guard and then creates the ticket. Example: BEGIN; UPDATE events SET available_seats = available_seats - 1 WHERE event_id = $1 AND avai",
+            "text": "Ensure partition pruning by bounding the partition key in WHERE (no function on date), then verify with EXPLAIN ANALYZE that only relevant monthly partitions are scanned. If pruning fails, redesign to",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "To avoid inventory oversell, use MVCC with SERIALIZABLE or a FOR UPDATE lock. T1 reads stock, then inserts cart line; T2 checks out and decrements stock. With READ COMMITTED, phantom reads could allow",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Guarantee price correctness under concurrency using an MVCC-friendly approach with either SERIALIZABLE isolation or optimistic locking with versioning. SQL transaction flow: BEGIN; SET TRANSACTION ISOLATION LEVEL SERIAL…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a composite B-Tree index on (tenant_id, event_type, ts) to support per-tenant time-range scans and per-type lookups. Use a separate hash index on (tenant_id, event_type) for exact lookups that don't require ti…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests mastery of MVCC, write skew, and practical transactional patterns within a single DB. Demonstrates ability to design atomic operations under high contention, and evaluate SERIALIZABLE vs guarded updates.\n\n## Key Concepts\n- MVCC and row-level locking via UPDATE ... WHERE ... AND available > 0\n- Preventing overbooking and phantom reads\n- SERIALIZABLE vs explicit FOR UPDATE vs advisory locks\n- Retry/backoff and idempotence for retries\n- Cache invalidation considerations with Redis\n\n## Code Example\n```sql\nBEGIN;\nUPDATE events\nSET available_seats = available_seats - 1\nWHERE event_id = $1 AND available_seats > 0\nRETURNING event_id;\n\n-- If row returned, create ticket\nINSERT INTO tickets (id, event_id, user_id, purchased_at)\nVALUES (gen_random_uuid(), $1, $2, now());\n\nCOMMIT;\n```\n\n## Follow-up Questions\n- How would you adapt if event rows are partitioned across shards or tables?\n- How would you test for write skew and deadlocks at scale?\n- How would you handle retries and idempotency on duplicate purchases?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "database-q-7",
-        "questionId": "q-29020",
-        "question": "Scenario: A high-throughput analytics store handles trades in PostgreSQL with a Redis cache for hot reads. The Trades table has (exchange_id, user_id, symbol, side, price, qty, ts). You must support queries: A) by (exchange_id, user_id, ts) with a 1-day sliding window; B) by (symbol, ts) for short-term trends. Propose a composite B-tree index strategy, a hashed index for exact exchange lookups, and partial indexes on recent ts. Discuss maintenance and fillfactor considerations under heavy write load?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a composite B-tree index on (user_id, created_at) to efficiently fetch a user's recent logs; a HASH index on (region) for fast regional endpoint lookups; partition logs by day and archive old part",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use partial indexes, automated index monitoring, and gradual migration strategies with feature flags to handle schema changes while maintaining query performance.",
+            "text": "Use a composite B-tree index on (order_date, category, product_id) for efficient range filtering, with product_name included via a covering index to avoid table lookups. Add a secondary B-tree index on order_items(produ…",
             "isCorrect": false
           },
           {
@@ -239,47 +209,107 @@
           },
           {
             "id": "d",
-            "text": "Create Composite B-tree indexes: (exchange_id, user_id, ts) for A and (symbol, ts) for B; add a HASH index on (exchange_id) for exact lookups; implement partial index on ts >= current_timestamp - inte",
-            "isCorrect": true
+            "text": "Create a composite index on (category, price, brand), implement covering indexes for frequently accessed columns, use partial indexes for active products, and maintain index health through regular fragmentation analysis…",
+            "isCorrect": false
           }
         ],
-        "explanation": "Why This Is Asked\n- Tests ability to design multi-column indexing strategies for real-world, high-throughput workloads.\n- Probes trade-offs between B-tree, HASH, and partial indexes, plus covering and partitioning considerations.\n\nKey Concepts\n- Composite B-tree indexes for multi-predicate queries\n- HASH indexes for exact-match lookups\n- Partial indexes to optimize recent data\n- Covering indexes to avoid lookups\n- Partitioning and fillfactor tuning for write-heavy workloads\n- Maintenance: ANALYZE, VACUUM, and reindexing plans\n\nCode Example\n```sql\nCREATE INDEX trades_exch_user_ts_idx ON trades (exchange_id, user_id, ts);\nCREATE INDEX trades_symbol_ts_idx ON trades (symbol, ts);\nCREATE INDEX trades_exch_only_hash ON trades USING HASH (exchange_id);\nCREATE INDEX trades_recent_ts_idx ON trades (ts) WHERE ts >= now() - INTERVAL '1 day';\n```\n\nFollow-up Questions\n- How do you choose between B-tree vs HASH for a given predicate?\n- What strategies reduce index bloat under high write throughput?\n- How would you validate index effectiveness in production workloads?",
+        "explanation": "## Why This Is Asked\nAssesses ability to reason about partition pruning, explain plans, and real-world trade-offs in a warehouse workload.\n\n## Key Concepts\n- Partition pruning\n- Predicate pushdown\n- Partition-wise joins\n- Statistics and ANALYZE\n- Partition design trade-offs (range vs subpartitioning)\n\n## Code Example\n```sql\nSELECT p.category, SUM(s.revenue)\nFROM sales s\nJOIN products p ON s.product_id = p.id\nWHERE s.order_date >= DATE '2025-01-01' AND s.order_date < DATE '2025-04-01'\nGROUP BY p.category;\n```\n\n## Follow-up Questions\n- How would you validate plans across columnar vs row stores?\n- What changes would you make to partitioning when daily traffic spikes?",
         "difficulty": "advanced"
       },
       {
-        "id": "database-q-8",
-        "questionId": "q-6598",
-        "question": "Scenario: A real-time chat system stores messages in MongoDB, presence/status in Redis, chat metadata in Cassandra, and long-term archives in DynamoDB. Design a data path and concrete queries to fetch the latest 20 messages for a chat room, ensuring Redis cache warmth and TTL cleanup for presence. Explain how you’d keep Redis in sync with MongoDB on new messages and how you archive older chats?",
+        "id": "database-q-7",
+        "questionId": "q-20474",
+        "question": "In PostgreSQL, design a normalized multi-tenant analytics schema to compute quarterly revenue by product category across tenants. Provide concrete tables (tenants, users, products, orders, order_items, events), join paths, and indexing strategy (partial and multicolumn indexes, BRIN for time). Include an example query for a given quarter and tenant, plus considerations to prevent cross-tenant leakage and data privacy?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Create a compound index on messages: {chatId:1, createdAt:-1} and fetch latest 20 with db.messages.find({chatId}).project({_id:0,content:1,createdAt:1}).sort({createdAt:-1}).limit(20). Cache in Redis",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Add a composite BTREE index on (user_id, created_at) to support per-user date range queries and finding the most recent event. This column order is critical—user_id comes first because it's used for equality filtering,…",
+            "text": "Partition pruning scans only partitions whose date ranges overlap the 30‑day window. In EXPLAIN ANALYZE you should see a PartitionRangeScan or Bitmap Heap/Index scans limited to the relevant partition",
             "isCorrect": false
           },
           {
+            "id": "b",
+            "text": "Leverage a single multi-tenant schema with tenant_id on all facts. For quarterly revenue by category: tenants(id) join users(tenant_id), orders(tenant_id, id, created_at, status), order_items(order_id",
+            "isCorrect": true
+          },
+          {
             "id": "c",
-            "text": "Describe how MVCC and isolation levels prevent oversell in a concurrent purchase. Compare READ COMMITTED vs REPEATABLE READ for stock checks, and outline a minimal transaction that decrements inventor",
+            "text": "For a given user_id and last 30 days, filter plays, join songs and genres, group by genre, and pick top 5 by play_count with total_duration. Use a CTE to pre-filter plays, then join to songs and genre",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "SQL: SELECT oi.product_id, SUM(oi.quantity*oi.unit_price) AS total_revenue, COUNT(DISTINCT o.id) AS order_count FROM customers c JOIN orders o ON o.customer_id=c.id JOIN order_items oi ON oi.order_id=",
+            "text": "Implement the transfer as a single transaction that locks both accounts and updates balances atomically. When two concurrent transfers A→B and A←B execute between the same accounts, Read Committed isolation can encounte…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests multi-datastore familiarity, including cache patterns, TTLs, and archival strategy across MongoDB, Redis, Cassandra, and DynamoDB.\n\n## Key Concepts\n\n- Compound indexing in MongoDB for time-ordered reads\n- Redis caching strategy for recently viewed messages\n- Cache invalidation on writes and presence TTL handling\n- Archival workflow to DynamoDB and cross-store dataflow\n\n## Code Example\n\n```javascript\n// MongoDB query (latest 20)\ndb.messages.find({chatId}).project({_id:0,content:1,createdAt:1}).sort({createdAt:-1}).limit(20)\n```\n\n```javascript\n// Redis cache update (pseudo-code)\nLPUSH chat:{chatId}:recent <newMessage>\nLTRIM chat:{chatId}:recent 20\nEXPIRE chat:{chatId}:recent 60\n```\n\n## Follow-up Questions\n\n- How would you test cache hit vs miss latency under load?\n- What happens if Redis goes down temporarily, and how do you preserve UX?",
+        "explanation": "## Why This Is Asked\nTests multi-tenant schema design, join strategy, and advanced indexing. It also covers data privacy and performance for dashboards.\n\n## Key Concepts\n- Multi-tenant normalization with tenant_id on all facts\n- Joins across fact/dim tables; BRIN vs BTREE indexing; partial indexes\n- Row-level security to prevent cross-tenant leakage; materialized views for common quarters\n\n## Code Example\n```javascript\n-- DDL sketch for multi-tenant analytics\nCREATE TABLE tenants (id BIGINT PRIMARY KEY, name TEXT);\nCREATE TABLE users (id BIGINT, tenant_id BIGINT, created_at TIMESTAMP, PRIMARY KEY(id, tenant_id), FOREIGN KEY(tenant_id) REFERENCES tenants(id));\nCREATE TABLE products (id BIGINT, tenant_id BIGINT, category TEXT, name TEXT, price NUMERIC, PRIMARY KEY(id, tenant_id));\nCREATE TABLE orders (id BIGINT, tenant_id BIGINT, user_id BIGINT, created_at TIMESTAMP, status TEXT, PRIMARY KEY(id, tenant_id), FOREIGN KEY(tenant_id) REFERENCES tenants(id));\nCREATE TABLE order_items (order_id BIGINT, tenant_id BIGINT, product_id BIGINT, quantity INT, unit_price NUMERIC, PRIMARY KEY(order_id, tenant_id), FOREIGN KEY(order_id, tenant_id) REFERENCES orders(id, tenant_id), FOREIGN KEY(product_id, tenant_id) REFERENCES products(id, tenant_id));\n```",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "database-q-8",
+        "questionId": "q-27815",
+        "question": "Given a normalized PostgreSQL schema for a small library with patrons(id PK, name, membership_type), authors(id PK, name), books(id PK, title, author_id FK, isbn), loans(id PK, patron_id FK, book_id FK, loan_date, due_date, return_date). Write an efficient SQL query to list all active loans (return_date IS NULL) for a specific month (e.g., 2026-04) including patron name, book title, and author name, ordered by due_date. Propose a minimal indexing strategy and discuss normalization considerations?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Analyze the EXPLAIN plan to identify full table scans, then implement timestamp-based partitioning with a composite index on (timestamp, device_id).",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "SQL: SELECT p.name AS patron, b.title AS book, a.name AS author, l.due_date FROM loans l JOIN patrons p ON p.id=l.patron_id JOIN books b ON b.id=l.book_id JOIN authors a ON a.id=b.author_id WHERE l.re",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Partition events by day with range partitions; if last two weeks are typical, switch to weekly partitions for pruning. Create a multicolumn B-tree index on (region, device_type, event_date) and a BRIN",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use SERIALIZABLE (or SSI). In one transaction, lock both accounts with FOR UPDATE, verify src balance >= amount, then debit/credit, and insert a ledger row, then COMMIT. On serialization_failure, retr",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests join proficiency across normalized tables and practical indexing for a beginner. It also checks ability to scope a query to a month and reason about maintenance of data integrity.\n\n## Key Concepts\n- Joins across four tables\n- 3NF normalization and FK usage\n- Partial indexes to optimize active rows\n- Month-based filtering and deterministic ordering\n\n## Code Example\n```sql\nSELECT p.name AS patron, b.title AS book, a.name AS author, l.due_date\nFROM loans l\nJOIN patrons p ON p.id = l.patron_id\nJOIN books b ON b.id = l.book_id\nJOIN authors a ON a.id = b.author_id\nWHERE l.return_date IS NULL\n  AND l.loan_date >= DATE '2026-04-01'\n  AND l.loan_date < DATE '2026-05-01'\nORDER BY l.due_date;\n```\n\n## Follow-up Questions\n- How would you adjust for a range of months?\n- What if you need to support fast lookups by patron? which index would you add?\n- How could you test correctness with concurrent loans?",
         "difficulty": "beginner"
       },
       {
         "id": "database-q-9",
-        "questionId": "q-6974",
-        "question": "You're designing a multi-tenant SaaS platform where each customer has their own isolated data but shares the same database infrastructure. How would you approach indexing strategy to ensure query performance while maintaining tenant isolation, and what trade-offs would you consider between composite indexes vs. tenant-prefixed indexes?",
+        "questionId": "q-458",
+        "question": "You have a PostgreSQL database with orders (10M rows) and customers (1M rows). A query joining these tables is slow. How would you optimize it?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Proposed: (1) BTREE composite index on (city_id, user_id, created_at DESC) for per-city, per-user recent activity; (2) HASH index on (event_id) for O(1) lookups; (3) BTREE on (city_id, created_at) (or",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Redis: flag:<id>:live:<region> -> boolean, TTL 300s. MongoDB: flags { _id, name, defaultValue, strategy }. Cassandra: evals (user_id, flag_id, ts, result). DynamoDB: rollouts (user_id, flag_id, result",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "To optimize the slow PostgreSQL query joining orders (10M rows) and customers (1M rows), add indexes on the customer_id foreign key in the orders table and analyze the query execution plan with EXPLAIN ANALYZE to identi…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Two-level partitioning: range on event_date with region subpartitions; ensure constraint exclusion. Create a covering index on (region, user_id) per leaf; rewrite the query to restrict the date and re",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Key Optimization Strategies\n\n- **Indexing**: Create composite indexes on join columns and frequently filtered columns\n- **Query Analysis**: Use EXPLAIN ANALYZE to identify full table scans and expensive operations\n- **Join Strategy**: Ensure proper join order and consider hash joins for large datasets\n- **Partitioning**: Implement table partitioning by date or customer ranges for better performance\n\n## PostgreSQL Specific Techniques\n\n```sql\n-- Create composite index for join and filter\nCREATE INDEX idx_orders_customer_date \nON orders(customer_id, order_date);\n\n-- Analyze query performance\nEXPLAIN ANALYZE SELECT o.*, c.name \nFROM orders o JOIN customers c \nON o.customer_id = c.id \nWHERE o.order_date > '2023-01-01';\n```\n\n## Trade-offs\n\n- **Storage**: Indexes increase storage requirements\n- **Write Performance**: More indexes slow down INSERT/UPDATE operations\n- **Maintenance**: Regular VACUUM and ANALYZE needed for optimal performance",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "database-q-10",
+        "questionId": "q-30070",
+        "question": "A social app publishes a 'story' that must be visible in Redis feeds in real time, stored canonically in MongoDB, appended to Cassandra activity logs, and archived in DynamoDB with TTL. Design the cross-store write path, key schemas, TTL strategies, and conflict resolution. Explain read paths for fresh vs archived stories and compare 2PC vs saga trade-offs with concrete examples?",
         "type": "single",
         "options": [
           {
@@ -289,115 +319,235 @@
           },
           {
             "id": "b",
-            "text": "Guarantee price correctness under concurrency using an MVCC-friendly approach with either SERIALIZABLE isolation or optimistic locking with versioning. SQL transaction flow: BEGIN; SET TRANSACTION ISOLATION LEVEL SERIAL…",
+            "text": "Approach: join customers to active subscriptions, filter invoices by current month, sum payments minus refunds per customer, and derive last_payment_at via max(paid_at). Use left joins for unpaid invo",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Telemetry arrives: Redis: update last_seen for device_id with TTL 7d. MongoDB: upsert device profile; insert telemetry into a telemetry_24h collection with TTL 24h. Cassandra: append to telemetry_by_d",
-            "isCorrect": false
+            "text": "Design a saga-based write path with the following cross-store operations: First, publish story_id to Redis feeds using the key feeds:stories:{user_id} as a sorted set with timestamp scores for real-time feed delivery. N…",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Use tenant_id as leading column in composite indexes for optimal isolation and performance, balancing query selectivity with index maintenance overhead across shared infrastructure.",
-            "isCorrect": true
+            "text": "Propose a composite B-tree index on (city, created_at DESC) to satisfy both: the top-20 recent posts per city and per-day counts with a time range. A separate hash index on (city) can speed equality l",
+            "isCorrect": false
           }
         ],
-        "explanation": "For multi-tenant SaaS, the core indexing challenge is balancing performance with isolation. The optimal approach is making tenant_id the leading column in all composite indexes, ensuring queries are naturally filtered by tenant first. This prevents cross-tenant data leakage and allows the database to quickly narrow results to the relevant tenant's data subset. For example, in a customer orders table, an index on (tenant_id, customer_id, created_at) serves both tenant isolation and common query patterns like 'recent orders for specific customer'.\n\nThe trade-off between composite indexes and tenant-prefixed indexes involves maintenance overhead vs. query flexibility. Composite indexes with tenant_id as the prefix are more space-efficient and support multiple query patterns, but may require more indexes for different access patterns. Tenant-prefixed indexes (like creating separate index families per tenant) provide maximum isolation and can be tailored per tenant's usage patterns, but dramatically increase index count and maintenance complexity. Most SaaS platforms opt for composite indexes with tenant_id as the first column, supplemented by selective secondary indexes for high-frequency tenant-specific queries.\n\nReal-world implementation should also consider index cardinality - if tenant_id has low cardinality (few tenants), consider adding a high-cardinality column as the second index component to improve selectivity. Additionally, implement partial indexes for active tenants only, and use database features like PostgreSQL's partitioning or MongoDB's sharding with tenant_id as the partition/shard key for very large multi-tenant deployments.",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "database-q-10",
-        "questionId": "q-23363",
-        "question": "Scenario: A delivery service stores driver profiles in MongoDB, live location in Redis geospatial index, 24h trip logs in Cassandra, and daily performance summaries in DynamoDB. For a real-time 'Nearby Drivers' feature, design concrete write paths and keys, TTLs, and cross-store consistency rules. Explain how to query the nearest 10 drivers quickly and how to refresh Redis cache from MongoDB/Cassandra as needed?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Describe how MVCC and isolation levels prevent oversell in a concurrent purchase. Compare READ COMMITTED vs REPEATABLE READ for stock checks, and outline a minimal transaction that decrements inventor",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a comprehensive timezone rollout across four data stores: Redis presence cache using key `user:presence:{id}` with 300s TTL storing `{userId, timezone, lastSeen}`; MongoDB profile document `{userId, name, timezon…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "On each activity: Redis: ZINCRBY leaderboard:YYYY-MM-DD user_id delta, TTL 86400; MongoDB: update users last_seen; Cassandra: insert into activity_logs(user_id, ts, delta); DynamoDB: update weekly_tot",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a Redis GEO index for live locations with TTL 30s. On update: GEOADD drivers:geo and write to MongoDB (drivers collection) as truth; Cassandra holds 24h trips; DynamoDB stores daily summaries. Rea",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests practical familiarity with multi-datastore patterns, real-time geo queries, TTL-driven cache, and read-fallback strategies across systems.\n\n## Key Concepts\n\n- Redis GEO with TTLs for live proximity data\n- MongoDB as source of truth for profiles\n- Cassandra for 24h time-series traces\n- DynamoDB for daily summaries and analytics\n- Read-time fallback paths and cache refresh mechanics\n\n## Code Example\n\n```javascript\n// Redis write (pseudo)\nredisClient.geoadd('drivers:geo', longitude, latitude, driverId);\nredisClient.expire('drivers:geo', 30);\n\n// Read near drivers (pseudo)\nconst nearby = redisClient.georadius('drivers:geo', lon, lat, 5, 'km', 'WITHDIST', 'COUNT', 10);\n```\n\n## Follow-up Questions\n\n- How would you test correctness with synthetic location data and TTLs?\n- How would you scale Redis for high write throughput and geo queries across regions?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nThis question evaluates your ability to design distributed writes across multiple stores with different consistency and latency profiles. It requires understanding pragmatic patterns like Saga over traditional 2PC, explicit failure handling strategies, and read-time trade-offs between fresh and archived data.\n\n## Key Concepts\n- Saga vs 2PC for cross-store commits\n- Idempotency and deduplication across stores\n- TTL and eviction semantics in Redis and DynamoDB\n- Read path prioritization: fresh (Redis/MongoDB) vs archived (DynamoDB) data\n- Compensation logic and eventual consistency",
+        "difficulty": "advanced"
       },
       {
         "id": "database-q-11",
-        "questionId": "q-6916",
-        "question": "Scenario: PostgreSQL database for a SaaS app with tables users(id, region, created_at), orders(id, user_id, created_at, status). For every user, fetch their most recent order's id, created_at, and status in a single query, and include the region from users. Explain the indexing strategy to avoid N+1 queries and provide the SQL you would use?",
+        "questionId": "q-12284",
+        "question": "Context: A payment system uses PostgreSQL with MVCC. Table accounts(id, balance). Design a concurrent transfer workflow: transfer amount from source account to destination account atomically, ensuring balance never goes negative, no money is lost or duplicated, and invariants hold under high contention. Provide concrete SQL steps, locking strategy (SELECT FOR UPDATE vs SERIALIZABLE), and a simple retry policy. What tests would you implement to prove correctness under parallel transfers?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a composite B-tree index on (order_date, category, product_id) for efficient range filtering, with product_name included via a covering index to avoid table lookups. Add a secondary B-tree index on order_items(produ…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Index orders(user_id, created_at DESC); consider including id and status in a covering index. To avoid N+1 queries, use a LATERAL join or DISTINCT ON. Example: SELECT u.region, u.id AS user_id, o.id AS latest_order_id,…",
+            "text": "Use an explicit transfer transaction with row-level locking to prevent race conditions. Example: BEGIN; SELECT balance FROM accounts WHERE id=$src FOR UPDATE; SELECT balance FROM accounts WHERE id=$dst FOR UPDATE; IF ba…",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "Use partition pruning on occurred_at, join tenants for region, and filter via JSONB index on details. Per-partition index: CREATE INDEX logs_details_completed ON logs USING GIN (details) WHERE details",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "Leverage the composite (city, event_time) index to filter by city and recency, then apply event_type='purchase' via a predicate or bitmap intersection. Use an index-ordered plan with ORDER BY event_ti",
+            "text": "Use EXPLAIN (ANALYZE, BUFFERS) to confirm partition pruning via the sale_date predicate. If partitions aren't being pruned, ensure the partition key is used directly without functions and that the date bounds align with…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "For a given user_id and last 30 days, filter plays, join songs and genres, group by genre, and pick top 5 by play_count with total_duration. Use a CTE to pre-filter plays, then join to songs and genre",
+            "text": "Compute the top 10 customers by lifetime value in a given region over the last 36 months by aggregating gross order revenue (SUM(oi.quantity * oi.unit_price)) across completed orders, then subtracting any refunds linked…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis tests practical indexing and join planning to fetch one related row per parent without triggering N+1 queries, plus handling users without orders.\n\n## Key Concepts\n- LATERAL joins and DISTINCT ON\n- Multi-column indexes with DESC\n- Covering indexes to avoid lookups\n\n## Code Example\n```sql\nSELECT u.region, u.id AS user_id, o.id AS latest_order_id, o.created_at, o.status\nFROM users u\nLEFT JOIN LATERAL (\n  SELECT id, created_at, status\n  FROM orders\n  WHERE orders.user_id = u.id\n  ORDER BY created_at DESC\n  LIMIT 1\n) o ON true;\n```\n\n## Follow-up Questions\n- How would you handle this scenario with millions of users?\n- What alternatives would you consider if using a different database?\n- How would you optimize this query for pagination?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\n- Tests understanding of MVCC anomalies (write skew, phantom reads) and practical locking.\n- Probes choice between SELECT FOR UPDATE and SERIALIZABLE and the tradeoffs under contention.\n- Necessitates correct error handling and retry logic.\n\n## Key Concepts\n- MVCC, SERIALIZABLE SSI, SELECT FOR UPDATE, deadlocks, retries, invariants on balances\n\n## Code Example\n```javascript\nBEGIN;\nSELECT balance FROM accounts WHERE id = :src FOR UPDATE;\nSELECT balance FROM accounts WHERE id = :dst FOR UPDATE;\nIF balance_src < :amount THEN \n  ROLLBACK; \nELSE \n  UPDATE accounts SET balance = balance - :amount WHERE id = :src;\n  UPDATE accounts SET balance = balance + :amount WHERE id = :dst;\n  COMMIT;\nEND IF;\n```\n\n## Testing Strategy\n- Unit tests for edge cases (insufficient funds, same account transfers)\n- Concurrent transfer tests with multiple threads transferring between accounts\n- Invariant verification tests ensuring total balance remains constant\n- Deadlock detection and retry mechanism tests under high contention\n- Performance benchmarks comparing SELECT FOR UPDATE vs SERIALIZABLE approaches",
+        "difficulty": "intermediate"
       },
       {
         "id": "database-q-12",
-        "questionId": "q-16609",
-        "question": "A lightweight social app uses Redis for sessions, MongoDB for profiles, Cassandra for time-series activity, and DynamoDB for per-user feature flags. When a user logs in on a new device, design a concrete write path with explicit keys and TTLs to create a session, log the event, and update the profile; also outline a read path to validate the session and fetch current profile and latest login activity, considering eventual consistency?",
+        "questionId": "q-24753",
+        "question": "Given a PostgreSQL analytics schema with tables: tenants(id), users(id, tenant_id), events(id, user_id, tenant_id, event_type, created_at, payload). For a specific tenant_id and date range, design a query to return per-user counts by event_type, and outline an indexing/partitioning strategy to keep responses under sub-second latency for up to 1M events?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Ingest fraud signals with a dedup key {region}:{signalId}, write to DynamoDB alerts with TTL 24h, stream to Cassandra audit logs, update MongoDB user profile with lastFraudAt, and cache a lightweight",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use Redis: session:{user}:{device} = token (TTL 24h); active_devices:{user} add device. MongoDB: update users set last_login, push device to devices array. Cassandra: insert into login_events (user_id",
+            "text": "Schema: tenants(id), users(id, tenant_id), events(id, user_id, tenant_id, event_type, created_at, payload). For a tenant and date window, return per-user counts by event_type. Optimized query: SELECT",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "Implement a comprehensive indexing strategy using composite B-tree indexes on frequently filtered columns (category_id, price_range, customer_rating), partial indexes for active/inactive products, and scheduled index ma…",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "Two-level partitioning: create monthly range partitions on created_at with regional subpartitions, so queries filtering by date and region prune to relevant partitions. Add a composite index (region,",
+            "text": "Two concurrent transactions on product 42. T1 reads stock, then T2 updates stock and commits. Under READ COMMITTED, T1’s second read may show a different value (non-repeatable read). REPEATABLE READ k",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Suggested answer: Create a composite B-tree index on (tenant_id, created_at) to support range scans per tenant, e.g. CREATE INDEX events_tenant_time_idx ON events(tenant_id, created_at); and a hash in",
+            "text": "Redis: presence:{user_id} = room_id with ttl 60s; MongoDB: insert into messages:{room_id} with {ts, sender, text} and index (room_id, ts); Cassandra: upsert daily_stats(room_id, date) += 1; DynamoDB:",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of basic cross-datastore write flows, TTL usage, and idempotent cache updates in a beginner context.\n\n## Key Concepts\n- TTL-driven cache invalidation across Redis\n- Cross-store writes: Redis, MongoDB, Cassandra, DynamoDB\n- Eventual consistency and read-path fallbacks\n\n## Code Example\n```javascript\n// Pseudo write flow\nredis.set(\"session:\"+user+\":\"+device, token, 24*3600);\ndbMongo.users.updateOne({_id: user}, {$set: {last_login: now}, $push: {devices: device}});\ncassandra.login_events.insert({user_id: user, ts: now, device: device}, TTL: 7*24*3600);\ndynamo.upsert({TableName: \"UserFlags\", Item: {user_id: user, flags: flags}});\n```\n\n## Follow-up Questions\n- How would you test race conditions when login occurs from multiple devices?\n- How would you adjust TTLs and invalidation strategies for latency across regions?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nAssesses practical joins across normalized tables, and a concrete plan for indexing and partitioning to meet latency targets in a real analytics workload.\n\n## Key Concepts\n- Joins across normalized tables; composite indexes; range partitioning; index-only scans; MVCC considerations.\n\n## Code Example\n```sql\n-- DDL sketches (simplified)\nCREATE TABLE tenants (id BIGINT PRIMARY KEY);\nCREATE TABLE users (id BIGINT PRIMARY KEY, tenant_id BIGINT REFERENCES tenants(id));\nCREATE TABLE events (id BIGINT PRIMARY KEY, user_id BIGINT REFERENCES users(id), tenant_id BIGINT, event_type TEXT, created_at TIMESTAMPTZ, payload JSONB);\n\n-- Optimized query (example)\nSELECT u.id AS user_id, e.event_type, COUNT(*) AS cnt\nFROM events e JOIN users u ON e.user_id = u.id\nWHERE e.tenant_id = $1 AND e.created_at >= $2 AND e.created_at < $3\nGROUP BY u.id, e.event_type\nORDER BY cnt DESC;\n```\n\n## Follow-up Questions\n- How would you validate partition pruning is active in plans?\n- How to handle skew/seasonality across partitions?",
+        "difficulty": "intermediate"
       },
       {
         "id": "database-q-13",
+        "questionId": "q-30303",
+        "question": "Scenario: In a PostgreSQL-based payout pipeline using MVCC, nightly batches compute per-driver payouts from unsettled rides and update a driver balance and a payout_ledger. Batches run concurrently and can touch the same driver. How would you guarantee correctness with minimal aborts? Compare SERIALIZABLE vs SSI, when to use row-level SELECT FOR UPDATE, and propose concrete schemas and a test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design an indexing plan for a MongoDB-style event store with fields user_id, event_type, event_ts, and payload. **Index Definitions:** 1. **B-tree Composite Index (user_id, event_ts)** ```javascript db.events.createInde…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Prefer Serializable Snapshot Isolation (SSI) to avoid full abort storms at high concurrency, or SERIALIZABLE when you need strict guarantees. Use per-driver row locking (SELECT FOR UPDATE) or an expli",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use SERIALIZABLE isolation with explicit row-level locking and retry logic for account transfers to prevent lost updates while maintaining concurrency.",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design: Posts live in MongoDB; Redis holds per-hashtag inverted index as sorted sets: key hashtag:<tag> with members as post_id and score as created_at. TTL 7d. Write: on new post, insert to MongoDB a",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\\n\\nTests understanding of MVCC, anomalies, and cross-batch correctness in a high-concurrency payout workflow.\\n\\n## Key Concepts\\n- MVCC, SERIALIZABLE, SSI\\n- Row-level locking, SELECT FOR UPDATE\\n- Idempotent writes, upserts, optimistic locking, version/timestamp columns\\n- Long-running transactions and abort rates\\n\\n## Code Example\\n```sql\\nBEGIN;\\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\\nSELECT balance, version FROM drivers WHERE id = :driver_id FOR UPDATE;\\n-- compute new_balance using :amount and existing balance/version\\nUPDATE drivers SET balance = new_balance, version = version + 1 WHERE id = :driver_id;\\nINSERT INTO payout_ledger(driver_id, amount, tstamp) VALUES (:driver_id, :amount, NOW());\\nCOMMIT;\\n```\\n\\n## Follow-up Questions\\n- How would you test for write skew in this setup?\\n- When would you introduce compensating transactions if an abort occurs?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "database-q-14",
+        "questionId": "q-8342",
+        "question": "Scenario: A microblogging app uses MongoDB for posts, Redis for fast hashtag lookup, Cassandra for daily hashtag trends, and DynamoDB for long-term archives. Design a hashtag search feature: concrete data models, write paths, TTLs, and cross-store invalidation. Explain how to fetch the top 5 posts for a given hashtag and how edits/deletes keep Redis in sync?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Partition by month (range) on event_time. On each partition, create a composite index on (user_id, event_time) covering event_type. Write filters with event_time >= current_date - interval '90 days' a",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Compute the top 10 customers by lifetime value in a given region over the last 36 months by aggregating gross order revenue (SUM(oi.quantity * oi.unit_price)) across completed orders, then subtracting any refunds linked…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design: Posts live in MongoDB; Redis holds per-hashtag inverted index as sorted sets: key hashtag:<tag> with members as post_id and score as created_at. TTL 7d. Write: on new post, insert to MongoDB a",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use EXPLAIN (ANALYZE, BUFFERS) to confirm partition pruning via the sale_date predicate. If partitions aren't being pruned, ensure the partition key is used directly without functions and that the date bounds align with…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design cross-store indexing for search features, balancing latency, freshness, and TTL-driven cleanup.\n\n## Key Concepts\n- Redis sorted sets as inverted index for hashtags\n- TTL alignment with post lifecycle and cache warmth\n- Write path consistency across MongoDB, Redis, Cassandra, DynamoDB\n- Invalidation and edit/delete handling across stores\n- Query path that prefers Redis but gracefully falls back to durable stores\n\n## Code Example\n```javascript\n// Pseudo: addPost\nasync function addPost(post){\n  // insert to MongoDB\n  // for each hashtag: redis.zadd('hashtag:'+tag, post.created_at, post.post_id)\n  // optionally set EXPIRE on the key\n}\n```\n\n## Follow-up Questions\n- How would you handle removing a hashtag from a post and cleaning up Redis?\n- How would you scale the Redis index to handle a hashtag with millions of posts?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "database-q-15",
+        "questionId": "q-27391",
+        "question": "For a high-traffic event log table in PostgreSQL with columns (id bigserial PK, region_code text, user_id int, created_at timestamptz, event_type text, payload jsonb), design a concrete indexing strategy to efficiently support: 1) counts of events per region in the last 24 hours; 2) fast lookups for events by a given user within a region; 3) global aggregations by region by day. Provide exact index definitions, including a composite B-tree and a separate hash index, plus a partial index for recent data; discuss query plans and maintenance considerations?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Join customers, orders, order_items, products; filter region and date; per customer compute total_revenue, total_orders, distinct_categories_bought. Build a 12-month revenue series with generate_serie",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Under READ COMMITTED isolation, both transactions can read the initial balance of 100 concurrently, leading to a lost update anomaly. Transaction T1 subtracts 60 (resulting balance: 40) and Transaction T2 subtracts 40 (…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a composite B-tree index on (region_code, created_at DESC, user_id) for region-scoped, time-bounded queries and user lookups within a region. Add a separate hash index on (user_id) for efficient global per-user look…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "The physical plan demonstrates effective partition pruning on both date and region columns, with predicate pushdown directly into Delta Lake's storage layer. The small dimension table triggers a BroadcastHashJoin to avo…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes indexing strategy trade-offs under mixed workloads: region-based time-window counts, per-user lookups, and daily regional aggregations. It tests understanding of when to combine index types, when partial indexes provide value, and how query patterns should drive index design.\n\n## Key Concepts\n\n### Composite B-tree Indexes\nComposite indexes work best when the leading column has high selectivity. In this case, region_code filters first (equality), and created_at DESC provides sorted time-ordering for range scans. The user_id column enables index-covering for region + user queries without touching the heap.\n\n### Hash Indexes\nHash indexes provide O(1) lookups for equality predicates on medium-cardinality columns like user_id. Unlike B-tree indexes, they do not support range scans but use less storage and have faster equality lookups.\n\n### Partial Indexes\nPartial indexes are ideal for high-frequency queries on recency-bounded data (e.g., \"last 24 hours\"). They reduce index size, improve write performance, and automatically expire old entries—eliminating the need to DROP old indexes on a schedule.\n\n### Plan Verification with EXPLAIN ANALYZE\nAlways verify index usage with EXPLAIN (ANALYZE, BUFFERS). Look for Index Only Scan (optimal), Index Scan (acceptable), or Seq Scan (often indicates missing or unused indexes).\n\n### Index Maintenance and Bloat\nB-tree indexes accumulate dead tuples after UPDATEs/DELETEs. Regular VACUUM and periodic REINDEX maintain performance. Partial indexes require careful autovacuum tuning to prevent predicate staleness.\n\n## Code Example\n```sql\nCREATE TABLE activity_log (\n  id bigserial PRIMARY KEY,\n  region_code text NOT NULL,\n  user_id int NOT NULL,\n  created_at timestamptz NOT NULL,\n  event_type text,\n  payload jsonb\n);\n\n-- Composite B-tree for region + time + user queries\nCREATE INDEX CONCURRENTLY idx_activity_log_region_created_user \n  ON activity_log (region_code, created_at DESC, user_id);\n\n-- Hash index for global per-user lookups\nCREATE INDEX CONCURRENTLY idx_activity_log_user_id_hash \n  ON activity_log USING hash (user_id);\n\n-- Partial index for 24-hour window queries\nCREATE INDEX CONCURRENTLY idx_activity_log_recent \n  ON activity_log (created_at DESC) \n  WHERE created_at > NOW() - INTERVAL '24 hours';\n\n-- Example query using the composite index\nEXPLAIN ANALYZE\nSELECT COUNT(*), region_code \nFROM activity_log \nWHERE created_at > NOW() - INTERVAL '24 hours'\nGROUP BY region_code;\n\n-- Example query using partial index\nEXPLAIN ANALYZE\nSELECT * FROM activity_log \nWHERE user_id = 12345 \n  AND region_code = 'US-EAST'\nORDER BY created_at DESC \nLIMIT 100;\n```\n\n## Common Pitfalls\n- Creating too many indexes increases write overhead and storage.\n- Partial index predicates must match query WHERE clauses exactly for the planner to use them.\n- Hash indexes are not crash-safe in PostgreSQL versions prior to 13 without additional configuration.\n- Leading column selectivity matters: a composite index on (created_at, region_code) would not efficiently support region-first queries.",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "database-q-16",
+        "questionId": "q-24292",
+        "question": "Scenario: A SaaS analytics platform stores 500M+ event records in PostgreSQL with columns (user_id, org_id, event_type, timestamp, payload JSONB, metadata JSONB). The most common queries are: 1) org-level aggregations (SUM/COUNT over time ranges), 2) user behavior sequences within an org, 3) event_type filtering with timestamp ordering, and 4) JSONB payload key lookups. Current queries are slow (5-15s) despite adequate hardware. Design a comprehensive indexing strategy: which indexes to create, their types, column ordering rationale, partial/indexes for tenant isolation, and how to handle JSONB querying. Also explain index maintenance overhead, when to consider partitioning, and how you'd validate index effectiveness?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Create composite indexes with high-cardinality columns first (org_id, timestamp), use partial indexes for tenant isolation, leverage BRIN indexes for time-series data, add expression indexes for JSONB path lookups, and…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Partition events by region; join tenants, users, events; filter by region/date window; aggregate per-tenant: total_events, unique_users, top 3 event_types using COUNT, COUNT(DISTINCT), and rank() over",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "I would implement a tiered indexing strategy combining time-based partitioning with adaptive index types: recent data would utilize high-performance write-optimized indexes, while historical data would employ compressed…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Create a composite index on (category, price, brand), implement covering indexes for frequently accessed columns, use partial indexes for active products, and maintain index health through regular fragmentation analysis…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "This solution requires a multi-layered indexing approach. For org-level aggregations, create a composite index on (org_id, timestamp) with event_type included for index-only scans—the column ordering matters because PostgreSQL can only use columns after equality constraints for seeks. For user behavior sequences within an org, a covering index on (org_id, user_id, timestamp) INCLUDE (event_type, payload) allows fetching full records without heap hits. For time-series patterns, consider BRIN indexes, which are smaller and faster to maintain for naturally ordered data like timestamps.\n\nFor JSONB querying, avoid casting payload to text; instead, use expression indexes on specific paths such as `((payload->>'key')::jsonb)` or GIN indexes with jsonb_ops for broader path searches. For tenant isolation, partial indexes like `CREATE INDEX ON events (timestamp) WHERE org_id = $1` reduce index bloat and enforce logical separation.\n\nIndex maintenance overhead includes increased write latency (INSERT/UPDATE/DELETE operations must update all relevant indexes) and storage costs—balance the number of indexes against write performance. Consider partitioning by time (monthly or weekly) when tables exceed tens of millions of rows, as it enables partition pruning, reduces index size per partition, and simplifies data lifecycle management (archival/deletion). To validate effectiveness, use EXPLAIN ANALYZE to verify index usage, pg_stat_statements to track query performance improvements, and monitor index hit ratios and bloat levels regularly.",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "database-q-17",
+        "questionId": "q-8221",
+        "question": "Given a PostgreSQL schema for a small publication system: authors(id, name), posts(id, author_id, created_at, title, content), tags(id, name), post_tags(post_id, tag_id). For a selected author_id and date range, return each tag name with the number of posts, the total word count across those posts, and the average words per post. Describe normalization, indexing strategy, and provide the SQL to compute it?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Join authors→posts on author_id, filter by author and date, then join post_tags→tags; group by tag.name to emit post_count, total_words, avg_words. Use composite indexes: posts(author_id, created_at)",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Partition events by day with range partitions; if last two weeks are typical, switch to weekly partitions for pruning. Create a multicolumn B-tree index on (region, device_type, event_date) and a BRIN",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Composite B-tree index on (tenant_id, category, price) enables per-tenant category-range scans; a hash index on (tenant_id, product_id) provides fast tenant lookups; a partial index on (tenant_id, act",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement an idempotent, versioned cross-store write path: 1) Write to DynamoDB using a composite key (campaign_id:user_id:version) with the new channel preference and version number; 2) Update Redis per-user current_ch…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of multi-table normalization, efficient joins, and concrete indexing for common query shapes.\n\n## Key Concepts\n- Foreign-key joins across a many-to-many relation.\n- Composite indexes to support filtered range scans.\n- Aggregation by a dimension (tag) with derived metrics (words).\n\n## Code Example\n```sql\nSELECT t.name, COUNT(*) AS post_count,\n       SUM(char_length(p.content)-char_length(replace(p.content,' ',''))+1) AS total_words,\n       AVG(char_length(p.content)-char_length(replace(p.content,' ',''))+1) AS avg_words\nFROM authors a\nJOIN posts p ON p.author_id = a.id\nJOIN post_tags pt ON pt.post_id = p.id\nJOIN tags t ON t.id = pt.tag_id\nWHERE a.id = $1 AND p.created_at BETWEEN $2 AND $3\nGROUP BY t.name\nORDER BY t.name;\n```",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "database-q-18",
         "questionId": "q-7975",
         "question": "A SaaS analytics platform stores time-series metrics in PostgreSQL with composite indexes on (timestamp, metric_id, customer_id). Query patterns include: 1) Latest metric values per customer, 2) Historical ranges for specific metrics, 3) Aggregated rollups across time windows. How would you design the indexing strategy, including partial indexes, expression indexes, and index maintenance to optimize these query patterns while managing write performance?",
         "type": "single",
@@ -409,17 +559,17 @@
           },
           {
             "id": "b",
-            "text": "To ensure ACID across transfers, use SERIALIZABLE; lock both rows with SELECT ... FOR UPDATE within one transaction, check balance >= amount, then UPDATE balances and INSERT a movement; commit. If ins",
+            "text": "The composite index follows leftmost prefix matching, so it can only be used when the leading column (status) is included in the query. A query filtering only on created_at cannot use the index becaus",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "SQL: SELECT oi.product_id, SUM(oi.quantity*oi.unit_price) AS total_revenue, COUNT(DISTINCT o.id) AS order_count FROM customers c JOIN orders o ON o.customer_id=c.id JOIN order_items oi ON oi.order_id=",
+            "text": "Create Composite B-tree indexes: (exchange_id, user_id, ts) for A and (symbol, ts) for B; add a HASH index on (exchange_id) for exact lookups; implement partial index on ts >= current_timestamp - inte",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design a comprehensive timezone rollout across four data stores: Redis presence cache using key `user:presence:{id}` with 300s TTL storing `{userId, timezone, lastSeen}`; MongoDB profile document `{userId, name, timezon…",
+            "text": "Query: SELECT p.category, SUM(oi.quantity*oi.unit_price) AS revenue, COUNT(DISTINCT o.id) AS orders FROM customers c JOIN orders o ON o.customer_id=c.id JOIN order_items oi ON oi.order_id=o.id JOIN pr",
             "isCorrect": false
           }
         ],
@@ -427,254 +577,44 @@
         "difficulty": "intermediate"
       },
       {
-        "id": "database-q-14",
-        "questionId": "q-172",
-        "question": "Design a database failover strategy for a high-traffic e-commerce platform using primary-replica PostgreSQL. How would you ensure zero-downtime failover while maintaining data consistency during peak traffic of 10,000 requests/second?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a comprehensive failover strategy using PgBouncer for connection pooling with automatic failover detection, continuous health checks every 5 seconds with 3-second timeouts, and write operation queuing with eve…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Run EXPLAIN ANALYZE to confirm partition pruning. If all 90 partitions are scanned, bind the partition key directly with literal date bounds, push the date filter before the join, and consider a subqu",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Write a single query joining students to cohorts and programs, and enrollments to compute per-student completed_courses and avg_grade for a specified cohort year and program. Normalize via foreign key",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Write a query joining trips to regions, filter by pickup_time >= now() - interval '24 hours', and group by region name to compute counts, sums, and averages. Index suggestions: trips(pickup_time), trips(region_id), or a…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "Interview Context: This SRE question evaluates system design expertise in database resilience and high availability architecture for mission-critical e-commerce platforms.\n\nTechnical Requirements:\n- Primary-replica PostgreSQL configuration with synchronous replication\n- PgBouncer connection pool with transaction pooling mode\n- Health checks every 5 seconds with 3-second timeout thresholds\n- Automatic failover completion within 30 seconds\n- Write operations queue management during failover transitions\n\nNon-Functional Requirements & Calculations:\n- Availability target: 99.99% (52.6 minutes maximum annual downtime)\n- Recovery Time Objective (RTO): <30 seconds\n- Recovery Point Objective (RPO): <1 second\n- Connection pool sizing: 100 connections (10% of peak traffic capacity)\n- Failover trigger threshold: 3 consecutive failed health checks\n- Write queue capacity limits to prevent memory exhaustion",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "database-q-15",
-        "questionId": "q-15132",
-        "question": "In a fintech workload, a large transactions table is range-partitioned by sale_date (monthly) with a hash subpartition on user_id. A query filters by user_id and a date range and joins to a small customers table. Explain how you would validate explain analyze plans to guarantee partition pruning and parallelism, and state concrete changes to partitioning, indexing, and planner settings to fix any mispruning?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Leverage EXPLAIN ANALYZE BUFFERS to confirm partition pruning and partition-wise aggregation; ensure the WHERE clause matches partition bounds (order_month for last 6 months); weigh daily vs monthly p",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement declarative range partitions by month on events(event_date). Ensure WHERE clauses use tight, contiguous date ranges (avoid OR conditions) to guarantee partition pruning. Add a per-partition index on (dim_id, e…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Add a composite BTREE index on (user_id, created_at) to support per-user date range queries and finding the most recent event. This column order is critical—user_id comes first because it's used for equality filtering,…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use EXPLAIN ANALYZE to confirm only relevant partitions are scanned and the plan uses a feasible join with the small customers table. If pruning fails, switch to range partitioning by sale_date with h",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nInterview context explanation.\n\n## Key Concepts\n\n- Partition pruning validation with EXPLAIN ANALYZE\n- Composite per-partition indexing\n- Planner settings: enable_partition_pruning, constraint_exclusion\n- Join strategies with small dimension tables\n\n## Code Example\n\n```sql\nEXPLAIN ANALYZE\nSELECT t.*\nFROM transactions t\nJOIN customers c ON c.user_id = t.user_id\nWHERE t.user_id = ? AND t.sale_date BETWEEN ? AND ?;\n```\n\n## Follow-up Questions\n\n- How would you monitor pruning regressions over time?\n- What trade-offs arise from adding hash subpartitions on user_id?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "database-q-16",
-        "questionId": "q-16169",
-        "question": "Scenario: A financial ledger stores balances in a MVCC database with snapshot isolation. Two concurrent transfers run: T1 transfers 100 from A to B if A >= 100; T2 transfers 100 from B to A if B >= 100. Starting A=100, B=100. Explain why both commits can succeed under snapshot isolation, show final balances, and propose a concrete strategy to guarantee serializability with minimal performance hit, including DB features or patterns you would use?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Composite indexes are optimal for queries that filter on multiple columns in a specific order, while single-column indexes work better for independent column queries.",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "To avoid inventory oversell, use MVCC with SERIALIZABLE or a FOR UPDATE lock. T1 reads stock, then inserts cart line; T2 checks out and decrements stock. With READ COMMITTED, phantom reads could allow",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Under snapshot isolation, T1 and T2 each read A=100 and B=100 and both commit, leaving A=0, B=200 (or A=200, B=0). This write skew violates serializability. Fix: run in SERIALIZABLE isolation, or add",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use partial indexes, automated index monitoring, and gradual migration strategies with feature flags to handle schema changes while maintaining query performance.",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes understanding of SSI vs serializable, and practical strategies to avoid write skew in distributed MVCC systems.\n\n## Key Concepts\n- MVCC and snapshot isolation\n- Write skew and serializability\n- Predicate locking and 2PC vs strict locking\n\n## Code Example\n```sql\n-- Serializable path example (PostgreSQL-like)\nBEGIN;\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\nUPDATE accounts SET balance = balance - 100 WHERE id = 'A' AND balance >= 100;\nUPDATE accounts SET balance = balance + 100 WHERE id = 'B';\nCOMMIT;\n```\n\n## Follow-up Questions\n- How would you implement serializable guarantees in a distributed DB like CockroachDB or Spanner?\n- How would you detect and recover from serialization anomalies in production?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "database-q-17",
-        "questionId": "q-19593",
-        "question": "Given a Postgres schema with tables: customers(id, region), orders(id, customer_id, created_at, status), order_items(id, order_id, product_id, quantity, unit_price), products(id, category). For region='US' and a date range, write a single SQL query to return, for each customer: total_revenue, total_orders, distinct_categories_bought, and a 12-month revenue series (month, revenue). Explain normalization and indexing choices?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Join customers, orders, order_items, products; filter region and date; per customer compute total_revenue, total_orders, distinct_categories_bought. Build a 12-month revenue series with generate_serie",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use composite partition keys with sharding (product_id#hash) and adaptive capacity for hot items, trading some read latency for write scalability.",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a single transaction that SELECT FOR UPDATE SKIP LOCKED on unbilled events for the target date, then aggregate units and insert or update daily_invoice, and finally set billed=true for those event",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Composite BTREE index on (user_id, event_type, created_at) for efficient per-user, per-type range scans; HASH index on (event_type) for rapid equality lookups and aggregations; partial BTREE index on created_at WHERE cr…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to craft a comprehensive multi-join aggregation with a time-series component and discuss data modeling and indexing in Postgres at scale.\n\n## Key Concepts\n- Multi-table joins\n- Aggregate functions and distinct counts\n- generate_series for time-series windows\n- Composite indexes for selective predicates\n- Normalization vs denormalization trade-offs in OLAP queries\n\n## Code Example\n```sql\n-- Totals per customer\nSELECT c.id AS customer_id,\n       SUM(oi.quantity*oi.unit_price) AS total_revenue,\n       COUNT(DISTINCT o.id) AS total_orders,\n       COUNT(DISTINCT p.category) AS distinct_categories_bought\nFROM customers c\nJOIN orders o ON o.customer_id = c.id\nJOIN order_items oi ON oi.order_id = o.id\nJOIN products p ON p.id = oi.product_id\nWHERE c.region = 'US'\n  AND o.created_at BETWEEN :start AND :end\n  AND o.status = 'completed'\nGROUP BY c.id;\n\n-- 12-month series\nWITH months AS (\n  SELECT generate_series(:start::date, :end::date, interval '1 month') AS month\n)\nSELECT c.id AS customer_id,\n       m.month,\n       SUM(oi.quantity*oi.unit_price) AS revenue\nFROM months m\nCROSS JOIN customers c\nLEFT JOIN orders o ON o.customer_id = c.id\n  AND o.created_at >= date_trunc('month', m.month)\n  AND o.created_at < date_trunc('month', m.month) + interval '1 month'\nLEFT JOIN order_items oi ON oi.order_id = o.id\nLEFT JOIN products p ON p.id = oi.product_id\nWHERE c.region = 'US'\nGROUP BY c.id, m.month;\n```\n\n## Follow-up Questions\n- How would you adapt the query for dynamic region filtering at runtime?\n- What changes to indexes if data grows 10x and queries become more selective by product category?\n- How would you verify correctness with EXPLAIN ANALYZE and address potential skew in monthly revenue?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "database-q-18",
-        "questionId": "q-29204",
-        "question": "Scenario: A SaaS analytics platform runs PostgreSQL with a table 'events' containing 500M+ rows (eventId UUID, userId UUID, eventType VARCHAR, properties JSONB, createdAt TIMESTAMP, tenantId UUID). Queries filtering by tenantId + createdAt + eventType take 8-15 seconds. Query patterns include: real-time dashboards (last 24h per tenant), historical analysis (any date range per tenant), and ad-hoc property lookups inside JSONB. Design a comprehensive indexing strategy covering partitioned tables, composite indexes, partial indexes for hot data, JSONB GIN indexes, and include/exclude constraints. How would you balance read performance against write amplification and storage costs, and what monitoring would validate index effectiveness?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a multi-layered indexing strategy: **1. Range Partitioning:** Partition the events table by createdAt (monthly), with tenantId as the distribution key to co-locate tenant data. This reduces the index footprint…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use a single query with INNER JOINs across orders → order_items → products, grouping by products.category_id. Calculate revenue as SUM(oi.qty * oi.unit_price) and total_items as SUM(oi.qty). Filter on orders.customer_id…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement composite partitioning by date + user_id with BRIN indexes, create materialized views for common aggregations, use columnar storage via cstore_fdw, add query plan hints with SET enable_seqscan=off, and leverag…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "The physical plan demonstrates effective partition pruning on both date and region columns, with predicate pushdown directly into Delta Lake's storage layer. The small dimension table triggers a BroadcastHashJoin to avo…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "Begin with range partitioning on createdAt by month, using tenantId as the distribution key to co-locate related data. This approach reduces the index footprint per partition and enables efficient partition pruning for time-bounded queries.\n\nFor the most common query pattern—filtering by tenantId, createdAt, and eventType—create a composite B-tree index with tenantId as the leading column, followed by eventType, then createdAt as a range condition. This column ordering maximizes index selectivity for both equality and range predicates.\n\nFor real-time dashboards querying recent data, implement a partial index that excludes historical data, dramatically reducing index size and write amplification while keeping hot data fully optimized for reads.\n\nGIN indexes on the JSONB properties column enable efficient path and containment queries, though be aware they increase write costs. The INCLUDE clause in the composite index allows index-only scans for common access patterns, eliminating heap access for qualifying queries.\n\nBalance write amplification by carefully evaluating fillfactor settings—lower values on high-churn partitions reduce fragmentation but increase storage. BRIN indexes serve well for historical partitions where data is append-only, offering near-zero write overhead compared to B-tree alternatives.",
-        "difficulty": "intermediate"
-      },
-      {
         "id": "database-q-19",
-        "questionId": "q-29685",
-        "question": "Scenario: A multi-tenant SaaS uses MongoDB for tenant configs, Redis for real-time per-tenant counters, DynamoDB for daily quotas, and Cassandra for audits. When an API call consumes a quota, perform a cross-store write: (a) DynamoDB: decrement quota_remaining with conditional (quota_remaining > 0), (b) Redis: increment quota_used, (c) Cassandra: append audit row. Propose an idempotent commit protocol (2PC or advisory locks), failure handling, and a concrete write order. Include schemas and a test plan?",
+        "questionId": "q-27834",
+        "question": "Scenario: A billing system coordinates MongoDB (customer data), Redis (real-time usage counters), Cassandra (per-minute usage logs), and DynamoDB (invoices). At month-end, design a cross-store finalization to generate a single DynamoDB invoice per customer for the month, with line items stored in MongoDB, a reset of Redis counters, and an immutable audit record in Cassandra. Include schemas, a concrete write path, idempotent guarantees, and a practical test plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a composite B-tree index on (user_id, event_type, created_at) as primary, with a partial index for recent data. For schema changes, use pg_repack or CONCURRENTLY to avoid blocking.",
+            "text": "Analyze the EXPLAIN plan to identify full table scans, then implement timestamp-based partitioning with a composite index on (timestamp, device_id).",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use a composite B-Tree index on (region, ts) to support regional time-range scans; a hash index on (driver_id, region, ts) for exact reconciliation lookups; optionally a separate index on (region, tri",
-            "isCorrect": false
+            "text": "Freeze monthly usage by running a Redis Lua script that atomically moves counters to a frozen bucket keyed by customerId:month. Retrieve per-minute usage logs from Cassandra, aggregate them, and write a DynamoDB invoice…",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Index design: B-Tree on ts stores leaves as (ts, row_id); hash on user_id maps to row_ids; composite (user_id, ts) uses key (user_id, ts) with row_id. Inserts update all three. a) use composite (42, [",
+            "text": "Use an event-driven revoke flow: publish a consent_revoked event with user_id and category. MongoDB: profile.consents[cat].revoked_at = now. Redis: delete tokens and cache keys profile:<uid>, session:",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design a cross-store write using a deterministic transaction ID for idempotency with the following sequence: 1. **Generate a unique `txId`** — Use a UUID or composite key (tenantId + requestId) to track this operation.…",
-            "isCorrect": true
+            "text": "To guarantee atomic cross-region transfers in a region-sharded MVCC ledger with Serializable isolation, we employ a Two-Phase Commit (2PC) protocol across shards to ensure all-or-nothing semantics. The flow proceeds as…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question evaluates the ability to design cross-store consistency, idempotency, and failure handling across diverse data stores in a realistic multi-tenant quota enforcement system. It tests practical knowledge of distributed systems patterns, not just theoretical understanding.\n\n## Key Concepts\n\n- **Cross-store consistency** across MongoDB, Redis, DynamoDB, and Cassandra with different consistency models\n- **Idempotent writes** using deterministic transaction IDs to enable safe retries\n- **Conditional updates** (DynamoDB) as a primitive for atomic checks\n- **Compensating transactions** to handle partial failures\n- **Failure scenarios**, retry strategies, and reconciliation patterns\n\n## Schema Design\n\n**DynamoDB** (`quotas` table):\n```\nPK: tenantId (String)\nAttributes: quota_remaining (Number), quota_limit (Number), updatedAt (String)\n```\n\n**Redis**:\n```\nquota:used:{tenantId} — Integer counter\ntx:{txId} — Idempotency marker (TTL: 24h)\n```\n\n**Cassandra** (`audit_logs` table):\n```\ntx_id (UUID, partition key)\ntenant_id (String)\naction (String)\ntimestamp (BigInt)\n```\n\n## Test Plan\n\n1. **Happy path**: Call API within quota — verify DynamoDB decrements, Redis increments, Cassandra inserts.\n2. **Quota exhausted**: Call when quota_remaining = 0 — expect DynamoDB conditional failure, no Redis/Cassandra writes.\n3. **Idempotency**: Replay same requestId — expect single write across all stores.\n4. **Redis failure**: Inject Redis timeout after DynamoDB success — verify compensating DynamoDB increment.\n5. **Cassandra failure**: Inject Cassandra error — verify dead-letter queue entry and eventual consistency.\n6. **Concurrent requests**: Multiple calls for same tenant — verify atomic conditional updates in DynamoDB prevent race conditions.\n7. **Recovery**: Simulate crash mid-transaction — verify idempotent replay recovers correctly.",
+        "explanation": "## Why This Question Is Asked\n\nThis scenario evaluates your ability to design and reason about cross-store finalization patterns, idempotence guarantees, and failure recovery in a realistic billing workflow spanning Redis, Cassandra, MongoDB, and DynamoDB.\n\n## Key Concepts\n\n- Atomic operations in Redis via Lua scripting to ensure counter consistency\n- Deterministic composite keys and upserts in DynamoDB for idempotent invoice writes\n- Immutable audit records in Cassandra for compliance and replay capability\n- Multi-store read-after-write consistency decisions\n- Replay-safe test design for distributed billing workflows\n\n## Code Example\n\n```javascript\nasync function finalizeInvoice(customerId, month) {\n  // Acquire distributed lock in Redis\n  // Atomically move counters to frozen bucket using Lua script\n  // Query Cassandra for aggregated usage logs\n  // Upsert invoice to DynamoDB with deterministic ID\n  // Store line items in MongoDB linked by invoiceId\n  // Write immutable audit record to Cassandra\n  // Reset active Redis counters\n}\n```\n\n## Idempotent Guarantees\n\nUse composite keys (customerId:YYYY-MM) for DynamoDB upserts and check-if-not-exists patterns before writing. The distributed lock prevents concurrent finalizations for the same customer-month.",
         "difficulty": "intermediate"
       },
       {
         "id": "database-q-20",
-        "questionId": "q-10413",
-        "question": "In PostgreSQL, you store events in daily range partitions named events_YYYYMMDD and a users table, joined on user_id. A query filters a 90-day window and a region, then joins users to count events per region. EXPLAIN ANALYZE shows poor partition pruning and cross-partition scans. Propose a partitioning and indexing strategy plus a query rewrite that guarantees pruning across the date window, minimizes cross-partition work, and preserves fast lookups for user_id lookups. How would you validate performance?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a partial index on (customer_id, created_at) filtering on status='pending', and create a supporting index on customers(tier) for the subquery. Validate with EXPLAIN ANALYZE to confirm index-only scans are being used…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "A composite BTREE index on (user_id, event_type, event_time) is the most practical choice for this workload. It supports equality lookups on the first two columns, range queries on event_time, and serves as a covering i…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Two-level partitioning: range on event_date with region subpartitions; ensure constraint exclusion. Create a covering index on (region, user_id) per leaf; rewrite the query to restrict the date and re",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Approach: normalize campaigns by product, calculate revenue with discounts in a single query, filter to completed orders in range, group by category. Use a left join for campaigns to handle no-discoun",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests practical understanding of partition pruning, multi-level partitioning, and index design under realistic warehouse workloads.\n\n## Key Concepts\n\n- Partition pruning and constraint exclusion\n- Two-level partitioning design (range + subpartitioning)\n- Covering indexes per leaf and join strategies\n\n## Code Example\n\n```javascript\n-- Pseudo SQL illustrating partition pruning test\nEXPLAIN ANALYZE\nSELECT e.region, COUNT(*) \nFROM events_20210101 e\nJOIN users u ON u.user_id = e.user_id\nWHERE e.event_date BETWEEN '2021-01-01' AND '2021-01-31'\n  AND e.region = 'eu'\nGROUP BY e.region;\n```\n\n## Follow-up Questions\n\n- How would you monitor partition pruning in production and alert on regression?\n- What are trade-offs of adding a global index versus local leaf indexes in this setup?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "database-q-21",
-        "questionId": "q-268",
-        "question": "How would you optimize a time-series analytics query that scans 100M+ rows across multiple date partitions in PostgreSQL when the WHERE clause cannot be pruned effectively due to complex temporal conditions?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "SQL plan (category and top products): SELECT pr.category AS category, SUM(oi.quantity*oi.unit_price) AS revenue FROM orders ord JOIN order_items oi ON oi.order_id = ord.id JOIN products pr ON oi.produ",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement composite partitioning by date + user_id with BRIN indexes, create materialized views for common aggregations, use columnar storage via cstore_fdw, add query plan hints with SET enable_seqscan=off, and leverag…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Publish each bid to Redis Streams bids:auctionId with bidId as idempotency key. A consumer group runs a transactional envelope: DynamoDB TransactWriteItem to increment the auction’s totalBids and reco",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a Serializable transaction in PostgreSQL. Schema: accounts(id, balance), transfers(id, from_id, to_id, amount, txid, status). Pattern: BEGIN; SELECT balance FROM accounts WHERE id IN (from_id, to_",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Interview Context\nThis question assesses your ability to optimize large-scale PostgreSQL queries with real-world constraints like real-time dashboard requirements and inefficient WHERE clauses.\n\n## Technical Approach\n- **Composite Partitioning**: Date + user_id partitions reduce scan scope while maintaining query flexibility\n- **BRIN Indexes**: Block Range Indexes perfect for time-series data with natural ordering\n- **Materialized Views**: Pre-computed aggregations refreshed incrementally to avoid full rescans\n- **Columnar Storage**: TimescaleDB's compression reduces I/O for analytical workloads\n- **Parallel Execution**: Leverage multiple CPU cores for concurrent partition processing\n\n## Implementation Details\n```sql\n-- Create time-series table with TimescaleDB\nCREATE TABLE metrics (\n  timestamp TIMESTAMPTZ NOT NULL,\n  user_id BIGINT NOT NULL,\n  value NUMERIC NOT NULL\n) PARTITION BY RANGE (timestamp);\n\n-- Create BRIN index for efficient range scans\nCREATE INDEX idx_metrics_brin ON metrics USING BRIN (timestamp);\n\n-- Materialized view for common aggregations\nCREATE MATERIALIZED VIEW daily_metrics AS\nSELECT date_trunc('day', timestamp) as day,\n       user_id, AVG(value), COUNT(*)\nFROM metrics GROUP BY day, user_id;\n```\n\n## Follow-up Questions\n1. How would you handle partition pruning when the WHERE clause doesn't include the partition key?\n2. What metrics would you monitor to determine if your optimization is effective?\n3. How would you design the schema to handle both real-time and historical query patterns?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "database-q-22",
         "questionId": "q-17003",
         "question": "Scenario: A chat app uses Redis for presence, MongoDB for profiles and messages, Cassandra for per-chatroom time-series, and DynamoDB for long-term archives. Design a concrete write path for sending a message that updates Redis presence, stores the message in MongoDB, and appends a record to Cassandra with a bucket TTL; archive to DynamoDB. Then describe a read path to fetch the latest 20 messages for a chatroom using a Redis cache and fallbacks?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "I would optimize the PostgreSQL query through a systematic approach: first analyze the execution plan using EXPLAIN ANALYZE to identify bottlenecks, then add appropriate indexes on foreign keys and frequently used join…",
+            "text": "To guarantee at-most-one reservation per seat, use serializable transactions with row-level locking or a per-seat advisory lock. The pattern: BEGIN TRANSACTION, SELECT seat_id FROM seats WHERE seat_id = ? FOR UPDATE, ve…",
             "isCorrect": false
           },
           {
@@ -684,12 +624,12 @@
           },
           {
             "id": "c",
-            "text": "Redis: flag:<id>:live:<region> -> boolean, TTL 300s. MongoDB: flags { _id, name, defaultValue, strategy }. Cassandra: evals (user_id, flag_id, ts, result). DynamoDB: rollouts (user_id, flag_id, result",
+            "text": "Create composite indexes with high-cardinality columns first (org_id, timestamp), use partial indexes for tenant isolation, leverage BRIN indexes for time-series data, add expression indexes for JSONB path lookups, and…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Under READ COMMITTED isolation, both transactions can read the initial balance of 100 concurrently, leading to a lost update anomaly. Transaction T1 subtracts 60 (resulting balance: 40) and Transaction T2 subtracts 40 (…",
+            "text": "Begin by running EXPLAIN ANALYZE to confirm whether partition pruning is occurring as expected. Ensure predicates reference the partition key directly without functions or implicit type conversions, which can prevent pr…",
             "isCorrect": false
           }
         ],
@@ -697,68 +637,128 @@
         "difficulty": "beginner"
       },
       {
-        "id": "database-q-23",
-        "questionId": "q-19204",
-        "question": "Scenario: A shopping app uses Redis for per-user recently viewed products, MongoDB for product catalog, Cassandra for user view events, and DynamoDB for daily analytics. For the 'Recently Viewed' widget, design a concrete write path when a user views a product (keys, TTLs, cross-store writes), a read path that returns the latest 10 items with fast cache, and how to refresh cache on cache miss. Include concrete key schemas?",
+        "id": "database-q-21",
+        "questionId": "q-288",
+        "question": "What is the main difference between B-tree and hash index in terms of range query performance?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Propose a single SQL query that returns, for each customer, the most recent completed order per product category, using a window function partitioned by (customer_id, category_id) ordered by placed_at",
-            "isCorrect": false
+            "text": "B-trees provide O(log n) range scans with sorted data traversal; hash indexes offer O(1) equality lookups but degrade to O(n) for ranges and require collision handling strategies like chaining or open addressing.",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Use a Redis Lua script to atomically increment the player's score in the leaderboard:global ZSET via ZINCRBY and return the new score. In MongoDB, update users.{id} with incremented total_matches and total_score in a si…",
+            "text": "Two-level partitioning: create monthly range partitions on created_at with regional subpartitions, so queries filtering by date and region prune to relevant partitions. Add a composite index (region,",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Write path: Cassandra: insert (user_id, product_id, ts); Redis: LPUSH user:recent:<uid> <product_id>, LTRIM 10, EXPIRE 7d; DynamoDB: increment daily_views by (date, product_id). Read path: Redis cache",
-            "isCorrect": true
+            "text": "Run EXPLAIN ANALYZE to verify pruning; check that only relevant monthly partitions are scanned and that aggregation is driven by a date-based grouping. If pruning is absent, add a composite index on (",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Analyze the EXPLAIN plan to identify full table scans, then implement timestamp-based partitioning with a composite index on (timestamp, device_id).",
+            "text": "Diagnose whether pruning uses the partition key directly in the WHERE clause. Run EXPLAIN ANALYZE with filters: where event_day >= '2026-02-01' and event_day < '2026-02-08' and event_type='login'. If",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests cross-store write/read paths, TTLs, and cache-aside logic in a beginner-friendly multi-DB setup.\n\n## Key Concepts\n- Cache-aside pattern across Redis, Cassandra, MongoDB, DynamoDB\n- TTL management and LTRIM for fixed-size lists\n- Upserts and simple analytics counters\n\n## Code Example\n```javascript\n// Write path (pseudo)\nasync function onView(userId, pid) {\n  const ts = Date.now();\n  await cassandra.insert('view_event', {userId, pid, ts});\n  await redis.lpush(`recent:${userId}`, pid);\n  await redis.ltrim(`recent:${userId}`, 0, 9);\n  await redis.expire(`recent:${userId}`, 7*24*3600);\n  await dynamo.update('daily_views', {date: today, pid}, {increment: 1}, {upsert: true});\n}\n\n// Read path (fallback)\nasync function getRecent(userId) {\n  let ids = await redis.lrange(`recent:${userId}`, 0, 9);\n  if (!ids.length) {\n    const events = await cassandra.query('SELECT pid FROM view_event WHERE userId=? ORDER BY ts DESC LIMIT 10', userId);\n    ids = events.map(e => e.pid);\n    await redis.rpush(`recent:${userId}`, ...ids);\n    await redis.expire(`recent:${userId}`, 7*24*3600);\n  }\n  const products = await mongo.find('products', {_id: {$in: ids}});\n  return ids.map(id => products.find(p => p._id === id));\n}\n```",
+        "explanation": "## Why Asked\nTests practical understanding of index selection based on query patterns and performance characteristics, including collision scenarios.\n\n## Performance Comparison\n**B-tree Index:**\n- Range queries: O(log n + k) where k = result count\n- Equality lookups: O(log n)\n- Memory overhead: 20-30% additional storage\n- Example: `SELECT * FROM employees WHERE salary BETWEEN 50000 AND 80000` efficiently scans adjacent leaf nodes\n\n**Hash Index:**\n- Equality lookups: O(1) average case\n- Range queries: O(n) full table scan required\n- Memory overhead: 15-25% additional storage\n- Example: `SELECT * FROM employees WHERE email = 'john@company.com'` direct bucket access\n\n## Collision Handling\nHash indexes use two main collision strategies:\n1. **Separate Chaining**: Stores colliding keys in linked lists from the same bucket\n2. **Open Addressing**: Probes alternative slots using linear/quadratic probing\n\nPerformance degrades when load factor exceeds 0.7, turning O(1) lookups into O(n) chain traversals. B-trees maintain consistent performance regardless of data distribution.\n\n## Code Example\n```sql\n-- B-tree for range queries (salary ranges, date ranges)\nCREATE INDEX idx_salary_btree ON employees(salary);\n-- Hash for exact matches (email lookups, user IDs)\nCREATE INDEX idx_email_hash ON employees USING HASH(email);\n-- Monitor hash index collision impact\nSELECT schemaname, tablename, indexname, \n       pg_stat_get_numscans(pg_stat_get_index_relid(indexrelid)) as scans\nFROM pg_stat_user_indexes;\n```\n\n## Follow-up Questions\nHow would you handle hash index rebalancing with high insert rates?\nWhat hybrid indexing strategy combines both B-tree and hash benefits?\nHow does partitioning affect index choice for billion-row tables?",
         "difficulty": "beginner"
       },
       {
-        "id": "database-q-24",
-        "questionId": "q-18224",
-        "question": "You have a PostgreSQL data warehouse with range-partitioned orders by month. A nightly BI query aggregates revenue over a date range and joins to a customers table. The planner shows a Seq Scan on a large partition. Explain how to diagnose with EXPLAIN ANALYZE, enforce partition pruning, and optimize with targeted indexes and a rewritten predicate to touch only relevant partitions?",
+        "id": "database-q-22",
+        "questionId": "q-6835",
+        "question": "Design an indexing strategy for a high-throughput user activity table with columns: user_id, event_type, event_ts, region, device_id, payload. The system must support: 1) latest 5 events per user, 2) counts by (region, event_type) in 1-hour windows, 3) fast lookups by (event_type, region, event_ts) for recent aggregates. Propose a mix of B-tree indexes (for ranges), a hash index (for some equality lookups), and composite indexes; specify key orders, TTL/partitioning strategies, and how to avoid hot spots?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a composite B-tree index on (event_type, user_id, created_at) with INCLUDE (resource_id) for covering reads, and a separate hash index on (user_id) for fast existence checks. Add a partial index o",
+            "text": "Create separate indexing strategies for OLTP (few targeted indexes on hot tables) and OLAP (comprehensive covering indexes, column store), use partial/indexed views and materialized views to bridge th",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use a Redis Lua script to atomically increment the player's score in the leaderboard:global ZSET via ZINCRBY and return the new score. In MongoDB, update users.{id} with incremented total_matches and total_score in a si…",
-            "isCorrect": false
+            "text": "Proposed: 1) B-tree composite index on (user_id, event_ts DESC) to fetch latest events quickly. 2) Hash index on (region, event_type) for fast exact counts. 3) Composite index on (event_type, region,",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Use SERIALIZABLE (or SSI). In one transaction, lock both accounts with FOR UPDATE, verify src balance >= amount, then debit/credit, and insert a ledger row, then COMMIT. On serialization_failure, retr",
+            "text": "Create Composite B-tree indexes: (exchange_id, user_id, ts) for A and (symbol, ts) for B; add a HASH index on (exchange_id) for exact lookups; implement partial index on ts >= current_timestamp - inte",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Run EXPLAIN ANALYZE on the query and verify partition pruning; ensure the WHERE predicate uses the partition key as a constant range so only relevant monthly partitions are scanned. Add a composite in",
+            "text": "Write path: Redis: HSET chat:presence:$user_id 1; MongoDB: insert into messages (chat_id, msg_id, sender_id, ts, text); Cassandra: insert into messages_by_chat (chat_id, bucket(ts), ts, msg_id) with T",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests precise index design across B-tree, hash, and composite indexes for real-world query patterns with order-by, time windows, and aggregations. Requires trade-offs between write amplification, storage, and read latency.\n\n## Key Concepts\n- B-tree indexing for range and order by on time-series data\n- Hash indexing for equality-lookup hot paths\n- Composite index key order matters for selectivity and query shape\n- Partial indexes to limit maintenance to recent data\n- Hot-spot avoidance via bucketing or partitioning\n\n## Code Example\n```\nCREATE INDEX idx_user_eventts ON user_events (user_id, event_ts DESC);\nCREATE INDEX idx_region_eventtype_hash ON user_events USING HASH (region, event_type);\nCREATE INDEX idx_evtype_region_eventts ON user_events (event_type, region, event_ts DESC);\n```\n\n## Follow-up Questions\n- How would you verify index effectiveness with EXPLAIN plans and real workload metrics?\n- How would you adapt this strategy if regional skew causes hot partitions?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "database-q-23",
+        "questionId": "q-17520",
+        "question": "In a data warehouse with a fact table orders_fact partitioned by day and a small customers_dim, a 90-day revenue aggregation query with a join to customers_dim runs slowly because many partitions are scanned. Describe how you would diagnose with EXPLAIN ANALYZE, force partition pruning, and redesign partitioning or indexing to minimize scanned data. Provide concrete steps and trade-offs?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Partition pruning is triggered when a query includes predicates on the partition key (`event_day`) that PostgreSQL can evaluate at planning time. For RANGE partitions, this typically involves simple comparison operators…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use tenant_id as the leading column in all indexes, implement partial indexes for tenant-specific queries, and create separate summary tables with materialized views for cross-tenant reporting to bala",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Proposed: composite B-tree index on (region, signup_year) INCLUDE (user_id, last_login, status) to cover range scans and point lookups. Skip the separate hash index on user_id since B-tree already handles point lookups…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Run EXPLAIN ANALYZE to confirm partition pruning. If all 90 partitions are scanned, bind the partition key directly with literal date bounds, push the date filter before the join, and consider a subqu",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical ability to read and reason about explain plans, validate partition pruning, and propose concrete optimizations on a real partitioned schema.\n\n## Key Concepts\n- EXPLAIN ANALYZE, plan nodes, and cost interpretation\n- Partition pruning / constraint exclusion with range partitions\n- Composite indexes involving partition key and join/filter predicates\n- Writing sargable predicates to avoid unnecessary scans\n\n## Code Example\n```sql\nEXPLAIN ANALYZE\nSELECT SUM(o.total_amount) AS revenue\nFROM orders o\nJOIN customers c ON o.customer_id = c.id\nWHERE o.order_date >= DATE '2025-01-01'\n  AND o.order_date <  DATE '2025-02-01';\n```\n\n## Follow-up Questions\n- What steps if pruning still scans multiple partitions?\n- How would you confirm index usage for the orders table with EXPLAIN ANALYZE?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nThis question tests practical diagnostics of partition pruning, join pushdown, and real-world trade-offs in partition design.\n\n## Key Concepts\n- Partition pruning and constraint exclusion\n- Join pushdown vs pre-aggregation\n- Partition granularity trade-offs (daily vs monthly)\n- Local vs global indexes inside partitions\n\n## Code Example\n```javascript\nSELECT SUM(revenue) AS total\nFROM orders_fact f\nJOIN customers_dim c ON f.customer_id = c.id\nWHERE f.order_date >= DATE '2026-01-01' AND f.order_date < DATE '2026-04-01'\n  AND c.segment = 'Enterprise';\n```\n\n## Follow-up Questions\n- How would plan changes differ across PostgreSQL vs a cloud data warehouse?\n- What metrics indicate pruning effectiveness and query stability after schema changes?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "database-q-24",
+        "questionId": "q-15132",
+        "question": "In a fintech workload, a large transactions table is range-partitioned by sale_date (monthly) with a hash subpartition on user_id. A query filters by user_id and a date range and joins to a small customers table. Explain how you would validate explain analyze plans to guarantee partition pruning and parallelism, and state concrete changes to partitioning, indexing, and planner settings to fix any mispruning?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "SELECT a.id, a.name, COUNT(*) AS published_article_count FROM authors a JOIN articles ar ON ar.author_id = a.id WHERE ar.status = 'published' AND ar.category = $1 AND ar.published_at BETWEEN $2 AND $3 GROUP BY a.id, a.n…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use EXPLAIN ANALYZE to confirm only relevant partitions are scanned and the plan uses a feasible join with the small customers table. If pruning fails, switch to range partitioning by sale_date with h",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use a single idempotent request_id to drive the workflow: Redis: SET alert:{req_id} with payload, TTL 3600; MongoDB: upsert customer profile to include alert ref; Cassandra: append per-customer transa",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "SERIALIZABLE isolation; per-row versioning via a version column. Atomic reserve: BEGIN; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; UPDATE stock SET quantity = quantity - 1, version = version + 1 WH",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nInterview context explanation.\n\n## Key Concepts\n\n- Partition pruning validation with EXPLAIN ANALYZE\n- Composite per-partition indexing\n- Planner settings: enable_partition_pruning, constraint_exclusion\n- Join strategies with small dimension tables\n\n## Code Example\n\n```sql\nEXPLAIN ANALYZE\nSELECT t.*\nFROM transactions t\nJOIN customers c ON c.user_id = t.user_id\nWHERE t.user_id = ? AND t.sale_date BETWEEN ? AND ?;\n```\n\n## Follow-up Questions\n\n- How would you monitor pruning regressions over time?\n- What trade-offs arise from adding hash subpartitions on user_id?",
+        "difficulty": "advanced"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-09-08T06:57:58.729Z",
+    "createdAt": "2026-09-08T13:11:32.695Z",
     "version": 1
   }
 ]
