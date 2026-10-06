@@ -8,199 +8,109 @@
     "questions": [
       {
         "id": "low-level-q-0",
-        "questionId": "q-11221",
-        "question": "On a 2-socket Linux server with a high-rate NIC, design a lock-free per-core slab allocator for fixed-size blocks (256B) used for DMA descriptors. Blocks are cached per-core; a global pool is touched when a core runs dry. Use epoch-based reclamation to retire blocks, ensure O(1) allocate/free, cache-aligned structures, and minimize cross-NUMA traffic. Provide data structures, pseudo-code for allocate() and free(), and a microbenchmark plan focusing on cross-core throughput and latency under contention?",
+        "questionId": "q-26387",
+        "question": "Design a lock-free, bounded, multi-producer/multi-consumer ring buffer for real-time audio frame exchange between an ISR-like audio producer and a lower-priority worker consumer. Use per-slot sequence counters to avoid ABA, guarantee deterministic latency, and implement backpressure without dynamic allocation. Provide API prototypes and minimal pseudo-code for enqueue/dequeue with correct memory ordering, and outline a microbenchmark to validate max latency and jitter under mixed-priority traffic on a 2-socket server?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Per-core free lists with a shared global pool of 256B blocks; blocks and queues cache-line aligned (64B). allocate() pops from local list; if empty, batch-refill from global pool; free() pushes to loc",
-            "isCorrect": true
+            "text": "Use a global atomic_bool init_done = false. Thread A runs init, then atomic_store(&init_done, true, memory_order_release). Threads B/C wait with a acquire load: while (!atomic_load(&init_done, memory_",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "```c #include <stdint.h> #include <string.h> #include <stdatomic.h> #include <pthread.h> #include <stdio.h> #include <time.h> #include <stdlib.h> #define ARENA_SIZE (256 * 1024) #define BLOCK_SIZE 16 #define NUM_BLOCKS…",
+            "text": "Use a circular PMEM ring with N slots; writer writes payload, then updates and persists seq to publish the item; reader polls slots, verifies seq, copies payload, then advances a persistent tail and p",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Each thread maintains thread-local pointers (local_ptr and local_end) to track allocation within its current block. Allocations are performed by incrementing local_ptr within the block boundaries with proper alignment.…",
-            "isCorrect": false
+            "text": "Use a fixed-size ring with per-slot sequence counters and 64-byte frames. Enqueue reserves via CAS on tail, writes frame, bumps seq, and uses a release store for tail. Dequeue reads head, validates seq, copies frame, an…",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "**Question:** Implement a scalable sense-reversing barrier in C11 for N threads using only atomic primitives. Each thread must call `barrier_wait()`, which returns only after all N threads have arrived, then reuses the…",
+            "text": "Propose a log-structured PMEM allocator: append allocations to a durable log, then atomically update a per-block header (version, CRC). Maintain a free-block bitmap and a per-thread cache. Recovery re",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical memory allocator design in a NUMA, high-throughput setting with DMA. It probes lock-free data structures, memory alignment, and cross-core traffic considerations.\n\n## Key Concepts\n- Lock-free per-core allocators\n- Global pool interactions and batching\n- Epoch-based reclamation\n- NUMA-aware cache-line placement\n- DMA descriptor lifetimes\n\n## Code Example\n```c\nstruct Block { alignas(64) uint8_t data[256]; uint64_t next; };\n// Pseudo: per-core caches, batch refill from global pool, epoch GC hooks\n```\n\n## Follow-up Questions\n- How would you test false sharing? How does block size affect occupancy? What happens under CPU hot-plug or NUMA rebalancing?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nReal-time audio paths require deterministic latency and predictable backpressure under concurrent production and consumption. This question probes lock-free design, ABA avoidance, memory ordering, and cache-awareness in a practical, high-frequency context.\n\n## Key Concepts\n\n- Lock-free ring with per-slot sequence counters to avoid ABA problems\n- Deterministic latency guarantees for real-time audio frame processing\n- Memory ordering: acquire/release semantics with proper memory fences\n- Cache-line alignment and false sharing mitigation\n- Backpressure without dynamic memory allocation\n\n## Code Example\n\n```c\n// Ring buffer with per-slot sequence counters\n#define SLOT_COUNT 256\n#define FRAME_SIZE 64\n\ntypedef struct {\n    volatile uint64_t seq;\n    char data[FRAME_SIZE];\n} slot_t;\n\ntypedef struct {\n    slot_t slots[SLOT_COUNT];\n    volatile uint64_t head;  // consumer-controlled\n    volatile uint64_t tail;  // producer-controlled\n    char pad[PADSIZE];\n} ring_t;\n\n// Producer: enqueue frame\nint enqueue(ring_t* rb, const char* frame) {\n    uint64_t tail = __atomic_load_n(&rb->tail, Order::Relaxed);\n    while (1) {\n        uint64_t seq = __atomic_load_n(&rb->slots[tail % SLOT_COUNT].seq, Order::Acquire);\n        intptr_t diff = (intptr_t)tail - (intptr_t)seq;\n        if (diff < SLOT_COUNT - 1) {\n            // slot available\n            memcpy(rb->slots[tail % SLOT_COUNT].data, frame, FRAME_SIZE);\n            __atomic_store_n(&rb->slots[tail % SLOT_COUNT].seq, tail + 1, Order::Release);\n            if (__atomic_compare_exchange_n(&rb->tail, &tail, tail + 1, false, Order::Relaxed, Order::Relaxed)) {\n                return 0; // success\n            }\n        } else {\n            // backpressure: pause and retry\n            cpu_pause();\n        }\n    }\n}\n\n// Consumer: dequeue frame\nint dequeue(ring_t* rb, char* frame) {\n    uint64_t head = __atomic_load_n(&rb->head, Order::Relaxed);\n    while (1) {\n        uint64_t seq = __atomic_load_n(&rb->slots[head % SLOT_COUNT].seq, Order::Acquire);\n        if (seq > head) {\n            memcpy(frame, rb->slots[head % SLOT_COUNT].data, FRAME_SIZE);\n            __atomic_store_n(&rb->head, head + 1, Order::Release);\n            return 0; // success\n        } else if (seq == 0) {\n            // buffer empty: block or return\n            return -1;\n        }\n    }\n}\n```\n\n## Microbenchmark Outline\n\n1. Spawn one high-priority producer thread (audio ISR simulation) and one low-priority consumer thread\n2. Generate synthetic audio frames at a fixed rate (e.g., 48kHz, 256 samples per buffer)\n3. Measure enqueue and dequeue latency per frame using `clock_gettime(CLOCK_MONOTONIC)`\n4. Inject cross-traffic interference on a 2-socket server using `stress-ng` or custom load to stress memory controller\n5. Record tail latencies (p99, p99.9) and jitter (max - min) over 10M+ iterations\n6. Verify no lockups or data corruption under sustained 100% producer fill\n\n## Expected Validation Criteria\n\n- P99 latency < 1 μs under no-load, < 5 μs under cross-traffic\n- Zero missed frames under backpressure conditions\n- No ABA corruption across 1B+ enqueue/dequeue cycles\n- Deterministic behavior across NUMA sockets",
+        "difficulty": "advanced"
       },
       {
         "id": "low-level-q-1",
-        "questionId": "q-8572",
-        "question": "Design a per-CPU ring buffer for inter-thread messaging on a 2-socket NUMA server. Each CPU i has ring[i] with N=1<<16, 64B slots and a per-slot 64-bit sequence counter. Enqueue uses atomic fetch_add(head[i]), idx=head[i]&(N-1); spin until slot.seq==idx, write payload, then slot.seq=idx+1 with memory_order_release. Dequeue uses tail[i] and acquire. Hybrid wakeup: brief spin, then eventfd/futex. Also discuss padding to avoid false sharing and NUMA affinity?",
+        "questionId": "q-6278",
+        "question": "Design a two-level, lock-free timer wheel in C for a high-throughput event scheduler across 8 cores. Outer wheel: milliseconds; inner wheel: microseconds. Each timer stores deadline, callback, and linkage. Enqueue uses thread-local slots and atomic stores; tick advances outer wheel, moves due timers to inner wheel for immediate execution, with epoch-based reclamation. Compare latency and jitter vs a heap queue?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a two-counter ticket lock: next_ticket and now_serving as atomic integers. Lock: my = fetch_add(&next_ticket, 1); while (atomic_load_explicit(&now_serving, memory_order_acquire) != my); Unlock: at",
+            "text": "Design and implement a tiny per-thread allocator for fixed-size blocks in C. Each thread has a freelist stored inside freed blocks, backed by a preallocated 64-byte-aligned arena of N blocks. Expose a",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Explain a per-CPU, lock-free ring buffer design with NUMA awareness. Each CPU i owns ring[i] of N=1<<16, 64B slots and a per-slot 64-bit sequence counter to avoid ABA. Enqueue: atomic fetch_add on hea",
-            "isCorrect": true
+            "text": "Implement a bounded single-producer single-consumer (SPSC) ring buffer in C for an event logger on a two-core system. Use N = 1<<12 slots, 16-byte payloads, and a per-slot 64-bit sequence counter padded to 64 bytes to a…",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Proposed answer: two rings (requests/responses) in DMA-safe mem, per-slot gen counters to avoid ABA, and fetch_add/CAS for head/tail with seq_cst fences. NIC updates status; host polls a completion ri",
-            "isCorrect": false
+            "text": "Two-level timer wheel with outer 1ms buckets and inner 1µs buckets. Timers hold deadline, cb_id, and next pointer. Enqueue places the timer in the target outer bucket via per-thread slot with atomic s",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Per-core free lists with a shared global pool of 256B blocks; blocks and queues cache-line aligned (64B). allocate() pops from local list; if empty, batch-refill from global pool; free() pushes to loc",
+            "text": "Use a 4KB circular buffer with per-slot header {uint16_t len; uint64_t seq;}. Maintain atomic head and tail. Writer reserves a slot via CAS on head, copies payload, sets len, and bumps seq to signal d",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of low-latency IPC in NUMA systems, with careful attention to ABA avoidance, memory ordering, and cache-line effects.\n\n## Key Concepts\n- Lock-free ring buffers with per-slot sequence counters\n- NUMA-aware memory layout and per-CPU ownership\n- Cache-line padding to avoid false sharing\n- Hybrid wakeup (spin + eventfd/futex) to balance latency and CPU utilization\n\n## Code Example\n```cpp\n// Skeleton illustrating core structures\nstruct Slot { uint64_t seq; uint8_t data[64]; };\nstruct Ring {\n  Slot slots[N];\n  alignas(64) std::atomic<uint64_t> head, tail;\n};\nvoid enqueue(Ring* r, const void* item, size_t len);\nbool dequeue(Ring* r, void* out, size_t* len);\n```\n\n## Follow-up Questions\n- How would you instrument tail latency and jitter under cross-socket contention?\n- How would you adapt the design for 4+ sockets and different cache-line sizes?",
+        "explanation": "## Why This Is Asked\nTests ability to design a deterministic low-latency timer structure with lock-free synchronization and practical reclamation in a multi-core environment.\n\n## Key Concepts\n- Timer wheels, two-level design\n- Lock-free synchronization, atomic ops\n- Epoch-based reclamation and hazard pointers equivalent\n- Cache-line and false sharing considerations\n- Microbenchmark methodology\n\n## Code Example\n```c\n// Skeleton definitions\ntypedef struct timer {\n  uint64_t deadline;\n  void (*cb)(void*);\n  struct timer *next;\n} timer_t;\n```\n\n## Follow-up Questions\n- How would you scale to dynamic bucket counts?  \n- How would you support timer cancellation efficiently?",
         "difficulty": "intermediate"
       },
       {
         "id": "low-level-q-2",
-        "questionId": "q-14566",
-        "question": "Design a NUMA-aware, lock-free object pool for 64-byte objects with per-thread caches; each thread keeps four slots, and on alloc miss it refills from a shared pool in batches of 16 using a CAS; on free push back to the local cache and batch to global. Describe cache-line padding, ABA avoidance with per-slot counters, and outline a microbenchmark?",
+        "questionId": "q-22555",
+        "question": "Design and implement a per-core slab allocator for 64-byte objects in C. Each core keeps a private, 64-byte-aligned free-list cache; when the cache runs dry, fetch a batch from a global lock-free pool via CAS, refill the local cache, and continue. Include per-slot padding to avoid false sharing and NUMA-awareness. Provide API prototypes alloc64/free64 and a microbenchmark plan comparing against malloc at 1, 4, and 16 threads?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Thread-local freelists store 64-byte blocks. alloc: if local not empty, pop; else refill by atomically popping a batch from global pool and refill. free: push block back to local; if local full, push",
-            "isCorrect": false
+            "text": "Design and implement a per-core slab allocator for 64-byte objects in C. Each core maintains a private, 64-byte-aligned free-list cache. When the cache runs empty, fetch a batch atomically from a global lock-free pool u…",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Use a log-structured allocator with per-thread arenas and a persistent undo log in NVM. On allocation, reserve from a thread’s arena, emit a compact WAL entry, then update metadata with proper memory",
+            "text": "Implement EBR with a global epoch, per-thread observed epochs, and per-thread retire lists. retire_node enqueues to a thread-local list tagged with retirement_epoch; advance_epoch advances global_epoc",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement a per-thread allocator for fixed-size 64-byte objects. Each thread stores a local freelist aligned to 64 bytes; allocate pops from local free list, refills from a global lock-free stack when",
+            "text": "Use a power-of-two ring buffer with per-slot sequence numbers and separate atomic head/tail indices. Each slot has a 64-bit sequence: low 32 bits = turn number, high 32 bits = slot index. Producers: read tail, compute s…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Key approach: per-thread caches of 4 slots for 64-byte objects; on miss, bulk refill 16 objects from the global pool with a single CAS; on free, push to local cache and refill global in batches when f",
-            "isCorrect": true
+            "text": "Design a NUMA-aware allocator with per-thread caches for <=128-byte objects, backed by a central pool on a designated NUMA node. API: alloc/free; layout: per-thread freelists + central pool; sync via",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical memory locality, lock-free design, and efficient reclamation in NUMA contexts.\n\n## Key Concepts\n- NUMA-aware allocator design\n- Lock-free per-thread caches\n- Batch refill to minimize cross-socket traffic\n- ABA avoidance with per-slot counters\n- Cache-line padding to prevent false sharing\n\n## Code Example\n```javascript\n// Pseudo-structs for illustration (C-like semantics)\ntypedef struct Slot {\n  uint64_t seq;      // per-slot counter to avoid ABA\n  uint8_t  payload[64];\n} Slot;\n\ntypedef struct Pool {\n  _Atomic uint64_t head; // index into global free list\n  Slot slots[GLOBAL_SIZE] __attribute__((aligned(64)));\n} Pool;\n```\n\n## Follow-up Questions\n- How would you adapt for variable object sizes?\n- How to handle object retirement and memory reclamation under high churn?",
+        "explanation": "## Why This Question Is Asked\n\nThis question evaluates cache locality, per-core isolation, and lock-free synchronization in allocator design under contention on multi-socket systems.\n\n## Key Concepts\n\n- **Cache-line alignment and false sharing avoidance**: Ensuring each object occupies its own cache line to prevent performance degradation\n- **Per-core caches versus a shared pool**: Balancing locality with contention\n- **Lock-free free-list implementation using CAS**: Atomic operations for thread-safe pool management\n- **NUMA-aware allocation strategies**: Optimizing memory allocation across non-uniform memory access architectures\n\n## Code Example\n\n```c\ntypedef struct SlabNode SlabNode;\nstruct SlabNode {\n    SlabNode* next;\n};\n\nSlabNode* alloc64(void);\nvoid free64(SlabNode* ptr);\n```\n\n## Follow-up Questions\n\n- How would you determine the optimal batch size for refilling local caches?",
         "difficulty": "intermediate"
       },
       {
         "id": "low-level-q-3",
-        "questionId": "q-24286",
-        "question": "Design a SIMD-accelerated substring search kernel in C that scans a 10 GB log stream on a 2-socket x86-64 server. Use AVX-512 (or AVX2 fallback) to search for a short pattern (16–32 bytes). Handle cross-chunk boundary matches, alignment, and boundary tails. Provide a minimal code skeleton and discuss vector width, misalignment handling, prefetching, and a microbenchmark plan comparing to a scalar baseline under varying pattern locations?",
+        "questionId": "q-12102",
+        "question": "Design a lock-free, bounded hash table for high-contention use on a 4-core x86_64 server. It should support insert, find, and delete with open-addressing (linear probing), per-bucket version counters to avoid ABA, and hazard-pointer-based reclamation for removed nodes. The table size is fixed at N=1<<20; provide API prototypes, a minimal pseudo-code for insert/find/delete, and discuss cache-line alignment, false sharing, and how you would measure throughput under concurrent access?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a bounded hash map with N = 1<<20 buckets, 64B buckets aligned to 64B. Insert/lookup/delete via per-bucket CAS; linear probing for collisions; tombstone for deletes. Resize by allocating a new tab",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use 512-bit SIMD to load 64-byte blocks, broadcast the 16–32 byte pattern across vector lanes, and compare using 8–16 8-byte lanes per cycle. Build an index mask from comparison results and extract match positions. Main…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "An ideal solution uses a 128-bit head state (pointer+tag) for the freelist and 64-byte aligned slots. Allocate: load head, read slot, CAS head to head.next with a bumped tag; on success, place the obj",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a fixed-size block pool within the 64KB heap, serving 32-byte blocks aligned to 8 bytes. Maintain a singly-linked free-list stored in the first 4 bytes of each free block as the offset to the next",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question tests proficiency with vectorized string search, boundary handling for streaming data, and realistic benchmarking on multi-socket servers. It assesses understanding of low-level performance optimization, SIMD instruction sets, and the practical challenges of processing large-scale data streams.\n\n## Key Concepts\n- SIMD vectorization (AVX-512 with AVX2 fallback for older hardware)\n- Cross-chunk boundary handling and tail management for streaming data\n- Mask extraction and index reporting for match positions\n- Cache behavior analysis and prefetching strategy design\n- Multi-socket NUMA awareness and memory bandwidth considerations\n\n## Code Example\n```c\n#include <immintrin.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\n\n#define CHUNK_SIZE 64\n#define TAIL_SIZE 31\n\ntypedef struct {\n    size_t* positions;\n    size_t count;\n    size_t capacity;\n} MatchResults;\n\nstatic inline __m512i broadcast_pattern(const unsigned char* pat, size_t pat_len) {\n    __m512i v = _mm512_setzero_si512();\n    for (size_t i = 0; i < pat_len && i < 64; i++) {\n        v = _mm512_set1_epi8(pat[i]);\n    }\n    return v;\n}\n\nvoid search_simd(const unsigned char* data, size_t n,\n                 const unsigned char* pat, size_t pat_len,\n                 MatchResults* results) {\n    const size_t vec_width = 64;\n    unsigned char tail[TAIL_SIZE] = {0};\n    size_t tail_len = 0;\n    \n    size_t i = 0;\n    for (; i + vec_width <= n; i += vec_width) {\n        __m512i v = _mm512_loadu_si512((__m512i*)(data + i));\n        __m512i p = _mm512_set1_epi8(pat[0]);\n        __m512i cmp = _mm512_cmpeq_epi8(v, p);\n        uint64_t mask = _mm512_mask_reduce_u64(cmp);\n        \n        while (mask) {\n            uint64_t bit = __builtin_ctzll(mask);\n            size_t pos = i + bit;\n            if (pos + pat_len <= n && \n                memcmp(data + pos, pat, pat_len) == 0) {\n                if (results->count < results->capacity) {\n                    results->positions[results->count++] = pos;\n                }\n            }\n            mask &= mask - 1;\n        }\n    }\n    \n    tail_len = n - i;\n    if (tail_len > 0) {\n        memcpy(tail, data + i, tail_len);\n    }\n    for (size_t j = 0; j < pat_len && tail_len + j < CHUNK_SIZE; j++) {\n        tail[tail_len + j] = pat[j];\n    }\n    \n    for (size_t j = 0; j < tail_len; j++) {\n        if (j + pat_len <= tail_len + pat_len &&\n            memcmp(tail + j, pat, pat_len) == 0) {\n            if (results->count < results->capacity) {\n                results->positions[results->count++] = i + j;\n            }\n        }\n    }\n}\n\ndouble benchmark_search(const unsigned char* data, size_t n,\n                       const unsigned char* pat, size_t pat_len,\n                       int use_simd, size_t iterations) {\n    struct timespec start, end;\n    MatchResults results = {\n        .positions = malloc(n * sizeof(size_t)),\n        .count = 0,\n        .capacity = n\n    };\n    \n    clock_gettime(CLOCK_MONOTONIC, &start);\n    for (size_t iter = 0; iter < iterations; iter++) {\n        results.count = 0;\n        if (use_simd) {\n            search_simd(data, n, pat, pat_len, &results);\n        } else {\n            for (size_t i = 0; i + pat_len <= n; i++) {\n                if (memcmp(data + i, pat, pat_len) == 0) {\n                    if (results.count < results.capacity) {\n                        results.positions[results.count++] = i;\n                    }\n                }\n            }\n        }\n    }\n    clock_gettime(CLOCK_MONOTONIC, &end);\n    \n    free(results.positions);\n    return (end.tv_sec - start.tv_sec) + \n           (end.tv_nsec - start.tv_nsec) / 1e9;\n}\n```\n\n## Microbenchmark Plan\n1. **Baseline**: Scalar `memcmp`/byte-by-byte search across full dataset\n2. **Test Cases**:\n   - Pattern at stream start (best case for early exit)\n   - Pattern at stream end (worst case, full scan)\n   - Pattern distributed uniformly (average case)\n   - Pattern absent (negative case)\n3. **Metrics**: Throughput (GB/s), latency per match, cache miss rate\n4. **Variables**: Pattern length (16/32 bytes), server topology effects",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "low-level-q-4",
-        "questionId": "q-19664",
-        "question": "Design and implement a simple reusable barrier for N threads in C11. The barrier should block arriving threads until all N threads have reached it, then release them all to continue. Provide init and wait APIs, and discuss memory ordering and performance on cache-coherent CPUs. Include timeout handling and fairness considerations. Show your approach in pseudo-code?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a global atomic_bool init_done = false. Thread A runs init, then atomic_store(&init_done, true, memory_order_release). Threads B/C wait with a acquire load: while (!atomic_load(&init_done, memory_",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a fixed-capacity hash table in C for 32-bit keys and 64-bit values using open addressing with linear probing (N = 1<<12). Two arrays: keys[N], vals[N], with 0 as EMPTY. init() zeros; insert(",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a sense-reversal barrier with two atomics: `count` and `generation`. Each arriving thread performs an atomic fetch-and-increment on `count`. When the count reaches N, the last thread resets `count` to 0, toggles the…",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a tiny fixed-size block allocator (128B) for a high-throughput logging path. Each thread has a private freelist; when empty, fetch a slab from a global pool. Use a lock-free freelist with atomic operations to avo…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question tests understanding of low-level synchronization primitives, atomic memory ordering semantics, and how barriers affect performance on modern cache-coherent CPUs.\n\n## Key Concepts\n\n- **Sense-reversal technique**: Allows barrier reuse by toggling a generation counter instead of creating new barrier objects\n- **Atomic operations**: Use C11 `_Atomic` types with appropriate memory order primitives (`memory_order_acquire`, `memory_order_release`)\n- **Spin-wait optimization**: Use CPU pause hints (`_mm_pause()`) to reduce memory contention and power consumption during busy-waiting\n- **Memory ordering**: The arriving thread must use `memory_order_release` when updating the generation to ensure all prior writes are visible to waking threads; waiting threads use `memory_order_acquire` to synchronize with the releaser\n- **Cache coherency**: On cache-coherent CPUs, the coherence protocol (e.g., MESI) ensures atomic updates propagate across cores, though false sharing can degrade performance—padding the atomic variables helps\n- **Timeout handling**: Use `memory_order_relaxed` for the counter increment, then check timeout while spinning on generation; return an error code if timeout expires before the barrier releases\n- **Fairness**: Threads are released simultaneously but may resume execution at slightly different times due to scheduling; no strict ordering is guaranteed\n\n## Pseudo-Code Implementation\n\n```c\ntypedef struct {\n    _Atomic int count;\n    _Atomic int generation;\n    int N;\n} barrier_t;\n\nvoid barrier_init(barrier_t *b, int N) {\n    b->N = N;\n    atomic_init(&b->count, 0);\n    atomic_init(&b->generation, 0);\n}\n\nint barrier_wait(barrier_t *b) {\n    int my_gen = atomic_load_explicit(&b->generation, memory_order_relaxed);\n    if (atomic_fetch_add_explicit(&b->count, 1, memory_order_acq_rel) == b->N - 1) {\n        atomic_store_explicit(&b->count, 0, memory_order_release);\n        atomic_store_explicit(&b->generation, my_gen + 1, memory_order_release);\n        return 1; // last thread\n    }\n    while (atomic_load_explicit(&b->generation, memory_order_acquire) == my_gen) {\n        _mm_pause(); // avoid memory contention\n    }\n    return 0;\n}\n```",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "low-level-q-5",
-        "questionId": "q-22906",
-        "question": "Design a crash-consistent, non-blocking queue for inter-thread communication in persistent memory (PMEM) on a 2-socket x86-64 server. The queue resides entirely in PMEM and uses a power-of-two ring of slots with per-slot metadata. Enqueue writes the payload, flushes, updates a commit bit, and CAS on tail; Dequeue mirrors with sequence checks. Describe slot layout, publish/consume protocol, crash-recovery, and a microbenchmark plan under varying contention?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Crash-consistent PMEM queue: ring with N=1<<16 slots; each slot 128B: 8B seq, 4B len, 8B id, 108B payload. Enqueue writes payload, flushes, updates len, then CAS on tail; Dequeue validates seq/len, co",
+            "text": "Implement a fixed-size, open-addressing hash table with per-slot version counters and a tombstone flag. Use CAS to insert, validate version on finds, and mark tombstones on delete, incrementing the ve",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Use two fixed-size rings, per-slot 64-byte payload and 64-bit sequence counters; producers reserve a slot by atomically incrementing tail, write data, then publish with release; consumer uses acquire to read the sequenc…",
+            "text": "Per-thread caches per size class, a NUMA-aware central pool, and epoch-based reclamation to avoid cross-thread frees. Slabs align to 64-byte lines; pad to prevent false sharing. Lock-free central pool",
             "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a global atomic_bool init_done = false. Thread A runs init, then atomic_store(&init_done, true, memory_order_release). Threads B/C wait with a acquire load: while (!atomic_load(&init_done, memory_",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a bounded single-producer single-consumer (SPSC) ring buffer in C for an event logger on a two-core system. Use N = 1<<12 slots, 16-byte payloads, and a per-slot 64-bit sequence counter padded to 64 bytes to a…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests deep understanding of crash-consistency, PMEM semantics, and non-blocking protocols in a practical inter-thread queue.\n\n## Key Concepts\n- PMEM durability and flush semantics\n- Non-blocking CAS-based progress\n- Crash-recovery with replay logs\n- Memory layout and false sharing considerations\n\n## Code Example\n```c\n// Pseudo: enqueue path outline with flushes and CAS\n```\n\n## Follow-up Questions\n- How would you handle cache-line bounce and epoch rollover?\n- How would you test recovery latency experimentally?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "low-level-q-6",
-        "questionId": "q-17255",
-        "question": "Design a simple fixed-size block allocator in C for 256-byte blocks to back per-connection metadata in an edge proxy. Provide API prototypes: pool_init(Pool*, size_t capacity); void* pool_alloc(Pool*); void pool_free(Pool*, void*). Preallocate capacity*256 bytes, align to 256, link each block via its first pointer as next. pool_alloc pops from head; pool_free pushes back. For thread safety, wrap with a tiny mutex. Include a small test?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Uses a lock-free CAS loop to pop from a free-list embedded in the blocks; each block starts with a 8-byte next pointer; deallocation pushes onto head with CAS. To avoid ABA, tag head with a counter or",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a fixed-size 256-byte block pool. Use a Pool struct: base, block_size=256, capacity, free_head, mutex. In pool_init, allocate base via posix_memalign, chain blocks by writing the next pointe",
-            "isCorrect": true
           },
           {
             "id": "c",
@@ -209,75 +119,195 @@
           },
           {
             "id": "d",
-            "text": "Design a bounded MPSC queue using a fixed-size circular buffer of 1<<12 64-bit slots. Use an atomic tail for producers to reserve a slot with fetch_add; store the value and publish with memory_order_r",
+            "text": "## Lockless Cross-Thread Config Exchange Design ### Data Structures ```c #define BUFFER_SIZE 64 typedef struct { uint8_t data[BUFFER_SIZE]; uint32_t crc; } ConfigBuffer; typedef struct { ConfigBuffer buffers[2]; _Atomic…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of simple memory pools, alignment, and basic synchronization without resorting to malloc/free per allocation.\n\n## Key Concepts\n- Fixed-size allocator, free-list setup, alignment guarantees\n- Lightweight synchronization for beginners\n- Fragmentation avoidance by fixed size\n\n## Code Example\n```c\n// rough skeleton\ntypedef struct Pool { void* base; size_t cap; size_t block; void* free_head; pthread_mutex_t m; } Pool;\n\nvoid pool_init(Pool* p, size_t cap){ /* align, chain blocks, init mutex */ }\nvoid* pool_alloc(Pool* p){ /* lock, pop, unlock */ }\nvoid pool_free(Pool* p, void* b){ /* lock, push */ }\n```\n\n## Follow-up Questions\n- How would you add a per-thread cache to remove contention? \n- How would you detect/handle pool exhaustion?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nEvaluates ability to design a practical concurrent data structure with safe memory reclamation and performance tuning.\n\n## Key Concepts\n- Lock-free CAS-based probing\n- Hazard pointers for safe reclamation\n- Per-bucket version counters to avoid ABA\n- Tombstones and cache-line awareness\n- Fixed capacity without resizing\n\n## Code Example\n```c\ntypedef struct {\n  uint64_t key;\n  uint64_t value;\n  uint64_t version;\n  uint8_t  used;\n  uint8_t  pad[7];\n} Bucket;\n#define N (1<<20)\nBucket table[N];\n```\n\n## Follow-up Questions\n- How would you extend to support resizing with safe reclamation?\n- How would you verify correctness under burst contention?",
+        "difficulty": "intermediate"
       },
       {
-        "id": "low-level-q-7",
-        "questionId": "q-25166",
-        "question": "Design a small fixed-size SPSC ring buffer in C for a logging subsystem where a single producer thread emits 64-byte messages and a single consumer thread writes them to disk. Use N as a power of two (e.g., 64 slots). Provide init, enqueue, and dequeue, with per-slot occupancy flags to avoid races. Explain wrap-around, memory ordering, and a simple correctness test under high-throughput?",
+        "id": "low-level-q-4",
+        "questionId": "q-17451",
+        "question": "Implement a cache-friendly memmove-like routine in C that safely handles arbitrary overlapping src/dst ranges for N bytes. Use AVX2 to copy in 32/64-byte chunks, apply non-temporal stores for large blocks to avoid cache pollution, and choose copy direction based on overlap (src < dst => backward). Provide prototypes, a simple overlap-safe path, and a microbenchmark plan comparing to libc memmove on a NUMA system?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use epoch-based reclamation for a lock-free stack. Each thread publishes a local epoch; a global epoch advances periodically. On pop, retire the node with its epoch and reclaim only after all threads",
+            "text": "Use thread-local storage to hold a pool of 1024 blocks (128 bytes each). Each block has a next pointer; a per-thread free-list is formed. allocate() pops from the list, free() pushes back. If the thre",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Thread-local 64B block cache; allocate pops from local freelist; if empty fetch a batch (e.g., 32) from a global lock-free stack and push to local; free pushes back to local cache. Global pool uses at",
+            "text": "Implemented a lock-free MPMC circular buffer with a 1<<16 capacity, using a CAS-based head/tail and per-slot version counters. Hazard pointers guard nodes during dequeue; retirement uses per-thread li",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "I would implement a 64-slot SPSC ring buffer using per-slot 8-bit flags. Producer waits for flag==0, writes the 64-byte payload into slot i = tail & (N-1), then stores flag=1 with release semantics. C",
-            "isCorrect": true
+            "text": "Design a durable, lock-free inter-process queue backed by non-volatile RAM using a log-structured append architecture with per-producer segments. Enqueue operations flush writes to NVRAM before advancing a shared durabl…",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a 64-bit atomic bitmap to track 64 blocks in a 4KB arena. Allocate by reading the bitmap, compute free = ~bitmap, pick idx = __builtin_ctzll(free), and CAS to set that bit. Return arena + idx*64 o",
+            "text": "Detect overlap and copy direction (src < dst ? backward : forward). Use AVX2 to copy 32/64-byte chunks, aligning when possible. For blocks above 256B, employ non-temporal stores to minimize cache poll",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests overlap handling, SIMD usage, and cache behavior in practical memory movement code on real hardware.\n\n## Key Concepts\n- Overlap-safe copy\n- Directional copy for correctness\n- SIMD data movement (AVX2)\n- Non-temporal stores to reduce cache pollution\n- Alignment and tail handling\n\n## Code Example\n```c\nvoid* memmove_simd(void* dst, const void* src, size_t n){\n  // outline: determine direction, process aligned chunks with AVX2, handle tail\n  return dst;\n}\n```\n\n## Follow-up Questions\n- How would you extend to AVX-512 or adapt non-temporal hints for different CPUs?\n- How would you test correctness with adversarial overlaps and misalignment scenarios?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "low-level-q-5",
+        "questionId": "q-2699",
+        "question": "Design a bounded, lock-free, multi-producer/multi-consumer queue where each slot holds a variable-length payload with a 4-byte length prefix. Use a power-of-two ring, per-slot sequence numbers, and epoch-based reclamation. Provide enqueue/dequeue pseudo-code, describe memory layout, backpressure handling, and a microbenchmark plan under high contention?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a bounded MPMC queue on a power-of-two ring, per-slot length field and a sequence number to avoid ABA. Pad indices to cache lines; publish slot content with release stores and consume with acquire",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Proposed solution: four-level hierarchical timer wheel with 64K buckets per level, 128-byte per-slot records {expiry:8, id:8, seq:8, payload:104}. Enqueue computes target level/slot, uses CAS to insta",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use per-socket cache-line rings (N=1<<16) for two queues: high and normal. Each slot stores (gen, pri, data_ptr). Producers reserve via atomic fetch_add, publish with release; consumers read with acqu",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a 1024-byte buffer; divide into 32-byte blocks; maintain an atomic head index to a singly linked free-list embedded in the blocks. pool_alloc CAS pops a block; pool_free pushes it back. Guard agai",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of a minimal SPSC design, cache-line effects, and correct memory ordering in a low-level context.\n\n## Key Concepts\n- SPSC ring with power-of-two capacity\n- Per-slot flags to avoid ABA and stale data\n- Release/acquire semantics for producer/consumer visibility\n- Cache-line padding to avoid false sharing\n\n## Code Example\n```javascript\n/* C-like pseudocode illustrating data, flags, and indices */\ntypedef struct {\n  uint8_t payload[64];\n  uint8_t flag; // 0 empty, 1 full\n} slot_t;\n\ntypedef struct {\n  slot_t buf[64];\n  size_t head; // consumer index\n  size_t tail; // producer index\n} spsc_ring_t;\n```\n\n## Follow-up Questions\n- How would you adapt this to multiple producers or consumers?\n- How would you benchmark latency and throughput under contention?",
+        "explanation": "## Why This Is Asked\nTests mastery of lock-free design, memory ordering, and reclamation with real-world payloads.\n\n## Key Concepts\n- Bounded MPMC queue with CAS-based progression\n- Power-of-two ring and per-slot sequence numbers to avoid ABA\n- Epoch-based reclamation for safe memory reclamation\n- Variable-length payloads via 4-byte length prefix\n- Cache-line alignment to prevent false sharing\n- Backpressure handling and fragmentation management\n\n## Code Example\n```cpp\n// Enqueue pseudo\n```\n\n```cpp\n// Dequeue pseudo\n```\n\n## Follow-up Questions\n- How would you adapt this for NUMA-aware memory placements?\n- What stress tests would you run to validate under heavy contention and backpressure?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "low-level-q-6",
+        "questionId": "q-7937",
+        "question": "Context: A 2-socket x86-64 server with non-volatile memory backing a cross-thread event queue. Task: design a NUMA-aware, crash-consistent, lock-free bounded queue for inter-thread communication that persists enqueued items to PMEM using CLWB and sfence, with per-slot sequence counters to avoid ABA. Provide API prototypes, slot layout, and enqueue/dequeue pseudo-code. Describe recovery after a crash, and outline a microbenchmark to measure crash-resilience and latency under contention?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a crash‑consistent bounded MPMC ring in NVRAM. Use per-slot sequence counters; producers write payload, then publish via release semantics and CLFLUSH to persist, then advance tail atomicall",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Approach: Implement a fixed-size ring buffer in persistent memory with per-slot metadata. Each slot contains a 64-byte payload, an 8-byte sequence counter, and an 8-byte ready flag. The writer writes the payload, advanc…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement per-CPU fixed-size slab pools with lock-free free lists. Allocate from local cache in O(1); on miss, fetch a block from a global cache or steal from another CPU with bounded retries. Reclaim",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Provide a tiny fixed-block pool: 4KB, block size 32B, alignment 8. Each free block's header stores next pointer. Init builds the free list by linking all blocks. pool_alloc(size) rounds up to 32, pops",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question evaluates expertise in crash-consistent data structures, persistent memory semantics, and precise memory ordering requirements. It demands understanding of NUMA-aware design patterns and non-volatile memory flush granularity.\n\n## Key Concepts\n\n- Non-volatile memory crash-consistency protocols\n- Cache-line flush (CLWB) and SFENCE memory ordering semantics\n- ABA problem prevention using per-slot sequence counters\n- NUMA/topology-aware allocation and access patterns\n- Lock-free bounded queue implementation\n\n## Code Example\n\n```c\ntypedef struct {\n  uint64_t seq;",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "low-level-q-7",
+        "questionId": "q-29849",
+        "question": "Implement a sequence-lock guarded read path for a shared 128-bit configuration struct updated by a single writer; provide C-like pseudocode for the reader and writer and discuss memory ordering differences on x86 vs ARM?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a sequence-lock guarded read path for a 128-bit config updated by a single writer. Use a 64-bit version counter V. Writer: V++ (odd), write cfg, V++ (even). Reader: loop: s = V; if (s&1) ret",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use per-bucket head pointers with atomic CAS for inserts; each node holds key, value, next; pad nodes to cache-lines. Use epoch-based reclamation to retire removed nodes to prevent ABA. Resize by doub",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Initialize a 64KB arena with an 8-byte head at offset 0 and 32-byte blocks starting at offset 8. Each block uses an 8-byte header to store the next-free index and 24 bytes for payload (8-byte alignmen",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Provide a 1<<16, 128-byte per-slot bounded MPMC ring. Slot header: 16B seq/len plus 112B payload. Producers publish with store-release, then advance via CAS; consumers use load-acquire, process, and r",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nDemonstrates a practical lock-free pattern for data reads that must remain consistent without heavy synchronization.\n\n## Key Concepts\n- sequence lock\n- memory_order_acquire/release\n- barrier considerations on x86 vs ARM\n\n## Code Example\n```c\ntypedef struct { uint64_t ver; Config cfg128; } SharedConfig;\n\nvoid write_config(SharedConfig* sc, Config new_cfg) {\n  __atomic_fetch_add(&sc->ver, 1, memory_order_acq_rel); // make odd\n  sc->cfg128 = new_cfg;\n  __atomic_fetch_add(&sc->ver, 1, memory_order_release); // make even\n}\n\nConfig read_config(SharedConfig* sc) {\n  Config c;\n  uint64_t v;\n  do {\n    v = __atomic_load_n(&sc->ver, memory_order_acquire);\n    if (v & 1) continue;\n    c = sc->cfg128;\n  } while (__atomic_load_n(&sc->ver, memory_order_acquire) != v);\n  return c;\n}\n```\n\n## Follow-up Questions\n- How would you handle multiple writers?\n- What are the risks on ARM with 128-bit reads?\n- How would you benchmark read latency vs a simple lock?",
         "difficulty": "beginner"
       },
       {
         "id": "low-level-q-8",
-        "questionId": "q-20964",
-        "question": "Design and implement a 128 MB userfaultfd-backed ring buffer for high-throughput NIC traffic on a 2-socket server. Each slot contains a 64B payload plus 8B sequence, padded to 128B. Producers reserve head with atomic fetch_add, write payload, then publish via tail CAS. Consumer drains by checking per-slot sequence; on-demand paging via userfaultfd pages data. Explain wrap-around handling and false-sharing mitigation. Provide enqueue/dequeue pseudo-code and a microbenchmark plan?",
+        "questionId": "q-7800",
+        "question": "Design a durable, lock-free ring-based queue over persistent memory (NVRAM) for a 2-socket x86-64 server. It must support multiple producers and consumers, avoid ABA, use per-slot sequence counters, and guarantee crash-consistency without per-operation fsync. Outline layout, memory order, and a recovery protocol; provide API prototypes and minimal pseudo-code; propose a microbenchmark plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "## Lockless Cross-Thread Config Exchange Design ### Data Structures ```c #define BUFFER_SIZE 64 typedef struct { uint8_t data[BUFFER_SIZE]; uint32_t crc; } ConfigBuffer; typedef struct { ConfigBuffer buffers[2]; _Atomic…",
+            "text": "Proposed answer: Preallocate N blocks; maintain a lock-free free-list in the blocks themselves; use an atomic head pointer and a CAS to pop the head on allocate and push a block on free. Validate that",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use per-size-class caches per NUMA node with a local freelist and a shared pool for misses. Implement lock-free allocation/free with atomic CAS, ensure 64-byte alignment, and apply epoch-based reclama",
-            "isCorrect": false
+            "text": "Enqueue writes to a slot and publishes a release-store to the slot’s seq; consumer uses an acquire-load to validate slot and then advances head. For crash-resilience, flush the slot data and its seq w",
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Per-node shards with a global coordinator. Lock-free hot path: atomic upserts into per-node arrays using CAS, with 64-byte padding; memory order: acquire/release fences around reads/writes; cross-node",
+            "text": "Use a 32-bit atomic flag. In lock(), spin with atomic_flag_test_and_set_explicit(&lock, memory_order_acquire) until it succeeds; on miss, perform exponential backoff with _mm_pause() (cap at 1024). un",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design and implement a 128 MB userfaultfd-backed ring buffer for high-throughput NIC traffic on a 2-socket server. Each slot contains a 64-byte payload plus an 8-byte sequence number, padded to 128 bytes. Producers rese…",
-            "isCorrect": true
+            "text": "Allocate per-core, cache-aligned freelists of 64B blocks; keep a small per-core cache (e.g., 128 blocks). On allocate, pop from local freelist; on miss, batch-steal from a neighboring core or fetch fr",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question tests the design of a low-latency, memory-centric IPC path using userfaultfd, evaluating understanding of memory ordering, cache-line padding, and wrap-around logic in a NUMA environment.\n\n## Key Concepts\n\n- **userfaultfd lazy loading**: On-demand paging of memory pages for large ring buffers\n- **Pinned 128 MB shared memory region**: Prevents swapping; memory locked for DMA\n- **Per-slot sequencing**: Prevents ABA problems without heavy locking\n- **64B payload + 8B sequence, 128B slot padding**: Aligns to cache lines; eliminates false sharing\n- **Atomic operations**: Memory ordering semantics for producer-consumer synchronization\n- **NUMA awareness**: Optimized placement for 2-socket server topology\n\n## Implementation Details\n\n### Enqueue (Producer)\n```\nhead = atomic_fetch_add(&ring->head, 1) % RING_SIZE\n// Write payload and sequence\nring->slots[head].seq = head\nmemcpy(ring->slots[head].data, payload, 64)\n// Publish: update tail with CAS\nwhile (!atomic_compare_exchange(&ring->tail, &expected, head + 1)) {\n    expected = ring->tail\n}\n```\n\n### Dequeue (Consumer)\n```\ntail = ring->tail  // local snapshot\nif (ring->slots[tail % RING_SIZE].seq == tail) {\n    // Read payload\n    memcpy(output, ring->slots[tail % RING_SIZE].data, 64)\n    atomic_increment(&ring->tail)\n} else {\n    // Trigger page fault via userfaultfd if needed\n}\n```\n\n### Wrap-Around Handling\n- Use modulo arithmetic on the logical sequence number, not the array index\n- Sequence numbers grow monotonically without reset\n- Array index = sequence_number % RING_SIZE\n- This avoids ABA issues entirely\n\n### False-Sharing Mitigation\n- Each slot is exactly 128 bytes (2 cache lines)\n- No two slots share a cache line\n- Separate head/tail variables from slot data\n\n## Microbenchmark Plan\n\n1. **Throughput test**: Measure enqueue/dequeue ops/sec at various batch sizes\n2. **Latency test**: Measure per-operation latency at head vs tail of ring\n3. **NUMA test**: Compare same-socket vs cross-socket producer/consumer\n4. **Page fault test**: Measure fault handling overhead during cold start\n5. **Cache miss profiling**: Use VTune/Perf to identify cache-line conflicts",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nTests low-level, crash‑safe concurrency with persistent memory, demanding careful ordering, recovery, and durability guarantees beyond traditional in‑memory queues.\n\n## Key Concepts\n\n- Persistent memory semantics and crash-consistency\n- Lock-free multi-producer/multi-consumer design\n- Per-slot sequence counters to avoid ABA\n- Cache-line alignment, memory fences, and PM flushes\n- Recovery protocol and idempotent restarts\n\n## Code Example\n\n```javascript\n// API prototypes\ntypedef struct { uint64_t seq; uint8_t data[64]; } Slot;\ntypedef struct { Slot* slots; size_t head; size_t tail; size_t mask; } PersistentQueue;\nbool enqueue(PersistentQueue* q, const void* item, size_t len);\nbool dequeue(PersistentQueue* q, void* item, size_t* len);\n```\n\n## Follow-up Questions\n\n- How would you extend to multiple independent queues with cross-queue durability guarantees?\n- How would you validate crash-recovery correctness and measure worst-case recovery time?",
+        "difficulty": "advanced"
       },
       {
         "id": "low-level-q-9",
+        "questionId": "q-3280",
+        "question": "Design and implement a lock-free concurrent map using a skip-list with probabilistic levels, supporting O(log n) inserts, finds, and deletes under high contention. Use hazard pointers for memory reclamation and marked pointers for logical deletion. Provide node layout with per-level forward pointers, random level generator, and pseudocode for insert, search, and delete that avoids ABA. Include a minimal microbenchmark plan to validate throughput and correctness under heavy parallelism?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a cache-friendly transpose with 16x16 tiling: for r,c in steps, copy A[i][j] to B[j][i] within each tile, clipping bounds at edges. This increases L1 reuse and reduces cache misses; final co",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Proposed approach: a 16-slot wheel with a shared mutex protecting slot lists for simplicity. add_timer locks the target slot (slot_index = (current_tick + delay_ms) % 16), appends a timer with expiry_",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a cross-process IPC ring buffer backed by a memory-mapped file with multiple producers and a single consumer. Each 64-byte slot contains an 8-byte atomic sequence number followed by a 56-byte payload. Writers res…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Key ideas: a skip-list map with lock-free inserts/finds/deletes. Use hazard pointers for reclamation and marked next pointers for logical deletion. Nodes carry per-level forward pointers, and new node",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to implement a lock-free structure with correct memory reclamation and ABA avoidance in a real-world pattern.\n\n## Key Concepts\n- Lock-free data structures\n- Hazard pointers memory reclamation\n- ABA avoidance\n- Skip-list levels and randomization\n- Memory ordering and fences\n\n## Code Example\n```c\ntypedef struct Node {\n  int key;\n  void* value;\n  struct Node** next; // per-level forward pointers\n  int topLevel;\n  _Atomic(int) marked; // 0/1\n} Node;\n```\n\n## Follow-up Questions\n- How to resize or balance levels without locks?\n- How to validate memory reuse and detect ABA-related failures?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "low-level-q-10",
         "questionId": "q-28142",
         "question": "Design a zero-copy, cross-NUMA inter-process data pipe for a high-throughput ML inference server. Build a lock-free producer-consumer ring with per-slot sequence counters, but support dynamic resizing with minimal pauses and safe memory reclamation. Provide API prototypes and minimal pseudo-code; discuss contention, memory ordering, and correctness across sockets?",
         "type": "single",
@@ -289,17 +319,17 @@
           },
           {
             "id": "b",
-            "text": "Crash-consistent PMEM queue: ring with N=1<<16 slots; each slot 128B: 8B seq, 4B len, 8B id, 108B payload. Enqueue writes payload, flushes, updates len, then CAS on tail; Dequeue validates seq/len, co",
+            "text": "Uses a lock-free CAS loop to pop from a free-list embedded in the blocks; each block starts with a 8-byte next pointer; deallocation pushes onto head with CAS. To avoid ABA, tag head with a counter or",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Key approach: align each slot to a cache line (64B), store 64-bit key and 64-bit value, plus a 64-bit sequence counter and a flag in a 64-bit header, all padded to 64B. Use CAS-based insert/get with l",
+            "text": "This SP MC queue uses per-slot seq and a single tail. Producer does tail = fetch_add(1) to pick slot i, writes payload, then stores seq = i+1. Each consumer has a local read index r and spins until sl",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Propose a 64-slot ring with per-slot lock-free stacks. Enqueue computes slot = (current_tick + delay_ms) & 63, pushes a timer node with due_tick and callback. Tick advances every ms, drains current sl",
+            "text": "Design a deterministic, lock-free object pool allocator for fixed-size 128-byte objects on a 2-socket x86-64 system with per-thread fast-path free lists, central cross-thread pool, and hazard-pointer-based reclamation w…",
             "isCorrect": false
           }
         ],
@@ -307,255 +337,135 @@
         "difficulty": "advanced"
       },
       {
-        "id": "low-level-q-10",
-        "questionId": "q-2448",
-        "question": "Design a NUMA-aware, lock-free work-stealing deque with per-NUMA-node local queues and cross-node stealing to sustain high throughput on a 2-socket server. Provide per-slot layout, push/pop/steal pseudo-code with sequence counters, CAS, and memory fences; handle wrap-around; describe hazard pointers/epochs for lifetime management; discuss cache-line padding and validation under cross-NUMA contention?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a reusable sense-reversing barrier in C11 for any N threads. Maintain an atomic arrivals counter and a generation flag (sense). Each thread increments arrivals; if it was the last, flip gene",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose a NUMA-aware lock-free work-stealing deque with per-NUMA local queues and cross-node stealing to sustain high throughput on a 2-socket server. Provide per-slot layout, push/pop/steal pseudocod",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use stdatomic.h atomic_flag for a spinlock. Acquire: while (atomic_flag_test_and_set_explicit(&lock->flag, memory_order_acquire)) { _mm_pause(); for (int b=1; b<1024; b<<=1) _mm_pause(); }. Release: a",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a global atomic_bool init_done = false. Thread A runs init, then atomic_store(&init_done, true, memory_order_release). Threads B/C wait with a acquire load: while (!atomic_load(&init_done, memory_",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nEvaluates mastery of low-latency concurrent data structures, memory locality, cross-socket traffic, and safe memory reclamation in production environments.\n\n## Key Concepts\n- NUMA-aware memory locality and per-node queues\n- Lock-free push/pop/steal using CAS\n- ABA avoidance via sequence counters\n- Lifetime management with hazard pointers or epoch-based reclamation\n- Cache-line padding to avoid false sharing\n- Correct wrap-around handling under bounded capacity\n- Validation plan under cross-NUMA contention\n\n## Code Example\n```c\n// Pseudo-code sketch (high-level C-like)\ntypedef struct slot {\n  uint64_t seq;\n  void* data;\n} slot_t;\n\ntypedef struct deque {\n  slot_t* slots;\n  size_t mask; // N-1\n  _Atomic(size_t) head, tail;\n} deque;\n\n// push/pop/steal skeleton (high level; details omitted)\n```\n\n## Follow-up Questions\n- How would you debug a perf anomaly with cross-node steals?\n- How would you scale to more NUMA nodes or adapt to varying task sizes?",
-        "difficulty": "advanced"
-      },
-      {
         "id": "low-level-q-11",
-        "questionId": "q-707",
-        "question": "Design a crash‑consistent, multi‑producer/multi‑consumer ring buffer backed by persistent memory PMEM. How would you ensure last enqueued item durability across power loss, implement recovery, and validate correctness? Provide concise enqueue/dequeue pseudocode with proper flush/fence ordering and discuss failure scenarios?",
+        "questionId": "q-16920",
+        "question": "Design and implement a lock-free, per-core fixed-size block allocator for 64-byte blocks with per-core freelists and a shared global pool. It must be NUMA-aware, minimize cross-socket traffic, support fast alloc/free in O(1), and reclaim memory safely. Provide data structures, pseudo-code for alloc/free, and outline a microbenchmark comparing locality against a naive global-lock allocator under 2 NUMA nodes and 8 threads?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Proposed solution sketch: maintain a ring of N=1<<20 slots, each with a 128-byte payload and a 64-bit sequence. Use atomic head/tail indices and per-slot seq to guard ABA. Enqueue: reserve B slots via",
+            "text": "Design a NUMA-aware, lock-free allocator optimized for 64-byte objects. Use per-thread freelists to satisfy allocations from a thread-local cache; on cache miss, fetch a slab from a central NUMA-local pool and refill th…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a crash-durable, zero-copy IPC path using a shared ring with per-slot sequence counters and a compact durability log. Enqueue writes 256-byte messages, writes a durability record, then uses a r",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "I would implement a 64-slot SPSC ring buffer using per-slot 8-bit flags. Producer waits for flag==0, writes the 64-byte payload into slot i = tail & (N-1), then stores flag=1 with release semantics. C",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a crash‑safe PMEM ring buffer with two‑phase publish: write the data to the next slot, flush the data, then publish by updating a durable tail with a release store and a fence (sfence/clwb). Use p",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design crash‑consistent data paths in persistent memory, a common production issue when power failures occur during in‑flight operations.\n\n## Key Concepts\n\n- Durability guarantees for PMEM writes\n- Memory ordering: release/acquire, fences, cacheline flushes\n- Recovery via redo log and slot sequence counters\n- ABA avoidance in a concurrent ring\n- Testing with fault injection and crash replay\n\n## Code Example\n\n```c\n// Pseudo-code: enqueue/dequeue with PMEM flush/fence\n// Slot: { data, seq, valid }\nvoid enqueue(T v){\n  size_t t = tail.fetch_add(1);\n  Slot *s = &ring[t % CAP];\n  s->data = v; // write data\n  clwb(&s->data, sizeof(T));\n  fence(); // ensure data persists\n  s->seq = t; // publish with durable tail update (release)\n  clwb(&s->seq, sizeof(size_t));\n  fence();\n  // publish tail already happens via atomic tail update\n}\n\nbool dequeue(T *out){\n  size_t h0 = head.load();\n  Slot *s = &ring[h0 % CAP];\n  if (s->seq != h0) return false;\n  *out = s->data;\n  s->valid = false;\n  clwb(&s->valid, sizeof(bool));\n  fence();\n  head.fetch_add(1);\n  return true;\n}\n```\n\n## Follow-up Questions\n\n- How would you handle power loss during the publish vs data write steps?\n- How would you validate recovery correctness across multiple restart scenarios?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "low-level-q-12",
-        "questionId": "q-26618",
-        "question": "Design a scalable, tree-based barrier for N threads on a 2-socket x86-64 server. It must provide near-constant wakeup latency, support dynamic N up to 1024, minimize cache contention, and work with standard atomics. Provide API prototypes and minimal pseudo-code for join/wake paths, describe padding to avoid false sharing, and outline a microbenchmark plan to measure latency across 1–1024 threads on NUMA nodes?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-thread arenas hold a small freelist of 256 blocks, each 128B aligned to 64B. Allocation pops from the thread-local freelist; if empty, refill from a shared global pool via CAS-based lock-free stac",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Crash-consistent PMEM queue: ring with N=1<<16 slots; each slot 128B: 8B seq, 4B len, 8B id, 108B payload. Enqueue writes payload, flushes, updates len, then CAS on tail; Dequeue validates seq/len, co",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Lock-free graph: each node has an atomic head pointer to a singly linked list of edges; Edge {int to; atomic next}. add_edge uses CAS to prepend; add_node allocates a node and links it atomically. rem",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "API: barrier_init(barrier_t*, int max_threads); barrier_wait(barrier_t*, int tid); barrier_destroy(barrier_t*). Idea: complete binary tree in shared memory; each node has atomic remain and a padded se",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nSynchronization primitives are core at scale; a tree-based barrier tests deep concurrency understanding, memory ordering, and NUMA behavior without trivial spin-waits.\n\n## Key Concepts\n- Tree-based barrier with per-node atomic counters\n- Sense-reversing style to avoid extra barriers\n- Padding to avoid false sharing; memory_order_acq_rel on updates\n- Dynamic sizing: grow to next power of two\n\n## Code Example\n```c\ntypedef struct barrier_node {\n  alignas(64) _Atomic int remain;\n  bool sense;\n  char pad[128];\n} barrier_node_t;\n```\n\n## Follow-up Questions\n- How would you prove liveness when a thread stalls? \n- How would you handle a thread crash during barrier_wait?\n- How would you validate latency and fairness across 1–1024 threads on two NUMA nodes?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "low-level-q-13",
-        "questionId": "q-14250",
-        "question": "Design a fixed-size memory pool for 64-byte blocks to be used by a multithreaded logging path. It must support many threads acquiring and releasing blocks with minimal latency, no dynamic allocations after startup, and 64-byte alignment. Provide C-like prototypes and a minimal outline for implementation, including per-thread caches, a global atomic free-list, and strategy for refill/spill. Explain how you would test correctness and throughput under bursty traffic?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a slab allocator with per-thread caches. Each block is 64-byte aligned. Global free-list uses an atomic stack of indices; each thread keeps a local cache of 4 blocks. Acquire: if cache empty, p",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use two fixed-size rings, per-slot 64-byte payload and 64-bit sequence counters; producers reserve a slot by atomically incrementing tail, write data, then publish with release; consumer uses acquire to read the sequenc…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a tiny fixed-size block allocator (128B) for a high-throughput logging path. Each thread has a private freelist; when empty, fetch a slab from a global pool. Use a lock-free freelist with atomic operations to avo…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-core freelists with 4KB slabs; objects ≤64B aligned to 8B; alloc pops from local freelist via CAS; on empty, fetch a slab from a global lock-free pool. Free pushes into per-core cache, periodicall",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis task probes practical low-level memory management, thread-locality, and lock-free coordination under concurrency.\n\n## Key Concepts\n- Fixed-size slab pool with thread-local caches to reduce contention\n- 64-byte alignment and cache-friendly layout\n- Global atomic free-list for cross-thread reuse\n- Bounded pool leading to deterministic latency and predictable fragmentation\n- Simple stress test plan to validate throughput and correctness\n\n## Code Example\n```javascript\n// Minimal API (C-like)\ntypedef struct { void* blocks; size_t block_size; _Atomic(size_t) *free_indices; size_t total; } pool_t;\nvoid pool_init(pool_t*, size_t blocks, size_t block_size);\nvoid* pool_acquire(pool_t*);\nvoid pool_release(pool_t*, void*);\n```\n\n## Follow-up Questions\n- How would you extend to multiple pools or varying block sizes?\n- How would you detect and mitigate fragmentation during long-running runs?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "low-level-q-14",
-        "questionId": "q-27430",
-        "question": "Design a fixed-size shared-memory inter-thread primitive: a circular buffer that supports one producer and multiple consumers (1:N). Each slot holds a payload plus a header with length and a per-slot 'ready' flag. Provide slot layout, enqueue and dequeue pseudo-code using atomic operations and memory order, handle wrap-around, and ensure correctness under concurrent readers. Include a minimal microbenchmark plan to validate throughput and data integrity?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
             "text": "Per-node pools of 64-byte blocks with cache-line alignment; lock-free free lists using atomic pointers and pointer tagging to prevent ABA; local fast path, cross-node steal queues, and batch refills t",
             "isCorrect": false
           },
           {
+            "id": "c",
+            "text": "Use a fixed-size ring with per-slot sequence counters and 64-byte frames. Enqueue reserves via CAS on tail, writes frame, bumps seq, and uses a release store for tail. Dequeue reads head, validates seq, copies frame, an…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Per-core 64-byte freelists linked in arrays; allocation from local head using CAS; underflow refills from a shared global pool or steals from the nearest core; deallocation returns to the local freeli",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests lock-free memory management, NUMA locality, and safe reclamation in a realistic setting.\n\n## Key Concepts\n- Lock-free per-core freelists\n- Global overflow pool and work stealing\n- NUMA-aware memory placement\n- Reclamation: epoch-based or hazard pointers\n- 64B alignment and cache-line padding\n\n## Code Example\n```c\ntypedef struct Node { struct Node *next; void *block; } Node;\ntypedef struct FreeList { _Atomic(Node*) head; } FreeList;\nvoid* alloc(FreeList *f) {\n  Node *n = atomic_load(&f->head);\n  while (n && !atomic_compare_exchange_weak(&f->head, &n, n->next));\n  return n ? n->block : NULL;\n}\n```\n\n## Follow-up Questions\n- How would you support variable block sizes?\n- How to measure cross-socket traffic and false sharing risks?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "low-level-q-12",
+        "questionId": "q-14886",
+        "question": "Design a lock-free barrier for N threads to rendezvous without OS locks. Use a two-generation scheme to avoid ABA. Each thread writes arrival in its slot and waits on a per-thread flag; the last thread flips the generation. Provide C-like pseudo-code for init and wait, discuss 64-byte padding to silence false sharing, and outline a microbenchmark to test scalability to 128 threads on a 64-byte cache-line CPU?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a fixed-size, open-addressing hash table with per-slot version counters and a tombstone flag. Use CAS to insert, validate version on finds, and mark tombstones on delete, incrementing the ve",
+            "isCorrect": false
+          },
+          {
             "id": "b",
-            "text": "Per-thread arenas with size-class bins and per-socket freelists; small allocations served from thread cache; large aligned blocks drawn from a pooled arena with 64B cacheline alignment. Use epoch-base",
+            "text": "Key ideas: a skip-list map with lock-free inserts/finds/deletes. Use hazard pointers for reclamation and marked next pointers for logical deletion. Nodes carry per-level forward pointers, and new node",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "**One Producer, Multiple Consumers: Fixed Circular Buffer in Shared Memory** A circular buffer for 1:N producer-consumer patterns requires careful synchronization to ensure data integrity. Below is the complete design,…",
-            "isCorrect": true
+            "text": "Allocate first from per-thread cache, then per-NUMA node pool, then global heap. Implement 5 size classes: 8,16,32,64,128. Lock-free free lists per class using atomic head with a tag to avoid ABA; cro",
+            "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Implement a four-size-class slab allocator supporting 32, 64, 128, and 256-byte objects. Each thread maintains per-size free lists. On a cache miss, fetch a full slab from a global lock-free pool using a compare-and-swa…",
+            "text": "Two-generation barrier: each thread increments an atomic arrivals counter and writes its slot, then spins on its per-thread flag for the current generation. When the last thread arrives, flip the gene",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of low-level synchronization without locks, focusing on ABA avoidance and cache behavior.\n\n## Key Concepts\n- Barrier synchronization\n- Two-generation ABA avoidance\n- Cache-line padding and false sharing\n- Memory ordering with atomic operations\n\n## Code Example\n```javascript\n// Pseudo-C (illustrative only)\ntypedef struct { volatile int gen; volatile int arrived; char pad[60]; } slot_t;\ntypedef struct { slot_t *slots; int n; } barrier_t;\nvoid barrier_init(barrier_t *b, int n); \nvoid barrier_wait(barrier_t *b, int tid);\n```\n\n## Follow-up Questions\n- How would you support dynamic thread counts?\n- How would you stress-test for fairness and backlog under contention?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "low-level-q-13",
+        "questionId": "q-8072",
+        "question": "In a latency-sensitive service on a 2-socket server, design a NUMA-aware allocator for 64-byte small objects. Use per-node free lists, ABA-free cross-node steals, and a global refill policy. Provide API prototypes and pseudo-code for the fast path, and outline a microbenchmark plan to compare throughput and fragmentation against malloc under high contention?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use per-core local queues (128-byte slots, size 1<<12). Producers write data to per-core buffers, then publish a compact descriptor to a shared ring of N=1<<18 guarded with atomic tail/head counters that increment monot…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Per-node pools of 64-byte blocks with cache-line alignment; lock-free free lists using atomic pointers and pointer tagging to prevent ABA; local fast path, cross-node steal queues, and batch refills t",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "A ring in NVRAM with N=1<<16 slots; head/tail durable counters; each slot carries a 64-byte payload and a sequence nonce. Enqueue writes payload, then updates sequence and persists with fences. Dequeu",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a crash-consistent ring buffer with head/tail stored in DRAM for performance and per-slot metadata in NVRAM for durability. Use a two-phase commit protocol: (1) write payload to NVRAM slot, (2) flush with clwb…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Question Is Asked\n\nThis question evaluates a candidate's practical mastery of:\n\n- **Low-level synchronization primitives** — atomic operations, memory ordering models\n- **Cache coherence and false sharing** — understanding how hardware memory models affect design\n- **Producer-consumer patterns** — a foundational concurrency design pattern\n- **Real-world shared-memory primitives** — translating theory into production-quality code\n\nCandidates who can discuss trade-offs between spin-waiting vs. blocking, memory fence costs on different architectures, and slot-sizing for cache-line alignment demonstrate practical systems engineering knowledge essential for high-performance concurrent applications.",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\n\nTests practical NUMA-aware memory management, per-node caching, and ABA-safe freelists under high concurrency.\n\n## Key Concepts\n\n- NUMA affinity and cache locality\n- Lock-free free lists and ABA avoidance\n- Cross-node stealing and refill policy\n- Cache-line padding and fragmentation\n\n## Code Example\n\n```c\ntypedef struct Node { void* next; } Node;\nvoid* sa_alloc(void);\nvoid sa_free(void*);\n```\n\n## Follow-up Questions\n\n- How scale to 4+ sockets?\n- How would you measure long-term fragmentation and allocator throughput?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "low-level-q-14",
+        "questionId": "q-22415",
+        "question": "Design a software TLB cache for a CPU emulator on a 2-socket x86_64 server. Implement a 4-way set-associative TLB with N=1<<16 entries, 64-byte payload per entry (PFN, ASID, flags). Provide a lock-free lookup path using per-slot sequence counters to avoid ABA, and a CAS-based insert with publish. Include eviction via per-set recency counter and a microbenchmark plan to measure hit rate and emulation throughput under ASID churn?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use thread-local storage to hold a pool of 1024 blocks (128 bytes each). Each block has a next pointer; a per-thread free-list is formed. allocate() pops from the list, free() pushes back. If the thre",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Key approach: per-slot fields: seq, data. Prods reserve a slot via CAS on tail, write data, flush data cache line, then publish by updating seq and tail with a durable fence. Consumer reads by parity-",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Initialize a buffer of N blocks (64 bytes each). The first 8 bytes store a next pointer; the remaining 56 bytes are payload. Head points to first free block. allocate() pops head, returns block+8; fre",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose a 4-way set-associative software TLB for a CPU emulator on a 2-socket server: N=1<<16 entries, 64B per entry (PFN, ASID, flags). Lock-free lookup: set = hash(VPN, ASID) mod Nset; probe 4 ways;",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nEvaluates ability to design a cache-like structure under low-level constraints: lock-free paths, ABA avoidance, cache-line alignment, and NUMA-aware eviction.\n\n## Key Concepts\n- Software TLB design, set-associative mapping\n- Lock-free lookup and CAS inserts\n- Per-slot sequence counters to avoid ABA\n- Eviction policies and ASID flush semantics\n- NUMA-aware placement and padding to prevent false sharing\n\n## Code Example\n```c\n// Pseudo: slot layout and lookup for a 4-way set-associative TLB\ntypedef struct { uint64_t tag; uint64_t asid; uint64_t pfn; uint64_t flags; uint64_t seq; uint8_t valid; }\n tlb_slot_t;\n// lookup and insert skeletons omitted for brevity\n```\n\n## Follow-up Questions\n- How to handle TLB shootdowns and power-fail during publish\n- How would you adapt eviction for workload skew and ASID reuse",
+        "difficulty": "intermediate"
       },
       {
         "id": "low-level-q-15",
-        "questionId": "q-30513",
-        "question": "Design a crash-durable, zero-copy IPC path between two threads via a shared ring buffer. Use a fixed-capacity ring (N = 1<<16, slot_size = 256) with per-slot sequence counters. Enqueue writes a 256-byte message and a minimal durability log entry; after a release fence, CAS to publish. Dequeue validates sequence, copies out, and advances head. On restart, recover from the durability log to resume from the last committed slot without re-reading committed messages or losing in-flight ones. Provide API prototypes and minimal enqueue/dequeue pseudo-code with CAS and fences, plus a microbenchmark plan?",
+        "questionId": "q-8539",
+        "question": "Design and implement a fixed-size 64-byte block memory allocator in C that preallocates a 64KB arena and supports concurrent allocation/free without using malloc. Use a free-list embedded in blocks and an atomic head pointer; provide prototypes and a minimal implementation sketch. How would you test it under multi-threaded allocation and freeing for use-after-free or double-free issues?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a crash-durable, zero-copy IPC path using a shared ring with per-slot sequence counters and a compact durability log. Enqueue writes 256-byte messages, writes a durability record, then uses a r",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Allocate per-core, cache-aligned freelists of 64B blocks; keep a small per-core cache (e.g., 128 blocks). On allocate, pop from local freelist; on miss, batch-steal from a neighboring core or fetch fr",
+            "text": "Implement a sequence-lock guarded read path for a 128-bit config updated by a single writer. Use a 64-bit version counter V. Writer: V++ (odd), write cfg, V++ (even). Reader: loop: s = V; if (s&1) ret",
             "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Thread-local 64B block cache; allocate pops from local freelist; if empty fetch a batch (e.g., 32) from a global lock-free stack and push to local; free pushes back to local cache. Global pool uses at",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a NUMA-aware event bus with 4 producer rings and 4 consumer rings on a 2-socket system. Each ring holds 128-byte, cache-line-aligned events in a circular buffer. Producers advance tail atomical",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests correctness of crash durability, zero-copy semantics, and low-level synchronization in a tight producer/consumer path. It also probes recovery guarantees and minimal logging overhead.\n\n## Key Concepts\n- Per-slot sequence counters and CAS-based publication\n- Release/acquire fences and memory ordering\n- Lightweight durability log for crash recovery\n- Recovery semantics without re-processing committed data\n\n## Code Example\n```javascript\n// Prototypes included in the question; implement in C/C++ with atomics and fences\n```\n\n## Follow-up Questions\n- How would you validate correctness after power loss and ensure no data loss?\n- What are the trade-offs of using this approach vs. kernel-based IPC or PMEM-backed logs?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "low-level-q-16",
-        "questionId": "q-25736",
-        "question": "Implement a lightweight microbenchmark in C to measure memory bandwidth under three patterns: (1) stride-1 sequential, (2) stride equals 64 bytes (cache line), (3) stride equals 4096 bytes (page size). Use two aligned uint64_t arrays, time a full pass with clock_gettime(CLOCK_MONOTONIC_RAW), compute GB/s, and discuss cache-line effects, TLB pressure, and prefetching advantages/disadvantages?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a per-thread allocator for fixed-size 64-byte objects. Each thread stores a local freelist aligned to 64 bytes; allocate pops from local free list, refills from a global lock-free stack when",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "I would implement a microbenchmark in C to measure memory bandwidth under three patterns: (1) stride-1 sequential, (2) stride equals 64 bytes (cache line), (3) stride equals 4096 bytes (page-size). Us",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "## Lockless Cross-Thread Config Exchange Design ### Data Structures ```c #define BUFFER_SIZE 64 typedef struct { uint8_t data[BUFFER_SIZE]; uint32_t crc; } ConfigBuffer; typedef struct { ConfigBuffer buffers[2]; _Atomic…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-NUMA allocator with per-node free lists (lock-free or atomics), each block stores next pointer; allocate uses local node list via CAS; if empty, steal from a remote node or fall back to a central",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical understanding of memory hierarchy, cache lines, and accurate benchmarking rather than high-level theory.\n\n## Key Concepts\n- Memory bandwidth measurement\n- Cache-line locality and false sharing risk\n- Stride-based access patterns and TLB effects\n- Timing accuracy and overhead accounting\n\n## Code Example\n```javascript\n#include <stdio.h>\n#include <stdint.h>\n#include <stdlib.h>\n#include <time.h>\n\nint main(void){\n  const size_t N = 1<<26; // ~67M\n  uint64_t *A = (uint64_t*)aligned_alloc(64, N*sizeof(uint64_t));\n  uint64_t *B = (uint64_t*)aligned_alloc(64, N*sizeof(uint64_t));\n  for(size_t i=0;i<N;i++){ A[i]=i; B[i]=0; }\n\n  struct timespec t1,t2; \n  clock_gettime(CLOCK_MONOTONIC_RAW, &t1);\n  for(size_t i=0;i<N;i++) B[i] = A[i];\n  clock_gettime(CLOCK_MONOTONIC_RAW, &t2);\n  double t = (t2.tv_sec - t1.tv_sec) + (t2.tv_nsec - t1.tv_nsec)/1e9; \n  printf(\"stride1: %f s\\n\", t);\n  // add pattern 2 and 3 similarly\n}\n```\n\n## Follow-up Questions\n- How would you control for CPU frequency scaling during runs?\n- How would you extend to multi-threaded measurement and aggregate bandwidth?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "low-level-q-17",
-        "questionId": "q-8922",
-        "question": "Design a bounded, single-producer single-consumer queue for a real-time video path. Each slot is 64B; use a per-slot 64-bit sequence counter to avoid ABA, with N=1<<12. Provide init, enqueue, dequeue in C-like pseudocode (memory_order_release/acquire as appropriate) and explain how you prevent false sharing and validate correctness under bursty traffic?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a crash-consistent, lock-free skip list in non-volatile memory (NVRAM) that supports concurrent inserts and lookups across multiple threads while surviving power loss. Implement copy-on-write semantics: allocate…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Initialize a 64KB arena with an 8-byte head at offset 0 and 32-byte blocks starting at offset 8. Each block uses an 8-byte header to store the next-free index and 24 bytes for payload (8-byte alignmen",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a cross-process IPC ring buffer backed by a memory-mapped file with multiple producers and a single consumer. Each 64-byte slot contains an 8-byte atomic sequence number followed by a 56-byte payload. Writers res…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a circular buffer of N slots, each 64B with a 64-bit sequence counter. Initialize each slot's sequence to its index. The producer writes payload data, then updates the tail pointer and increments the slot's sequence…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests practical knowledge of low-level concurrency beyond mutexes, requiring precise memory ordering, ABA avoidance, and cache-line awareness.\n\n## Key Concepts\n\n- SPSC queues, ring buffers, per-slot sequence counters\n- Memory ordering: acquire/release semantics\n- False sharing and padding\n- Correctness under wrap-around and burst traffic\n\n## Code Example\n\n```c\ntypedef struct { uint64_t seq; uint8_t data[64]; } Slot;\n#define N (1<<12)\nSlot q[N];\nvolatile uint64_t head=0, tail=0;\n\nvoid enqueue(void* payload){ /* producer path with release store to slot and tail update */}\n```",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "low-level-q-18",
-        "questionId": "q-10993",
-        "question": "Design a NUMA-aware, zero-copy, multi-producer single-consumer logger in user space. Producers enqueue variable-length records into per-core buffers; a single consumer flushes to a file with direct I/O. Use tagged pointers or per-slot sequence counters to avoid ABA, implement epoch-based reclamation for record buffers, and describe a microbenchmark plan that measures throughput and tail latency for small (64B) vs large (4KB) records on a 2-socket server. Provide minimal C-like prototypes and pseudo-code for enqueue/dequeue?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Per-core ring buffers, fixed-size slots, variable payloads in a shared pool. Enqueue uses CAS on tail; ABA avoided via per-slot sequence counters. Reclaim with epoch-based GC tied to quiescent state.",
-            "isCorrect": true
           },
           {
             "id": "b",
@@ -564,98 +474,38 @@
           },
           {
             "id": "c",
-            "text": "Two writers and one reader share a shm ring buffer with N=1<<16; each slot has a 64-bit seq and 128-byte payload. Producers CAS head, write payload, bump seq, release-store head. Consumer uses acquire",
-            "isCorrect": false
+            "text": "Implement a fixed-size block allocator: preallocate arena (64KB) of 64-byte blocks. Use the head of a free-list stored in the arena; each free block stores a next pointer. Allocation uses lock-free CA",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Plan to implement per-slot sequence counters, cache-line aligned slots, and CAS-based enqueues/dequeues with acquire/release semantics. Use a 128-byte descriptor, precompute masks for wrap-around, and",
+            "text": "Per-node shards with a global coordinator. Lock-free hot path: atomic upserts into per-node arrays using CAS, with 64-byte padding; memory order: acquire/release fences around reads/writes; cross-node",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests low-level synchronization, non-blocking design, and memory reclamation in a realistic IO path.\n\n## Key Concepts\n- Lock-free queues, ABA avoidance, epoch-based reclamation, NUMA awareness, zero-copy paths, O_DIRECT.\n\n## Code Example\n```c\ntypedef struct { /* fields */ } slot_t;\ntypedef struct { /* ring, pool, etc */ } logger_t;\nint enqueue(logger_t*, const void* data, size_t len);\nint dequeue(logger_t*, void** out, size_t* len);\n```\n\n## Follow-up Questions\n- How would you adapt this for multiple consumers?\n- What diagnostics would you add to verify reclamation safety under abrupt termination?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nTests ability to design a safe, efficient memory primitive from scratch, focusing on low-level concurrency and memory layout rather than library calls.\n\n## Key Concepts\n\n- Fixed-size allocators and arena preallocation\n- Free-list embedded in blocks\n- Lock-free allocation/free with atomic CAS\n- Memory alignment and fragmentation basics\n- Basic multi-threaded testing strategies\n\n## Code Example\n\n```javascript\n// Sketch in C-like pseudocode\n#include <stdatomic.h>\ntypedef struct Block { struct Block* next; unsigned char data[64]; } Block;\nstatic unsigned char arena[64*1024];\n_Atomic(Block*) head;\nvoid init_pool() { head = NULL; /* link blocks in arena */ }\nvoid* alloc_block() { Block* b; while ((b = atomic_load(&head)) && !atomic_compare_exchange_weak(&head, (Block**)&head, (Block*)b->next)); return b ? b->data : NULL; }\nvoid free_block(void* p) { Block* b = (Block*)((char*)p - offsetof(Block, data)); b->next = atomic_load(&head); while (!atomic_compare_exchange_weak(&head, (Block**)&head, b)); }\n```\n\n## Follow-up Questions\n\n- How would you detect double-free or use-after-free in this scheme?\n- How would you extend to multiple block sizes or a scalable pool?",
+        "difficulty": "beginner"
       },
       {
-        "id": "low-level-q-19",
-        "questionId": "q-6815",
-        "question": "Design a NUMA-aware, per-worker work-stealing scheduler for a user-space thread pool in C++. Each worker has a local 64-byte-aligned queue; idle workers steal from the least-loaded neighbor using tagged indices to avoid ABA. Provide enqueue, pop, and steal with memory fences; discuss cache locality, false sharing, and fairness. Outline a microbenchmark plan across 2 NUMA nodes with 8 threads?",
+        "id": "low-level-q-16",
+        "questionId": "q-27430",
+        "question": "Design a fixed-size shared-memory inter-thread primitive: a circular buffer that supports one producer and multiple consumers (1:N). Each slot holds a payload plus a header with length and a per-slot 'ready' flag. Provide slot layout, enqueue and dequeue pseudo-code using atomic operations and memory order, handle wrap-around, and ensure correctness under concurrent readers. Include a minimal microbenchmark plan to validate throughput and data integrity?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Per-thread caches fed from a global pool. Each block holds a next pointer; the global free list head is atomic. **allocate()**: if the local cache is non-empty, pop and return; otherwise, lock the global pool, refill th…",
+            "text": "Proposed answer: Preallocate N blocks; maintain a lock-free free-list in the blocks themselves; use an atomic head pointer and a CAS to pop the head on allocate and push a block on free. Validate that",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a cross-process IPC ring buffer backed by a memory-mapped file with multiple producers and a single consumer. Each 64-byte slot contains an 8-byte atomic sequence number followed by a 56-byte payload. Writers res…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a sense-reversing barrier with N threads and C11 atomics. Each thread signals arrival via a shared counter (fetch_add); the last thread resets the counter and toggles a shared sense flag. Other th",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a NUMA-aware, per-worker lock-free deque scheduler in C++. Each worker has a 64-byte-aligned local queue; idle workers steal from the least-loaded neighbor using tagged indices to avoid ABA. Us",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests understanding of real-world low-level concurrency, memory locality, and practical trade-offs in multi-socket systems. It blends lock-free data structures with NUMA-aware scheduling and stress testing.\n\n## Key Concepts\n- NUMA locality and memory bandwidth\n- Lock-free deques and work stealing\n- ABA avoidance with tagging or epochs\n- Cache-line alignment and false sharing avoidance\n- Memory order semantics and fences\n\n## Code Example\n```javascript\n// Skeleton (C++-like pseudo): Deque per worker with 64-byte alignment\nclass Deque {\npublic:\n  alignas(64) std::atomic<size_t> head{0};\n  alignas(64) std::atomic<size_t> tail{0};\n  // slots: aligned storage for Task*\n  void push(Task* t) { /* local enqueue: tail.fetch_add(1, relaxed) */ }\n  Task* pop() { /* local pop with acquire on read, relaxed on write */ }\n  Task* steal() { /* steal from victim: CAS head with acquire, update tail */ }\n};\n```\n\n## Follow-up Questions\n- How would you handle memory reclamation for stolen tasks?\n- How would you extend to more than 2 NUMA nodes and ensure fairness across nodes?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "low-level-q-20",
-        "questionId": "q-28558",
-        "question": "Design a lock-free, multi-producer, multi-consumer ring buffer that persists to non-volatile memory (pmem) on a 4-socket NUMA server. Each slot is 128 bytes with a per-slot version counter; implement enqueue/dequeue with proper flush/fence semantics to survive crashes. Provide minimal pseudo-code, discuss recovery after power loss, and how you validate crash-consistency under churn?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a fixed-capacity MPMC ring with 128-byte slots, cache-line aligned, and per-slot 64-bit version counters. Enqueue reserves a slot by atomically bumping tail, writes data, updates the version, flus",
+            "text": "**One Producer, Multiple Consumers: Fixed Circular Buffer in Shared Memory** A circular buffer for 1:N producer-consumer patterns requires careful synchronization to ensure data integrity. Below is the complete design,…",
             "isCorrect": true
           },
           {
-            "id": "b",
-            "text": "Lock-free graph: each node has an atomic head pointer to a singly linked list of edges; Edge {int to; atomic next}. add_edge uses CAS to prepend; add_node allocates a node and links it atomically. rem",
-            "isCorrect": false
-          },
-          {
             "id": "c",
-            "text": "Barrier uses sense-reversing, lock-free design. Shared: atomic_int count padded to 64 bytes; atomic_bool sense padded. Each thread stores local_sense = !sense. barrier_wait: if (atomic_fetch_add(&coun",
+            "text": "Design a NUMA-aware allocator with per-thread caches for <=128-byte objects, backed by a central pool on a designated NUMA node. API: alloc/free; layout: per-thread freelists + central pool; sync via",
             "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a crash‑consistent, lock‑free object pool using per‑thread local caches backed by a central persistent free list. The central pool maintains a CAS‑based head pointer to a singly linked free list stored in pers…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThe question probes crash-consistency in non-volatile memory, lock-free design, and NUMA-aware memory ordering under contention. It requires careful use of version counters to avoid ABA and precise flush/fence semantics to guarantee durability.\n\n## Key Concepts\n- Non-volatile memory semantics and flush instructions (CLWB/CLFLUSH, sfence)\n- Lock-free MPMC ring with per-slot version counters\n- Crash-recovery: log replay and idempotent replays\n- NUMA-aware alignment and false sharing avoidance\n\n## Code Example\n```c\ntypedef struct {\n  uint64_t seq;\n  uint8_t data[128];\n} slot_t;\n\ntypedef struct {\n  slot_t *slots;\n  _Atomic size_t head;\n  _Atomic size_t tail;\n} ring_t;\n```\n```c\n// Pseudo enqueue/dequeue outline with fences and version checks\n```\n\n## Follow-up Questions\n- How would you test crash-recovery under sudden power loss?\n- What microbenchmark would you use to compare crash-recovery latency under varying contention?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "low-level-q-21",
-        "questionId": "q-7240",
-        "question": "Design and implement a tiny bitmap-based memory allocator in C for a 1KB arena that serves 8-byte blocks. Provide API: void mem8_init(void* arena, size_t size); void* mem8_alloc(); void mem8_free(void* ptr). Use a bitmap to track free blocks; ensure alignment and avoid double-free; include a minimal test snippet and discuss race conditions in a single-threaded context?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a sense-reversing barrier using a shared generation counter and per-thread flags padded to 64 bytes to prevent false sharing. Each thread toggles its local sense, sets its arrival flag, and spins on the genera…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose a ring with 1<<16 slots, 128B cache-line aligned. Each slot holds a 64-bit version, 64-bit pointer, 32-byte data, and a 16-byte header. Enqueue uses atomic fetch_add on tail with acquire, writ",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a 1KB bitmap-based allocator for 8-byte blocks. Arena: 16-byte bitmap header, then data; up to 128 blocks. Use two uint64_t words for the bitmap. mem8_init clears the bitmap; mem8_alloc sear",
-            "isCorrect": true
           },
           {
             "id": "d",
@@ -663,102 +513,252 @@
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests fundamental low-level memory management, bit-twiddling, and safety in a confined arena.\n\n## Key Concepts\n- Bitmap-based allocators\n- Alignment and bounds checks\n- Safety against double-free\n\n## Code Example\n```c\n#include <stdint.h>\n#include <stddef.h>\n\ntypedef struct { uint64_t m0, m1; unsigned char* data; size_t blocks; } mem8_pool;\n\nvoid mem8_init(mem8_pool* p, void* arena, size_t size){ p->data=(unsigned char*)arena+16; p->blocks=(size-16)/8; p->m0=0; p->m1=0; }\n\nvoid* mem8_alloc(mem8_pool* p){ for(int i=0;i<128;i++){ int word = i/64; int bit = i%64; uint64_t mask = (1ULL<<bit); uint64_t* w = (word==0)? &p->m0 : &p->m1; if(!(*w & mask)){ *w |= mask; return p->data + i*8; } } return NULL; }\n\nvoid mem8_free(mem8_pool* p, void* ptr){ size_t idx = ((unsigned char*)ptr - p->data)/8; if(idx< p->blocks){ int word = idx/64; int bit = idx%64; uint64_t mask = (1ULL<<bit); uint64_t* w = (word==0)? &p->m0 : &p->m1; *w &= ~mask; } }\n```\n\n## Follow-up Questions\n- How to extend to dynamic arena growth?\n- How to add thread-safety or locking strategies?\n- Compare space efficiency and fragmentation to a free-list allocator.",
+        "explanation": "## Why This Question Is Asked\n\nThis question evaluates a candidate's practical mastery of:\n\n- **Low-level synchronization primitives** — atomic operations, memory ordering models\n- **Cache coherence and false sharing** — understanding how hardware memory models affect design\n- **Producer-consumer patterns** — a foundational concurrency design pattern\n- **Real-world shared-memory primitives** — translating theory into production-quality code\n\nCandidates who can discuss trade-offs between spin-waiting vs. blocking, memory fence costs on different architectures, and slot-sizing for cache-line alignment demonstrate practical systems engineering knowledge essential for high-performance concurrent applications.",
         "difficulty": "beginner"
+      },
+      {
+        "id": "low-level-q-17",
+        "questionId": "q-27841",
+        "question": "On a 2-socket x86_64 server with MESI, design a lock-free, bounded event queue for a high-rate path where producers write to per-core local buffers and publish a compact descriptor into a shared ring (N=1<<18, 128-byte slots). Provide data structures, enqueue/dequeue pseudo-code with memory_order_release/acquire, per-slot sequence counters to avoid ABA, wrap-around handling, and a microbenchmark plan to measure throughput and cache-coherence traffic under mixed contention?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use per-core local queues (128-byte slots, size 1<<12). Producers write data to per-core buffers, then publish a compact descriptor to a shared ring of N=1<<18 guarded with atomic tail/head counters that increment monot…",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement a crash-consistent ring buffer with head/tail stored in DRAM for performance and per-slot metadata in NVRAM for durability. Use a two-phase commit protocol: (1) write payload to NVRAM slot, (2) flush with clwb…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Leverage per-size-class slabs of 64-byte-aligned blocks, with lock-free free-lists and per-thread caches to minimize cross-NUMA traffic. Use atomic CAS on a head-pointer for pop/push; implement ABA-fr",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a fixed-size ring with slots each containing a 64-bit payload and a 64-bit sequence, padded to avoid false sharing. Enqueue: read head, compute next=head+1; if slot[next].seq==head, write pa",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests knowledge of lock-free design, cross-socket contention, and memory ordering on MESI-based systems.\n\n## Key Concepts\n- Per-core local buffers to minimize cross-socket traffic and reduce coherence domain contention\n- Per-slot sequence counters to prevent ABA race conditions\n- Correct memory ordering: release for publishing, acquire for consuming, ensuring proper visibility across threads\n- Cache-line alignment to prevent false sharing\n- Wrap-around handling via power-of-two masking combined with sequence counter verification\n- Backpressure mechanisms to handle slow consumers gracefully\n\n## Data Structures\n\n```c\ntypedef struct {\n    uint64_t seq;\n    char pad[64];  // align to cache line boundary\n    void* data;\n    char payload[112];  // 128-byte slots total\n} Slot;\n\ntypedef struct {\n    Slot slots[1 << 18];\n    _Atomic(uint64_t) head;\n    _Atomic(uint64_t) tail;\n    char pad[L1_CACHE_SIZE];\n} Ring;\n\ntypedef struct {\n    char buffer[1 << 12][128];\n    uint64_t seq[1 << 12];\n    uint32_t local_head;\n    char pad[L1_CACHE_SIZE];\n} PerCoreQueue;\n```\n\n## Pseudocode\n\n**Enqueue:**\n```c\nbool enqueue(Ring* ring, PerCoreQueue* local, void* data, size_t len) {\n    uint32_t slot = local->local_head & (1 << 12 - 1);\n    \n    memcpy(local->buffer[slot], data, len);\n    atomic_store_explicit(&local->seq[slot], \n                          local->seq[slot] + 2, \n                          memory_order_relaxed);\n    \n    uint64_t desired = local->local_head + 1;\n    if (atomic_compare_exchange_weak_explicit(\n            &ring->tail, &desired, desired,\n            memory_order_release, memory_order_relaxed)) {\n        local->local_head++;\n        return true;\n    }\n    return false;  // backpressure\n}\n```\n\n**Dequeue:**\n```c\nbool dequeue(Ring* ring, void* out, size_t* len) {\n    uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);\n    \n    uint64_t desired = head + 1;\n    if (!atomic_compare_exchange_weak_explicit(\n            &ring->head, &head, desired,\n            memory_order_acquire, memory_order_relaxed)) {\n        return false;\n    }\n    \n    Slot* slot = &ring->slots[head & (N - 1)];\n    uint64_t seq = atomic_load_explicit(&slot->seq, memory_order_acquire);\n    if ((seq & 1) != 0) return false;  // not yet written\n    \n    memcpy(out, slot->data, *len);\n    atomic_store_explicit(&slot->seq, seq + 1, memory_order_release);\n    return true;\n}\n```\n\n## Microbenchmark Plan\n\n1. **Throughput measurement:** Vary producer/consumer thread counts (1-16), measure ops/sec at fixed load.\n\n2. **Cache-coherence traffic:** Use perf counters (`perf stat -e cache-references,cache-misses, LLC-load-misses, LLC-store-misses`) across:\n   - Single-socket baseline (no cross-socket traffic)\n   - Multi-socket with threads pinned to different NUMA nodes\n   - Vary write-to-read ratios (100/0, 50/50, 0/100)\n\n3. **Contention stress test:** Saturate ring capacity, measure under overflow conditions.\n\n4. **Baseline comparison:** Compare against mutex-protected ring and lock-free SPSC queue.",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "low-level-q-18",
+        "questionId": "q-18620",
+        "question": "Design a fixed-size-block allocator for 32-byte blocks in a pre-allocated arena (1–2 MB) that supports thread-safe malloc/free without coarse locks. Provide API prototypes, minimal pseudo-code for init/malloc/free using a lock-free free-list (CAS) and thread-local caches, and discuss alignment, fragmentation, and how you would validate it under multithreaded stress?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Provide a 1<<16, 128-byte per-slot bounded MPMC ring. Slot header: 16B seq/len plus 112B payload. Producers publish with store-release, then advance via CAS; consumers use load-acquire, process, and r",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a fixed-size, thread-safe allocator for 32-byte blocks from a pre-allocated arena (1–2 MB). Use a lock-free free-list updated via CAS, plus per-thread caches to reduce contention. Expose voi",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use a sense-reversing barrier. Let N be the size, count initialize to N, sense initialized to 0. barrier_wait() computes local = !sense; if (atomic_fetch_sub_explicit(&count,1,memory_order_acq_rel) ==",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I’d implement per-core 4KB slabs with 64B blocks, a lock-free freelist using atomic CAS on a per-slab head, and 64B padding to avoid false sharing. Allocation uses the local arena; frees stay local if",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nAssess practical low-level memory management skills, lock-free primitives, and performance considerations for multithreaded C/C++ code.\n\n## Key Concepts\n\n- Fixed-size allocators\n- Lock-free free-list with CAS\n- Thread-local caches\n- Alignment and fragmentation\n\n## Code Example\n\n```javascript\n// Pseudo-code for init, malloc, and free\ntypedef struct Node { void* next; } Node;\nstatic void* head;\n\nvoid init_arena(void* arena_base, size_t size) {\n  // split arena into 32-byte blocks and link on free-list\n}\n\nvoid* my_malloc() {\n  void* old = atomic_load(&head);\n  void* next = ((Node*)old)->next;\n  if (atomic_compare_exchange_weak(&head, &old, next)) return old;\n  // retry loop omitted for brevity\n}\n\nvoid my_free(void* p) {\n  Node* node = (Node*)p;\n  void* old;\n  do {\n    old = atomic_load(&head);\n    node->next = old;\n  } while (!atomic_compare_exchange_weak(&head, &old, node));\n}\n```",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "low-level-q-19",
+        "questionId": "q-15767",
+        "question": "Design a per-CPU slab allocator for a real-time, multi-threaded runtime that guarantees bounded worst-case latency. It must be lock-free, cache-line friendly, and minimize cross-core traffic. Provide API prototypes and high-level pseudo-code for allocate/free, discuss cross-core handoff, reclamation, and a microbenchmark plan to bound tail latency under contention?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a lock-free MPSC ring with N=1<<18 slots, each 64 bytes and a 64-bit per-slot sequence counter. Producers atomically fetch_tail, compute s = tail & (N-1), spin until slots[s].seq == tail, wr",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement per-CPU fixed-size slab pools with lock-free free lists. Allocate from local cache in O(1); on miss, fetch a block from a global cache or steal from another CPU with bounded retries. Reclaim",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Cross-NUMA, two-process ring for 40 Gbps on a dual-socket server. Slot: 128 bytes; capacity 1<<18; 64-byte alignment; per-slot 64-bit sequence for ABA-avoidance. NUMA-aware allocation on local node. ## Slot Layout ```c…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a sense-reversal barrier with 64-byte-aligned per-thread slots and a shared generation counter. **barrier_enter:** each thread writes its sense bit to its slot and performs an atomic fetch_add on the arrivals counte…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests understanding of real-time memory management, per-CPU caching, and lock-free data structures. Candidates must justify cache locality, contention, and reclamation tradeoffs.\n\n## Key Concepts\n- Per-CPU caches and fixed-size classes\n- Lock-free freelists and cross-core handoff\n- Reclamation strategies (epochs/RCU considerations)\n- Tail latency analysis and microbenchmarking\n\n## Code Example\n```javascript\n// Pseudo-C: per-CPU allocator core path\nfunction allocate(cpu, cls){\n  let head = cpu.freeList[cls];\n  if(head){ cpu.freeList[cls] = head.next; return head; }\n  // miss: pull from global or steal from neighbor\n}\n```\n\n## Follow-up Questions\n- How to choose size classes and memory alignment?\n- How to measure tail latency and what microbenchmark would you design?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "low-level-q-20",
+        "questionId": "q-9638",
+        "question": "Design a high-resolution, lock-free event timer for a multithreaded profiler on x86-64. API: timer_start(id) and timer_stop(id) for up to 256 concurrent events. Use RDTSCP with serialization to read stable timestamps, maintain a 256-entry table with total_ns, start_ts, and last_cpu hints. Support CPU migrations and concurrent starts/stops without locks. Provide prototypes and a microbenchmark plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Uses a lock-free CAS loop to pop from a free-list embedded in the blocks; each block starts with a 8-byte next pointer; deallocation pushes onto head with CAS. To avoid ABA, tag head with a counter or",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design and implement a per-core slab allocator for 64-byte objects in C. Each core maintains a private, 64-byte-aligned free-list cache. When the cache runs empty, fetch a batch atomically from a global lock-free pool u…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Read timestamps with RDTSCP after a CPUID serialize; at timer_start, store start_ts in a per-id slot atomically and mark active; on timer_stop, read end_ts, delta = end - start, add to total_ns using",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Approach: keep a shared ring pointer; on resize, allocate a new ring and publish with an atomic CAS to swap active ring. Producers switch atomically after a barrier; consumers detect the version and d",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design a low-overhead, lock-free timing primitive, handle CPU migration, and reason about timing accuracy in profiling workloads.\n\n## Key Concepts\n- RDTSCP serialization\n- Lock-free per-id timers\n- TSC frequency calibration\n- Migration awareness\n\n## Code Example\n```c\nstatic inline uint64_t read_tsc(void) { /* implementation depends on arch */ }\n```\n\n## Follow-up Questions\n- How would you extend for nested timers or different clock frequencies?\n- How would you ensure correctness under hyper-threading and CPU migration?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "low-level-q-21",
+        "questionId": "q-9430",
+        "question": "Design a zero-copy, DMA-friendly shared-memory RPC using a request/response ring pair on a NUMA system with a PCIe NIC. Each slot holds a descriptor (buf, len, cmd, gen) padded to a cache line. Describe how you publish/consume with atomic fences, how you avoid ABA, and how backpressure is signaled when the NIC stalls. Provide minimal C-like prototypes and a brief microbenchmark plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a sense-reversing barrier with per-thread slots padded to 64 bytes to avoid false sharing. Each thread stores its arrival flag in a unique slot; the last arriving thread flips a generation counter. Threads spin on t…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Proposed answer: two rings (requests/responses) in DMA-safe mem, per-slot gen counters to avoid ABA, and fetch_add/CAS for head/tail with seq_cst fences. NIC updates status; host polls a completion ri",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use a sense-reversing barrier. Maintain an atomic int count and a generation bit sense. Each thread stores a local copy of sense. In wait(), atomically increment count; if count == N, reset count to 0",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Detect overlap and copy direction (src < dst ? backward : forward). Use AVX2 to copy 32/64-byte chunks, aligning when possible. For blocks above 256B, employ non-temporal stores to minimize cache poll",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis probes low-level IPC design, DMA safety, and memory ordering in real systems.\n\n## Key Concepts\n- DMA-safe memory and cache-line padding\n- Generation counters to avoid ABA\n- Atomic fences and cache coherence\n- Backpressure and NIC stalls\n\n## Code Example\n```c\ntypedef struct {\n  uint64_t buf_addr;\n  uint32_t len;\n  uint32_t cmd;\n  uint64_t gen;\n  uint8_t pad[40];\n} slot_t;\n\ntypedef struct {\n  slot_t *slots;\n  uint64_t head;\n  uint64_t tail;\n  uint64_t capacity;\n} ring_t;\n```\n\n## Follow-up Questions\n- How would you recover from missed completions?\n- How would you verify correctness under NIC reordering or DMA faults?",
+        "difficulty": "advanced"
       },
       {
         "id": "low-level-q-22",
-        "questionId": "q-30383",
-        "question": "Design a cache-friendly, thread-safe latency histogram in C for 256 bins with per-thread buffers. Provide API: init_histogram(nbins), add_sample(value), merge_all_to_global(), read_global(). Explain how you avoid false sharing (padding/alignment) and how you choose memory_order for merges. Include a minimal test harness sketch and how to validate total samples?",
+        "questionId": "q-12160",
+        "question": "Design a crash-consistent in-memory B+tree intended to live on persistent memory (PMEM/NVMe) with a write-ahead log. Provide data layout, mutation protocol, and a recovery procedure after power loss. Explain how you ensure durability with minimal flush traffic, and outline a micro-benchmark to measure recovery time and throughput under mixed workloads?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a 4-level, 64-slot-per-level lock-free timer wheel. schedule_timer(delta_ns, cb) maps to the target slot at the appropriate level; enqueue a descriptor in a per-level slab using a per-slot sequ",
+            "text": "I would implement a NUMA-aware slab allocator using 4KB blocks with per-thread caches of 128 blocks each, backed by central memory pools per NUMA node. The metadata structures would be cache-line aligned and padded to p…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Thread-local histograms: each thread maintains a 256-bin buffer aligned to 64 bytes. add_sample increments local bin non-atomically. Periodically merge: atomically add each bin to a global 256-bin his",
+            "text": "Propose a crash-consistent PMEM B+tree with a per-operation redo log. Data layout: persistent nodes with keys and child offsets; a per-thread log tail for redo records. On mutating: append log (op, ke",
             "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Use four accumulators (a,b,c,d). Loop i+=4; prefetch arr[i+256]; accumulate a+=arr[i], b+=arr[i+1], c+=arr[i+2], d+=arr[i+3]. Finalize by adding a,b,c,d. Ensure arr is 64-byte aligned and compile with",
+            "text": "Per-core arenas isolate allocations to minimize cross-NUMA memory traffic. Each core maintains a private 64-byte block freelist; when empty, it atomically fetches a batch from a global pool using CAS, then refills its l…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a fixed-size pool with a free-list embedded in the blocks. pool_init links blocks[0..N-1]; pool_alloc pops the head and returns the payload; pool_free pushes the block back. Align to 8 bytes; avoi",
+            "text": "A practical approach: shared hashmap in shm with fixed capacity; hash to bucket, linear probe; per-slot 64-bit sequence counter to detect ABA; CAS-based updates with strong memory ordering; epoch-base",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests understanding of per-thread buffering, cache-line alignment, and atomic merges to minimize contention in high-frequency workloads.\n\n## Key Concepts\n- Thread-local buffers to avoid contention\n- Cache-line alignment to prevent false sharing\n- Atomic merges with memory_order_relaxed for performance\n\n## Code Example\n```c\n#include <stdalign.h>\n#define NBINS 256\n\ntypedef struct {\n  alignas(64) unsigned long long bins[NBINS];\n} thread_hist_t;\n\nunsigned long long global_bins[NBINS];\n\nvoid add_sample(thread_hist_t* t, unsigned int v) {\n  t->bins[v]++;\n}\n\nvoid merge_all_to_global(thread_hist_t* t) {\n  for (int i = 0; i < NBINS; ++i)\n    __atomic_fetch_add(&global_bins[i], t->bins[i], __ATOMIC_RELAXED);\n  // optionally clear t->bins here\n}\n```\n\n## Follow-up Questions\n- How would you adapt this for dynamic bin counts or streaming merges?\n- What profiling steps would you take to quantify false-sharing effects and contention under multi-threaded load?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nThis tests real-world crisis-safe data structures on PMEM and requires a durable protocol, recovery, and low flush overhead.\n\n## Key Concepts\n- Crash consistency on persistent memory\n- Write-ahead logging and durable pointers\n- Minimal flush traffic via in-log commits\n- Recovery by replaying a redo log\n- Atomicity with per-thread logs and commit tokens\n\n## Code Example\n```javascript\n// Simplified redo entry and apply flow (high level)\nstruct Redo { uint64_t op; uint64_t key; uint64_t old_ptr; uint64_t new_ptr; }\nfunction mutate(node, redo) {\n  // append redo, flush, then apply and commit\n}\n```\n\n## Follow-up Questions\n- How would you recover if a crash occurs during log tail flush?\n- How would you validate durability guarantees with power-failure tests?",
+        "difficulty": "advanced"
       },
       {
         "id": "low-level-q-23",
-        "questionId": "q-27767",
-        "question": "Design a minimal fixed-size per-thread memory pool for fast allocations in a multithreaded program. Each thread uses a per-thread free-list drawn from a shared arena of blocks. Provide API prototypes allocate(size) and free(ptr) with alignment guarantees, address cross-thread frees via a quarantine, and explain how you would test fragmentation and latency under 4-core contention?",
+        "questionId": "q-826",
+        "question": "Design and implement a tiny spinlock in C11 for a shared memory region. Provide lock() and unlock() using stdatomic.h primitives, ensuring memory_order_acquire on successful lock and memory_order_release on unlock. Include a minimal two-thread test contending for the lock and explain your backoff/yield strategy and fairness limitations?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Two atomics: next_ticket and now_serving. Each thread gets t = fetch_add(&next_ticket, 1) and spins until now_serving == t. Unlock sets now_serving = t+1 with release semantics and a thread-local tick",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Approach: pre-allocate a 256KB arena of 64-byte blocks; each thread maintains a lock-free free-list (stack) of blocks. allocate pops a block atomically; free pushes it back. Cross-thread frees land in",
+            "text": "```c #include <stdatomic.h> #include <sched.h> typedef struct { atomic_flag f; } spinlock_t; #define SPINLOCK_INIT { ATOMIC_FLAG_INIT } static inline void spin_lock(spinlock_t *s){ while (atomic_f",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "Implement a lock-free open-addressing hash map for two sockets. Use 64-bit keys/values, per-slot sequence counters to detect tombstones and avoid ABA, CAS-based inserts, and epoch-based reclamation. R",
+            "isCorrect": false
+          },
+          {
             "id": "c",
-            "text": "Barrier uses sense-reversing, lock-free design. Shared: atomic_int count padded to 64 bytes; atomic_bool sense padded. Each thread stores local_sense = !sense. barrier_wait: if (atomic_fetch_add(&coun",
+            "text": "Design a PMEM-backed MPSC (Multi-Producer Single-Consumer) log with per-record headers containing: a monotonically increasing sequence number (seq), payload length (len), and a CRC-32C checksum. Producers atomically inc…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Implement a fixed-size 256-byte block pool. Use a Pool struct: base, block_size=256, capacity, free_head, mutex. In pool_init, allocate base via posix_memalign, chain blocks by writing the next pointe",
+            "text": "Propose a bounded, lock-free WSQ with per-thread deques. Push to local tail; pop from local tail; thieves steal from heads. Use versioned pointers or tagged CAS to avoid ABA; apply hazard pointers or",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nAssess practical low-level memory management skills: per-thread caches, lock-free freelists, and cross-thread safety without heavyweight locks.\n\n## Key Concepts\n\n- Per-thread caches to reduce contention\n- Lock-free free-list with atomic ops\n- Cross-thread frees via quarantine\n- Fragmentation control with fixed-size blocks\n\n## Code Example\n\n```c\n// Minimal API surface for reference\nvoid* perthread_alloc(size_t size);\nvoid perthread_free(void* ptr);\n```\n\n```c\ntypedef struct Block { struct Block* next; } Block;\n```\n\n## Follow-up Questions\n\n- How would you extend to variable-size allocations?\n- How would you quantify fragmentation under churn, and how would you tune ARENA_SIZE/BLOCK_SIZE?",
+        "explanation": "## Why This Is Asked\nTests practical use of C11 atomics, memory ordering, and contention handling in low-level code. ## Key Concepts\n- C11 atomic primitives (atomic_flag)\n- memory_order_acquire/release semantics\n- busy-wait with backoff/yield to reduce bus traffic\n- fairness and starvation considerations ## Code Example\n```c\n// above code snippet\n```\n## Follow-up Questions\n- How would you extend this to a fair queueing spinlock?\n- What benchmarks would you run to profile contention impact?",
         "difficulty": "beginner"
       },
       {
         "id": "low-level-q-24",
-        "questionId": "q-3978",
-        "question": "Write a cooperative user-space scheduler that preempts green threads using a timer signal. In a single process, implement N coroutines with contexts (ucontext or setjmp/longjmp), maintain a ready queue, and use a per-thread timer (ITIMER_REAL) to trigger SIGALRM, performing yield by swapping to the next context. Include stack guard pages, an async-signal-safe enqueue/dequeue, and discuss race conditions, reentrancy, and performance implications?",
+        "questionId": "q-22750",
+        "question": "On a 2-socket x86-64 NUMA server, implement a fast, lock-free per-thread slab allocator for short-lived objects with size classes {64,128,256,512,1024}. Each thread maintains a local cache; a central heap handles misses with minimal cross-socket traffic. Use epoch-based reclamation to avoid cross-thread frees and stall. Ensure cache-line alignment and minimize false sharing; provide C API: void* alloc(size_t sz); void free(void* p); plus pseudo-code for alloc/free and a microbenchmark plan to measure cross-socket traffic, fragmentation, and sustained throughput under contention?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Key approach: per-slot fields: seq, data. Prods reserve a slot via CAS on tail, write data, flush data cache line, then publish by updating seq and tail with a durable fence. Consumer reads by parity-",
+            "text": "A ring in NVRAM with N=1<<16 slots; head/tail durable counters; each slot carries a 64-byte payload and a sequence nonce. Enqueue writes payload, then updates sequence and persists with fences. Dequeu",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use two indices: head and tail. Let mask = N-1. Enqueue: if ((head - tail) == N) return 0; data[head & mask] = value; head++; Dequeue: if (head == tail) return 0; *out = data[tail & mask]; tail++; Thi",
+            "text": "Implement a fixed-size, thread-safe allocator for 32-byte blocks from a pre-allocated arena (1–2 MB). Use a lock-free free-list updated via CAS, plus per-thread caches to reduce contention. Expose voi",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implementation approach: use ucontext to create N contexts with stacks aligned to 16/64 bytes; install a single signal handler for SIGALRM that is async-signal-safe; on timer expiry, save current cont",
+            "text": "Per-thread caches per size class, a NUMA-aware central pool, and epoch-based reclamation to avoid cross-thread frees. Slabs align to 64-byte lines; pad to prevent false sharing. Lock-free central pool",
             "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Per-thread caches per size class, a NUMA-aware central pool, and epoch-based reclamation to avoid cross-thread frees. Slabs align to 64-byte lines; pad to prevent false sharing. Lock-free central pool",
+            "text": "Use Intel TSX to wrap enqueue/dequeue in a small transaction: validate capacity, write payload, advance tail, and commit with _xend. If TSX aborts or capacity constraints are hit, fall back to a lock-free CAS-based path…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical low-level skills: user-space scheduling, context switching, and signal safety. It probes how candidates manage cross-core timing, layout stacks, and handle preemption without kernel help.\n\n## Key Concepts\n- Async-signal-safety and reentrancy in a signal handler\n- Context switching APIs (ucontext vs setjmp/longjmp)\n- Stack guards and guard pages to detect overflows\n- Preemption cost and jitter; worst-case latency\n\n## Code Example\n```javascript\n// Minimal skeleton (C-like) for a preemptive user-space scheduler\n#include <signal.h>\n#include <ucontext.h>\n#include <sys/mman.h>\n#include <unistd.h>\n\n#define N 4\n\nucontext_t ctxs[N], main_ctx;\nint current = 0;\nvoid scheduler_tick(int sig){ /* async-signal-safe yield to next */ }\n```\n\n## Follow-up Questions\n- How would you extend to handle more coroutines than hardware threads while keeping latency predictable?\n- How would you measure and minimize preemption jitter across cores in a dense workload?",
+        "explanation": "## Why This Is Asked\nTests practical NUMA-aware allocator design, concurrency, and fragmentation trade-offs in real workloads that push memory systems.\n\n## Key Concepts\n- Per-thread caches per size class\n- Lock-free freelists with CAS\n- Central heap with NUMA-awareness\n- Epoch-based reclamation to avoid cross-thread frees\n- Cache-line alignment and padding to prevent false sharing\n\n## Code Example\n```c\ntypedef struct { void* head; } FreeList;\ntypedef struct { void* cache[5]; } ThreadCache;\n```\n\n## Follow-up Questions\n- How would you validate hot-path performance under multi-threaded load?\n- What fragmentation bounds would you expect and how would you mitigate them?",
         "difficulty": "intermediate"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-10-06T08:37:52.663Z",
+    "createdAt": "2026-10-06T15:46:36.488Z",
     "version": 1
   }
 ]
