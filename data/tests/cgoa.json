@@ -8,128 +8,248 @@
     "questions": [
       {
         "id": "cgoa-q-0",
-        "questionId": "q-11917",
-        "question": "Design a CGOA wrapper for a C streaming logger: API: typedef void (*log_cb)(const char* line, void* user); void start_log_stream(log_cb cb, void* user); void stop_log_stream(void); Expose Go: func StartLogger() (<-chan string, error). Include header, minimal C, CGO binding, and a small Go program that reads 3 lines then stops. Address memory ownership, string lifetimes, and CGO threading rules?",
+        "questionId": "q-9452",
+        "question": "Design a CGOA wrapper for a C key-value store. The C API exposes: KVStore* kv_open(const char* path, int* err); void kv_close(KVStore*); const char* kv_get(KVStore*, const char* key, int* err); The kv_get return is heap-allocated and must be freed. Expose Go types and funcs: type KVStoreHandle struct{ ptr *C.KVStore }; OpenStore(path string)(*KVStoreHandle, error); func (h *KVStoreHandle) Close() error; func (h *KVStoreHandle) Get(key string) (string, error). Implement ownership so kv_get's C string is freed after Go conversion, and Close frees the store. Demonstrate two goroutines calling Get concurrently. Include header, minimal C, Go binding, and a small program. Discuss error propagation when kv_open or kv_get fails?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Approach: bind a C callback into Go by registering a per-task handler in a map keyed by a unique token, and pass that token as user to C. The wrapper should avoid passing Go pointers to C, use //expor",
+            "text": "Use a Go wrapper that creates a per-request channel, registers it with runtime/cgo.Handle, and passes a uintptr ctx to fetch_item_async. In the C callback, recover the handle, read the channel, conver",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Bridge CGO to a C async API by storing a Go value with a cgo.Handle and passing its uintptr to C. The C shim launches a thread, invokes the callback with status and data, then copies data into a Go sl",
+            "text": "Call get_item and check for NULL; copy label via C.GoString; assemble a Go Item{ID: int(it->id), Label: C.GoString(it->label)}; free the label and the item (via a C helper) to avoid leaks; return erro",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Propose a CGO wrapper that uses a C function to register a stream callback, with a Go channel wrapped by a cgo.Handle as the ctx. A single C callback pushes values into the Go channel via an exported",
-            "isCorrect": false
+            "text": "OpenStore calls kv_open and returns an error if the int* err is nonzero. Get calls kv_get; if non-null, convert with C.GoString and then free the C string; if null, return the error. Close calls kv_cl",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Provide a CGO wrapper exposing StartLogger() (<-chan string, error). The C callback should copy lines using C.GoString and push them into a Go channel from a dedicated goroutine. Use a buffered channel to decouple C cal…",
-            "isCorrect": true
+            "text": "## CGO Wrapper for C Streaming API with Callback-Driven Design ### C Header and Implementation ```c // stream_processor.h #ifndef STREAM_PROCESSOR_H #define STREAM_PROCESSOR_H #include <stdlib.h> typedef struct { char*…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests practical CGO practices: memory ownership, callback handling, and cross-language threading.\n\n## Key Concepts\n\n- CGO callback from C to Go\n- Memory management across boundaries\n- Thread-safety with CGO\n- Channel-based streaming in Go\n\n## Code Example\n\n```c\n// logger.h\n#ifndef LOGGER_H\n#define LOGGER_H\n\ntypedef void (*log_cb)(const char* line, void* user);\nvoid start_log_stream(log_cb cb, void* user);\nvoid stop_log_stream(void);\n\n#endif\n```\n\n```c\n// logger.c\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include \"logger.h\"\n\nstatic log_cb g_cb = NULL;\nstatic void* g_user = NULL;\nstatic int g_running = 0;\n\nvoid start_log_stream(log_cb cb, void* user) {\n    g_cb = cb;\n    g_user = user;\n    g_running = 1;\n    // Simulate logging\n    for (int i = 0; i < 10 && g_running; i++) {\n        char buffer[256];\n        snprintf(buffer, sizeof(buffer), \"Log line %d\", i);\n        if (g_cb) g_cb(buffer, g_user);\n        usleep(100000); // 100ms delay\n    }\n}\n\nvoid stop_log_stream(void) {\n    g_running = 0;\n    g_cb = NULL;\n    g_user = NULL;\n}\n```\n\n```go\n// logger.go\npackage main\n\n/*\n#cgo LDFLAGS: -lpthread\n#include \"logger.h\"\n#include <stdlib.h>\n*/\nimport \"C\"\nimport (\n\t\"fmt\"\n\t\"runtime\"\n\t\"sync\"\n\t\"unsafe\"\n)\n\ntype logger struct {\n\tch     chan string\n\tstopCh chan struct{}\n\tmu     sync.Mutex\n}\n\nvar globalLogger = &logger{\n\tch:     make(chan string, 100),\n\tstopCh: make(chan struct{}),\n}\n\n//export logCallback\nfunc logCallback(line *C.char, user unsafe.Pointer) {\n\tgoStr := C.GoString(line)\n\tselect {\n\tcase globalLogger.ch <- goStr:\n\tdefault:\n\t\t// Channel full, drop the message or handle backpressure\n\t}\n}\n\nfunc StartLogger() (<-chan string, error) {\n\tglobalLogger.mu.Lock()\n\tdefer globalLogger.mu.Unlock()\n\t\n\t// Ensure we're locked to an OS thread for CGO callbacks\n\truntime.LockOSThread()\n\t\n\tC.start_log_stream((*[0]byte)(C.logCallback), nil)\n\treturn globalLogger.ch, nil\n}\n\nfunc StopLogger() {\n\tglobalLogger.mu.Lock()\n\tdefer globalLogger.mu.Unlock()\n\t\n\tC.stop_log_stream()\n\truntime.UnlockOSThread()\n}\n\nfunc main() {\n\tch, err := StartLogger()\n\tif err != nil {\n\t\tfmt.Printf(\"Error starting logger: %v\\n\", err)\n\t\treturn\n\t}\n\t\n\t// Read 3 lines then stop\n\tfor i := 0; i < 3; i++ {\n\t\tline := <-ch\n\t\tfmt.Printf(\"Received: %s\\n\", line)\n\t}\n\t\n\tStopLogger()\n\tfmt.Println(\"Logger stopped\")\n}\n```\n\n## Follow-up Questions\n\n- How would you handle long-lived streams and backpressure?\n- What are the CGO rules for thread creation and OS thread affinity?",
+        "explanation": "## Why This Is Asked\nTests practical CGO memory ownership and lifecycle: ensure C-allocated strings are freed and resources are released, while errors propagate clearly across Go-C boundaries. Also validates basic concurrent usage patterns.\n\n## Key Concepts\n- CGO ownership of C-allocated memory\n- Converting C strings to Go safely\n- Error propagation from C to Go\n- Resource lifecycle: Open/Close semantics, thread-safe binding\n\n## Code Example\n```javascript\n// Not shown here: header, C implementation, and Go binding skeleton\n```\n\n## Follow-up Questions\n- How would you ensure no memory leaks if multiple Go calls can co-refer the same C string?\n- How would you extend the API to support batch kv_get calls safely across goroutines?",
         "difficulty": "beginner"
       },
       {
         "id": "cgoa-q-1",
-        "questionId": "q-4336",
-        "question": "Design a CGOA wrapper for a C library that provides an asynchronous API using a completion callback. Expose a Go function AsyncCompute(src []byte) ([]byte, error) that can run concurrently from multiple goroutines. Provide a C header and minimal C implementation that schedules a callback on a new thread; show a Go binding using CGO and a short program launching two concurrent calls. Include build steps?",
+        "questionId": "q-23570",
+        "question": "Design a CGOA wrapper for a C function that streams binary data and invokes a callback per chunk. C API: int process_stream(const uint8_t* data, size_t total_len, size_t chunk_size, void (*chunk_cb)(size_t idx, const uint8_t* chunk, size_t len, void* user), void* user); The wrapper should expose StreamProcess(data []byte, chunkSize int) (string, error), returning a malloc-allocated JSON describing per-chunk sizes and a final checksum. Provide a header, a minimal C impl, a Go binding, and a Go program that feeds data in parallel via a worker pool while guaranteeing memory ownership and no CGO pitfalls?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Serialize CGO calls with a mutex, copy the C message to Go, free the C result, and return meaningful errors when nil or code != 0. Pass query as C string and free it. Ensure no Go pointers escape into",
+            "text": "Implement a CGO wrapper that copies the token to C memory with C.CBytes, allocates a C output buffer, calls validate_token, checks the return value, unmarshals the JSON into a Go struct, and frees bot",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "I'd implement a per-call waiter keyed by id. In Go, generate a unique id, register a chan for the result, and invoke the C async_compute with that id and a trampoline to the Go callback (exported). Th",
-            "isCorrect": true
+            "text": "Design a CGOA wrapper for a C function that scales a data buffer in place: void transform_inplace(double* data, size_t n, double scale); The Go binding should expose TransformInPlace(data []float64, s",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "## CGO Wrapper for C Streaming API with Callback-Driven Design ### C Header and Implementation ```c // stream_processor.h #ifndef STREAM_PROCESSOR_H #define STREAM_PROCESSOR_H #include <stdlib.h> typedef struct { char*…",
-            "isCorrect": false
+            "text": "I would implement a CGO bridge using a Go callback registry with a cgo.Handle, exposing a C trampoline that calls back into Go via an exported function. The C side never hands Go pointers; chunks are",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Provide a CGO wrapper exposing StartLogger() (<-chan string, error). The C callback should copy lines using C.GoString and push them into a Go channel from a dedicated goroutine. Use a buffered channel to decouple C cal…",
+            "text": "Use a Go wrapper that registers a Go callback via //export, creates a unique handle per stream stored in a map, passes the handle as the C user pointer, and in the callback copies data into a Go slice.",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design CGO boundaries for async callbacks, memory ownership, and concurrency.\n\n## Key Concepts\n\n- CGO thread-safety and PTHREAD usage\n- Exported Go callbacks from C trampolines\n- Memory management across C and Go (malloc/free)\n- Synchronization of multiple in-flight calls using a map and channels\n\n## Code Example\n\n```c\n// header and trampoline example\n```\n\n```go\n// binding idea\n```\n\n## Follow-up Questions\n\n- How would you handle timeouts or callback errors?\n- How would you extend to streaming results or cancelation?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nAssesses CGO boundary discipline: safe callback bridging, memory ownership, and streaming with concurrency.\n\n## Key Concepts\n- Avoid Go pointers in C; use a handle registry (cgo.Handle) and an exported Go callback.\n- Implement a C trampoline to invoke Go code without leaking memory.\n- Manage final JSON lifetime and cleanup to prevent leaks across boundaries.\n- Backpressure and worker-pool integration when streaming large data.\n\n## Code Example\n```javascript\n// header (C)\nint process_stream(const uint8_t* data, size_t total_len, size_t chunk_size, void (*chunk_cb)(size_t idx, const uint8_t* chunk, size_t len, void* user), void* user);\n```\n\n```javascript\n// Go binding sketch\n// func StreamProcess(data []byte, chunkSize int) (string, error) { ... }\n```\n\n```javascript\n// Go worker pool sketch\n// go run main.go\n```\n\n## Follow-up Questions\n- How would you extend to multiple simultaneous streams without callback contention?\n- What are the risks if process_stream calls callbacks on non-Go threads?",
+        "difficulty": "advanced"
       },
       {
         "id": "cgoa-q-2",
-        "questionId": "q-25733",
-        "question": "Design a CGOA wrapper for a C function that tokenizes an input string into words, returning a malloc'ed array of C strings. API: int tokenize(const char* text, char*** tokens, size_t* count); Each token and the array are allocated by C and must be freed by the caller. Provide header + minimal C impl, a Go binding Tokens(text string) ([]string, error), and a Go program that tokenizes several inputs concurrently and cleans up correctly?",
+        "questionId": "q-30172",
+        "question": "Design a CGOA wrapper for a C function that processes TLV blocks in batches. API: int process_tlv_batch(const uint8_t** blocks, size_t n, size_t block_len, char** out_json); out_json is malloc'ed JSON of [{\\\"idx\\\":i,\\\"type\\\":t,\\\"len\\\":l,\\\"payload\\\":base64}]. Provide header and minimal C impl for TLV validation. Go binding exposes TLVBatch(blocks [][]byte) (string, error). A Go worker-pool streams blocks, validates TLV in Go, aggregates per-block digests, and computes a batch SHA-256; ensure proper memory ownership and error propagation?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement a CGOA wrapper for a C function that validates a stream of binary protobuf-like messages and emits a JSON array of per-message results. The C API: int stream_validate(const uint8_t** message",
+            "text": "Bridge CGO callbacks by exporting a C trampoline that calls back into Go using a stable handle. Pass a Go context or cancel channel as the ctx. On cancel, signal C wrapper via an atomic flag to abort.",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Bridge CGOA: export a Go callback used by a C streaming function that calls cb(block, len, user). In Go, copy the block to a Go []byte and run the user function, returning 0 to continue or nonzero to",
+            "text": "Provide a header and C source implementing compute_stats, returning 0 on success and -1 on error (n==0). In Go, implement ComputeStats(values []int) (int64, float64, error) calling the C function via",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement a CGOA wrapper that registers a Go callback and allows C to invoke it from multiple threads. Use a go/cgo handle to pass a Go function through a void* to C, export a Go bridge function, and synchronize access…",
+            "text": "The ideal answer outlines: a C header and a minimal impl for process_tlv_batch validating TLV (type 1 byte, length 4 bytes, payload) and returning malloc'ed JSON; a Go binding that constructs the bloc",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use an opaque C context per detector. Go binds CreateDetector(mode) returning *Detector with Feed([]byte) error and Close() (string, error). Feed passes chunks via detector_feed; Close calls detector_",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests nuanced CGO ownership, cross-language error reporting, and streaming concurrency.\n\n## Key Concepts\n- Memory ownership across C/Go boundaries\n- Safe Go<->C array construction\n- Error propagation in CGO wrappers\n- Worker pool streaming with deterministic memory frees\n\n## Code Example\n```c\n// Header\nint process_tlv_batch(const uint8_t** blocks, size_t n, size_t block_len, char** out_json);\n```\n\n```go\n// Binding sketch: convert Go []byte blocks to C array, call process_tlv_batch, free out_json\n```\n\n## Follow-up Questions\n- How would you handle partial failures within a batch?\n- How to parallelize safely across multiple batches without double-freeing memory?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "cgoa-q-3",
+        "questionId": "q-13881",
+        "question": "Design a CGOA wrapper for a C asynchronous engine API that accepts a data blob, processes it in the background, and reports results via a callback. Implement Go bindings exposing: Type Engine struct { p *C.engine }; NewEngine() (*Engine, error); func (e *Engine) Submit(data []byte) (string, error). Use a per-request channel and a cgo.Handle to attach the Go side to the C callback; ensure memory ownership: copy the result string to Go and free C memory; avoid passing Go pointers to C. Include a minimal header and C implementation, plus a Go program with a worker pool submitting multiple payloads concurrently?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a C wrapper that allocates counts and edges, and expose free_histogram. In Go, call histogram, copy into Go slices, then free via free_histogram. Create a small program that starts two gorou",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose a CGOA wrapper for a C function that accepts an array of C strings and returns a heap-allocated JSON string summarizing each input string's length and content; ensure proper memory ownership,",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a per-request channel and a cgo.Handle; pass the handle as user to the C engine_submit; in the C callback, retrieve the Go channel from the handle, copy the C result to a Go string, send it on the",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Design a CGO wrapper for a C function that processes an array and reports progress through a callback: ```c int run_with_progress(const double* data, size_t n, void (*cb)(int progress, const char* note, void* ctx), void…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to bridge Go and C asynchronously, manage memory ownership, and ensure CGO thread-safety without leaking pointers.\n\n## Key Concepts\n- CGO callback bridging with cgo.Handle\n- Per-request ownership and cleanup\n- Safe string transfer from C to Go\n- Concurrent submissions via worker pool\n\n## Code Example\n```c\n// header\ntypedef void (*c_callback_t)(int status, const char* result, void* user);\ntypedef struct engine engine;\nengine* engine_new();\nvoid engine_free(engine* e);\nvoid engine_submit(engine* e, const unsigned char* data, size_t n, c_callback_t cb, void* user);\n```\n```c\n// minimal implementation (conceptual)\n#include <stdlib.h>\n#include <string.h>\n#include \"engine.h\"\n\nstatic void cb_wrapper(int status, const char* result, void* user){\n    // In real code, cast user to the Go handle and signal result\n}\n\nengine* engine_new(){ return (engine*)malloc(sizeof(engine)); }\nvoid engine_free(engine* e){ free(e); }\nvoid engine_submit(engine* e, const unsigned char* data, size_t n, c_callback_t cb, void* user){\n    // simulate async work and call cb later; allocate result string\n    char* res = (char*)malloc(64);\n    strcpy(res, \"ok\");\n    cb(0, res, user);\n    free(res);\n}\n```\n```go\n// binding sketch (Go)\npackage main\n/*\n#include \"engine.h\"\n#include <stdlib.h>\n*/\nimport \"C\"\nimport (\n    \"errors\"\n    \"runtime\"\n    \"sync\"\n    \"sync/atomic\"\n    \"unsafe\"\n)\n\ntype Engine struct{ p *C.engine }\n\nfunc NewEngine() (*Engine, error){\n    e := C.engine_new()\n    if e == nil { return nil, errors.New(\"failed to create engine\") }\n    return &Engine{p: e}, nil\n}\n\nfunc (e *Engine) Submit(data []byte) (string, error){\n    // bridge via channel and handle; simplified for illustration\n    ch := make(chan string, 1)\n    // allocate C data and pass callback with a Go handle stored in a global map\n    // proper implementation would register a Go callback and store ch in a cgohandle\n    // for interview purposes this demonstrates the pattern\n    _ = data\n    _ = ch\n    return \"result\", nil\n}\n```\n\n## Follow-up Questions\n- How would you handle errors reported by the C callback and propagate them to Go without leaking handles?\n- How would you support multiple concurrent engines and ensure correct association of results to requests in a high-throughput scenario?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "cgoa-q-4",
+        "questionId": "q-9929",
+        "question": "CGOA Binding: Streaming C data with lifecycle management? Implement a CGO binding for a C streaming API exposing: typedef struct { const uint8_t* data; size_t len; int done; } Chunk; int stream_next(Chunk* c); void stream_free(Chunk* c); Expose a Go function Stream() (<-chan []byte, chan error) that streams chunks from two streams concurrently, ensuring thread-safety, freeing memory via stream_free after copying, and mapping C errors to Go errors. Provide header, minimal C, Go binding, and a small program that runs two streams concurrently?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a trampoline: implement a C callback that redirects to a Go-exported function with a per-session context. The C side frees event_json right after invoking the callback to avoid leaks. In Go, bind",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Serialize per-stream CGO calls, copy each chunk into a Go slice, then free C memory via stream_free. Use one dedicated goroutine per stream and a channel to emit data; map non-zero stream_next return",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a CGOA wrapper that uses a cgo.Handle for the Go-side callback and a C-provided context to marshal tile JSON back to Go on a channel. Manage memory by freeing tile_json after conversion, pro",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "To implement, Bind tokenize as: int tokenize(const char* text, char*** tokens, size_t* count); In Go, call C.tokenize, allocate a Go slice length *count, copy each C string with C.GoString, then free",
-            "isCorrect": true
+            "text": "Per-stream context is passed to start_audio_stream. In the C callback, copy data with C.GoBytes, then free the C buffer; push the copy to the Go channel. The wrapper returns a cancel function that cal",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests memory ownership across CGO, translation to Go, and concurrency basics at beginner level. The task checks the ability to design clean ownership semantics, avoid leaks, and expose a Go-friendly API.\n\n## Key Concepts\n- CGO memory management\n- heap allocation and free in C\n- transferring C strings to Go safely\n- concurrency in Go with goroutines\n\n## Code Example\n```c\n// header\nint tokenize(const char* text, char*** tokens, size_t* count);\n\n// simple stub implementation (not production-ready)\n```\n\n```go\n// pseudo-binding sketch\n```\n\n## Follow-up Questions\n- How would you handle non-ASCII input or UTF-8 tokens?\n- How would you handle tokenize returning errors for extremely large inputs?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\n\nEvaluates memory ownership between Go and C, error propagation, and streaming patterns with concurrency in CGO. It tests discipline around per-stream lifecycle, avoiding unsafe cross-thread CGO calls.\n\n## Key Concepts\n\n- CGO memory management and ownership rules\n- Error translation from C to Go (errno)\n- Streaming using channels and per-stream goroutines\n- CGO thread-safety considerations\n\n## Code Example\n\n```c\ntypedef struct { const unsigned char* data; size_t len; int done; } Chunk;\nint stream_next(Chunk* c);\nvoid stream_free(Chunk* c);\n```\n\n```go\npackage main\n\n/*\n#include <stream.h>\n*/\nimport \"C\"\nimport \"unsafe\"\n\nfunc Stream() (<-chan []byte, chan error) { /* placeholder */ return nil, make(chan error) }\n```\n\n## Follow-up Questions\n\n- How would you handle partial chunks and backpressure?\n- How would you extend to multiple independent streams?",
+        "difficulty": "intermediate"
       },
       {
-        "id": "cgoa-q-3",
-        "questionId": "q-4914",
-        "question": "CGOA Binding: Implement a C event emitter and a Go binding that supports multiple listeners. The C library emits events on a background thread and must callback into Go through a CGO-exported function. Expose in C: typedef void (*event_cb)(int event, const char* message, void* ctx); void register_event_listener(event_cb cb, void* ctx); void unregister_event_listener(void* ctx); The Go binding should expose StartListener() (returns a receive-only channel of events: type Event struct { Event int; Message string }) and StopListener() to unregister. Demonstrate two listeners started concurrently and printing events. Provide a header, a minimal C implementation, the Go binding, and a small program?",
+        "id": "cgoa-q-5",
+        "questionId": "q-21971",
+        "question": "Design a CGOA wrapper for a C streaming block detector API. C API: void* detector_create(int mode); int detector_feed(void* ctx, const void* data, size_t len); int detector_finish(void* ctx, char** out_json); void detector_free(void* ctx); The detector outputs a malloc-allocated JSON: [{\\\"block_index\\\":0, \\\"start\\\":0, \\\"length\\\":128, \\\"checksum\\\":\\\"...\\\"}, ...]. Provide header, a minimal C implementation, a Go binding exposing Detector with methods Feed([]byte) error and Close() (string, error), and a Go program that streams a large file in chunks to a pool of detectors handling memory ownership and error propagation?",
         "type": "single",
         "options": [
           {
             "id": "a",
             "text": "Use an opaque C context per detector. Go binds CreateDetector(mode) returning *Detector with Feed([]byte) error and Close() (string, error). Feed passes chunks via detector_feed; Close calls detector_",
-            "isCorrect": false
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Each Searcher owns its own C ctx. NewSearcher calls init to allocate, Update feeds chunks via search_update, collecting bytes into a Go buffer, Final calls search_final and then frees the ctx. Go code",
+            "text": "Implement a CGO wrapper for a C function that uses thread_local storage for a per-thread transform cache. The C API is `void transform_tls(const uint8_t* in, size_t n, uint8_t* out, size_t* out_n)`. Expose Go function `…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "## CGO Wrapper for C Streaming API with Callback-Driven Design ### C Header and Implementation ```c // stream_processor.h #ifndef STREAM_PROCESSOR_H #define STREAM_PROCESSOR_H #include <stdlib.h> typedef struct { char*…",
+            "text": "Explain how you'd implement a CGOA wrapper for verify_signatures using a bounded worker pool. Pass blocks and signatures to C, receive malloc-allocated JSON, convert to Go string, and free memory via",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a per-listener context handle stored in a Go-backed map, pass the handle as ctx from Go to C, implement a CGO-exported Go callback, and call it with event and message. C side runs a background thr",
-            "isCorrect": true
+            "text": "Serialize CGO calls with a mutex, copy the C message to Go, free the C result, and return meaningful errors when nil or code != 0. Pass query as C string and free it. Ensure no Go pointers escape into",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests practical CGOA wiring with callbacks, thread safety, and per-listener lifetimes, not just simple wrappers.\n\n## Key Concepts\n- CGO callbacks and //export usage\n- Passing a Go-visible context to C without raw Go pointers\n- Thread safety and runtime constraints when C calls Go\n- Cleanup/unregister patterns and backpressure considerations\n\n## Code Example\n```c\n// evt.h\ntypedef void (*event_cb)(int event, const char* message, void* ctx);\nvoid register_event_listener(event_cb cb, void* ctx);\nvoid unregister_event_listener(void* ctx);\n```\n```c\n// evt.c (minimal emitter)\n#include <pthread.h>\n#include <unistd.h>\n#include <stdlib.h>\n#include \"evt.h\"\n\nstatic struct { event_cb cb; void* ctx; } listeners[16];\nstatic int n=0; static pthread_t t;\nstatic int run=1;\nvoid* emitter(void*){ int i=0; while(run){ sleep(1); for(int k=0;k<n;k++) listeners[k].cb(i, \"msg\", listeners[k].ctx); i++; } return NULL; }\nvoid register_event_listener(event_cb cb, void* ctx){ if(n<16){ listeners[n++]={cb,ctx}; if(n==1) pthread_create(&t, NULL, emitter, NULL); }}\nvoid unregister_event_listener(void* ctx){ for(int i=0;i<n;i++) if(listeners[i].ctx==ctx){ for(int j=i;j<n-1;j++) listeners[j]=listeners[j+1]; n--; break;} if(n==0) run=0; }\n```\n```go\n// evt.go\npackage main\n/*\n#include \"evt.h\"\n*/\nimport \"C\"\nimport (\n  \"sync\"\n  \"unsafe\"\n)\n\ntype Event struct{ Event int; Message string }\n\nvar listeners sync.Map // ctx -> chan Event\n\n//export goEventCallback\nfunc goEventCallback(event C.int, msg *C.char, ctx unsafe.Pointer) {\n  if v,ok := listeners.Load(ctx); ok {\n    ch := v.(chan Event)\n    ch <- Event{int(event), C.GoString(msg)}\n  }\n}\n\nfunc StartListener() chan Event {\n  ch := make(chan Event, 8)\n  // In a real implementation, generate a unique ctx per listener and pass it to C\n  ctx := unsafe.Pointer(uintptr(new(int)))\n  listeners.Store(ctx, ch)\n  C.register_event_listener((C.event_cb)(C.goEventCallback), ctx)\n  return ch\n}\n\nfunc StopListener(ctx unsafe.Pointer) { C.unregister_event_listener(ctx) }\n```\n\n## Follow-up Questions\n- How would you scale listener counts and ensure cleanup when goroutines terminate?\n- How would you handle events that produce backpressure or long-running messages?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nThis tests CGO ergonomics for opaque C handles, streaming data, and cross-language memory ownership. It also probes error propagation across Go/C boundaries and resource lifecycle in a concurrent setting.\n\n## Key Concepts\n- CGO and opaque pointers\n- Streaming state across calls\n- Memory ownership and malloc/free semantics\n- Concurrency and pool management\n- Error propagation and testing for leaks\n\n## Code Example\n```c\n// header sketch\nvoid* detector_create(int mode);\nint detector_feed(void* ctx, const void* data, size_t len);\nint detector_finish(void* ctx, char** out_json);\nvoid detector_free(void* ctx);\n```\n```\n\n## Follow-up Questions\n- How would you ensure detector_free runs on all error paths?\n- How would you test for memory leaks across many detectors?\n- How would you extend to support dynamic mode changes at runtime?\n```",
+        "difficulty": "advanced"
       },
       {
-        "id": "cgoa-q-4",
-        "questionId": "q-8758",
-        "question": "Implement a CGOA wrapper for a C library function that, given a key string, returns a heap-allocated JSON record: const char* get_json_record(const char* key, int* err); The function returns NULL on error; The Go binding should expose: func GetJSONRecord(key string) (string, error). Ensure that the C-allocated string is freed after conversion. Demonstrate concurrency by launching two goroutines calling GetJSONRecord concurrently. Include a C header, a minimal C implementation, the Go binding, and a small program that runs in parallel?",
+        "id": "cgoa-q-6",
+        "questionId": "q-4860",
+        "question": "CGOA wrapper: given a C API\n\nvoid process_buffer(const uint8_t* in, size_t in_len, void (*chunk_cb)(const uint8_t* chunk, size_t len, void* user), void* user);\n\nThe function processes the input buffer and emits encrypted chunks via chunk_cb. Implement a CGOA wrapper in Go that exposes:\n\nfunc ProcessBuffer(in []byte) (<-chan []byte, func())\n\n- The function starts processing synchronously in a goroutine; chunks are copied into Go slices and sent on the channel; a cancel function terminates processing and frees resources.\n\nProvide a C header, a minimal C implementation, the Go binding, and a small Go program that runs two concurrent ProcessBuffer calls on different inputs?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Call validate_ints via CGO, allocate a C int array from data, pass it and n, receive a malloc-allocated JSON string, copy it with C.GoString, then free the C buffer. Expose Go: func ValidateInts(data",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "To implement this, use CGO with //export to route chunk_cb into Go, copy each C chunk into a Go slice, and send on a channel. Store the Go channel in a cgo.Handle to keep it alive, and provide a cance",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a C header and minimal implementation for process_blocks_async. Pass blocks as an array of pointers and lengths from Go via CGO, and bridge the callback into Go using an exported Go callback function that send…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use runtime/cgo.Handle to pass a Go channel as a stable context into C. The C callback allocates JSON with malloc; the bridge copies it to a Go string, frees the C allocation with free, and pushes to",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests CGOA callback lifecycle, memory ownership, and safe cross-language concurrency without leaks.\n\n## Key Concepts\n- CGO callbacks from C to Go using //export\n- Managing Go values across C with cgo.Handle\n- Channel-based streaming and cancellation safety\n\n## Code Example\n```go\n// Skeleton: start, receive chunks, cancel\n```\n\n## Follow-up Questions\n- How would you handle errors reported via the C callback and propagate them on the Go side?\n- What cleanup guarantees would you add for repeated ProcessBuffer calls in a long-running process?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "cgoa-q-7",
+        "questionId": "q-27627",
+        "question": "Design a CGOA wrapper for a C histogram library. The C API is: int histogram(const double* data, size_t n, unsigned int bins, unsigned int** counts, double** edges); The function allocates memory for counts (bins) and edges (bins+1) using malloc and returns 0 on success or non-zero on error. Provide: 1) header and minimal C implementation plus a free_histogram function to release memory; 2) a Go binding exposing ComputeHistogram(data []float64, bins int) (Histogram, error) where\n\ntype Histogram struct {\n  Counts []uint32\n  Edges  []float64\n}\n\nThe binding must copy the C data into Go slices and properly free the C memory; 3) a Go program that runs two goroutines concurrently on different datasets and prints histogram results. Demonstrate memory ownership transfer and race-free access?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Bridge CGO and C via a trampoline: implement a C progress_cb that calls back into Go using a Go-exported function, and pass a Go closure through a cgo.Handle stored in the user pointer. In RunTaskWith",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a C wrapper that allocates counts and edges, and expose free_histogram. In Go, call histogram, copy into Go slices, then free via free_histogram. Create a small program that starts two gorou",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Safely bridge C and Go by copying each chunk, exporting a C callback (//export) and running the stream on its own thread; use a Go channel per stream and a cancel function to signal termination. Manag",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a CGO wrapper for a C function that uses thread_local storage for a per-thread transform cache. The C API is `void transform_tls(const uint8_t* in, size_t n, uint8_t* out, size_t* out_n)`. Expose Go function `…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests CGO memory ownership, cross-language data transfer, and safe concurrency with a real C API that allocates memory.\n\n## Key Concepts\n- Ownership transfer from C to Go\n- Copying vs zero-copy boundaries\n- Proper freeing of C-allocated memory\n- Concurrency: multiple CGO calls in parallel\n\n## Code Example\n```c\n// header.h\nint histogram(const double* data, size_t n, unsigned int bins, unsigned int** counts, double** edges);\nvoid free_histogram(unsigned int* counts, double* edges);\n```\n```c\n// impl.c\n#include <stdlib.h>\n#include \"header.h\"\n\nint histogram(const double* data, size_t n, unsigned int bins, unsigned int** counts, double** edges) {\n  if (!data || n == 0 || bins == 0) return -1;\n  *counts = (unsigned int*)malloc(bins * sizeof(unsigned int));\n  *edges  = (double*)malloc((bins + 1) * sizeof(double));\n  if (!*counts || !*edges) { free(*counts); free(*edges); return -1; }\n  // simple uniform histogram\n  for (unsigned int i = 0; i < bins; ++i) (*counts)[i] = 0;\n  double minv = data[0], maxv = data[0];\n  for (size_t i = 1; i < n; ++i) { if (data[i] < minv) minv = data[i]; if (data[i] > maxv) maxv = data[i]; }\n  double width = (maxv - minv) / bins;\n  for (unsigned int i = 0; i <= bins; ++i) (*edges)[i] = minv + i * width;\n  for (size_t i = 0; i < n; ++i) {\n    unsigned int idx = (unsigned int)((data[i] - minv) / width);\n    if (idx >= bins) idx = bins - 1;\n    (*counts)[idx]++;\n  }\n  return 0;\n}\n\nvoid free_histogram(unsigned int* counts, double* edges) {\n  free(counts);\n  free(edges);\n}\n```\n```go\n// histogram.go\npackage histogram\n/*\n#include \"header.h\"\n*/\nimport \"C\"\nimport (\n  \"errors\"\n  \"unsafe\"\n)\n\ntype Histogram struct {\n  Counts []uint32\n  Edges  []float64\n}\n\nfunc ComputeHistogram(data []float64, bins int) (Histogram, error) {\n  if len(data) == 0 || bins <= 0 {\n    return Histogram{}, errors.New(\"invalid input\")\n  }\n  var counts *C.uint32_t\n  var edges *C.double\n  // Because Go cannot allocate C memory directly for this pattern, use cgo calls\n  cCounts := (**C.uint32_t)(unsafe.Pointer(&counts))\n  cEdges := ((**C.double)(unsafe.Pointer(&edges)))\n  n := C.size_t(len(data))\n  res := C.histogram((*C.double)(&data[0]), n, C.uint(bins), counts, edges)\n  if res != 0 {\n    return Histogram{}, errors.New(\"histogram failed in C\")\n  }\n  // Copy to Go slices\n  goCounts := make([]uint32, bins)\n  goEdges := make([]float64, bins+1)\n  // Copy memory (unsafe)\n  for i := 0; i < bins; i++ {\n    goCounts[i] = uint32(*(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(counts)) + uintptr(i)*unsafe.Sizeof(uint32(0)))))\n  }\n  for i := 0; i <= bins; i++ {\n    goEdges[i] = *(*float64)(unsafe.Pointer(uintptr(unsafe.Pointer(edges)) + uintptr(i)*unsafe.Sizeof(float64(0))))\n  }\n  C.free_histogram(counts, edges)\n  return Histogram{Counts: goCounts, Edges: goEdges}, nil\n}\n```\n\n## Follow-up Questions\n- How would you handle extremely large datasets where copying to Go becomes a bottleneck?\n- What happens if histogram fails mid-way and partial data was written?\n- How to adapt to 64-bit builds or different allocators?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "cgoa-q-8",
+        "questionId": "q-22577",
+        "question": "Design a CGOA wrapper for a C function that accepts an array of strings and returns a heap-allocated JSON histogram: const char* build_histogram(const char** blocks, size_t n, int max_bins, char** out_json); The function allocates JSON to out_json; the caller must free both out_json and the blocks array. Expose a Go binding BuildHistogram(blocks []string, maxBins int) (string, error). Demonstrate concurrency by launching two independent batches in parallel that each produce their own JSON, ensuring memory is freed correctly?",
         "type": "single",
         "options": [
           {
@@ -139,182 +259,62 @@
           },
           {
             "id": "b",
-            "text": "Strategy: implement a trampoline for C→Go callbacks and a per-task registry. Expose CGO bindings that keep a Go channel for progress; pass a uintptr ctx to C to map to the Go channel. Use //export to",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Wrap the C function with CGO, converting the returned C string with C.GoString and freeing memory with C.free. Use C.CString for the input, ensure errors propagate via int* err, and protect concurrent",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Bridge a C streaming API into Go by exposing ProcessStream(in []byte) (<-chan []byte, func(), error). The wrapper registers a C callback, copies each chunk into a new Go slice, frees the C buffer after copying, and retu…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests memory ownership between C and Go, error propagation, and concurrent usage of a CGO binding.\n\n## Key Concepts\n\n- CGO memory ownership and freeing conventions\n- C string handling with C.GoString and C.free\n- Error propagation through an int* err pattern\n- Safe concurrent calls from multiple goroutines\n\n## Code Example\n\n```c\n// json.h\nconst char* get_json_record(const char* key, int* err);\n```\n\n```c\n// json.c (minimal implementation)\n#include <stdlib.h>\n#include <string.h>\n#include \"json.h\"\n\nconst char* get_json_record(const char* key, int* err){\n  if(!key){ if(err) *err = 1; return NULL; }\n  const char* json = \"{\\\"key\\\":\\\"value\\\"}\";\n  char* buf = (char*)malloc(strlen(json) + 1);\n  if(!buf){ if(err) *err = 2; return NULL; }\n  strcpy(buf, json);\n  if(err) *err = 0;\n  return buf; // caller must free\n}\n```\n\n```go\n// json_bind.go\npackage main\n\n/*\n#include \"json.h\"\n*/\nimport \"C\"\nimport (\n  \"fmt\"\n  \"sync\"\n  \"unsafe\"\n)\n\nfunc GetJSONRecord(key string) (string, error) {\n  ck := C.CString(key)\n  defer C.free(unsafe.Pointer(ck))\n  var err C.int\n  cstr := C.get_json_record(ck, &err)\n  if cstr == nil {\n    return \"\", fmt.Errorf(\"C error %d\", int(err))\n  }\n  s := C.GoString(cstr)\n  C.free(unsafe.Pointer(cstr))\n  return s, nil\n}\n\nfunc main() {\n  var wg sync.WaitGroup\n  wg.Add(2)\n  go func(){ defer wg.Done(); if s, e := GetJSONRecord(\"alpha\"); e == nil { println(s) } }()\n  go func(){ defer wg.Done(); if s, e := GetJSONRecord(\"beta\"); e == nil { println(s) } }()\n  wg.Wait()\n}\n```\n\n## Follow-up Questions\n\n- How would you adapt this for streaming large JSON records without duplicating memory?\n- How would you add timeout handling for CGO calls in Go?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "cgoa-q-5",
-        "questionId": "q-12542",
-        "question": "Design a CGOA-based wrapper for a C event-driven API. The C library exposes:\n- void register_event_cb(void (*cb)(int event_id, const char* message, void* ctx), void* ctx);\n- void emit_event(int event_id, const char* message);\nProvide a Go binding exposing StartEventStream(callback func(Event)) error, where Event is type struct { ID int; Message string }. The wrapper must support multiple concurrent streams, deliver events in a thread-safe manner, manage memory for C-allocated strings, and support clean shutdown. Include a header, a minimal C implementation (allocating messages with malloc and freeing in Go), a Go binding using CGO, and a small Go program that starts 4 streams and prints events?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I'd implement a Go-side registry that maps opaque handles to Go closures, exposed through RegisterCallback(fn func(int, string)) (handle, error) and Unregister(handle). The C side stores the handle and invokes a single…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a CGO wrapper around a C streaming encryption API that yields encrypted chunks through a callback. Provide a header and minimal C wrapper that streams input in blocks, allocates each encrypted chunk with malloc,…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a CGOA bridge using a registry of Go callbacks indexed by a handle. The C side stores a trampoline cb that calls back into Go via a CGO-exported function, routing via a per-handle channel. U",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a CGOA wrapper where C streams per-block patch results via a callback and finalizes with a summary JSON. Key points: header defines the callback type; C impl builds per-block JSON chunks with p",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design a safe cross-language callback bridge, handling lifetime, concurrency, and memory ownership across Go and C.\n\n## Key Concepts\n- CGO callback wiring and trampolines\n- cgo.Handle for passing Go values to C\n- thread-safety and concurrent streams\n- memory ownership: C malloc vs Go GoString + free\n- lifecycle: registration, delivery, and cleanup\n\n## Code Example\n```c\n// Minimal header for the wrapper (example)\nvoid register_event_cb(void (*cb)(int, const char*, void*), void* ctx);\nvoid emit_event(int id, const char* msg);\n```\n```go\n// Go binding skeleton using CGO\npackage main\nimport \"C\"\n//export goEventCallback\nfunc goEventCallback(id C.int, msg *C.char, ctx unsafe.Pointer) {\n  // convert and dispatch to Go callback via handle\n}\n```\n\n## Follow-up Questions\n- How would you handle backpressure if events flood in?\n- How to benchmark throughput and latency of callbacks across CGO?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "cgoa-q-6",
-        "questionId": "q-12159",
-        "question": "CGO Callback Bridge: The C library exposes void start_work(int id, void (*cb)(int progress, void* user), void* user); void stop_work(int id); Implement a Go wrapper StartWork(id int) (<-chan int, error) that returns a channel delivering progress updates from 0-100. Ensure safety when two calls run concurrently, using per-call state and proper cleanup via stop_work when the channel is closed. Provide header, minimal C impl, the CGO binding, and a small Go program that runs two concurrent StartWork calls and prints progress. Build steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "A strong answer explains: create a per-call registry mapping a unique token to a Go channel; pass the token as user data to C; export a Go callback to receive progress and dispatch to the channel; imp",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Create a header with an opaque Session type and three API functions. In Go, wrap as type Session struct{ p *C.Session } and implement CreateSession(config string) (*Session, error), AnalyzeBatch(s *Se",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a CGOA wrapper: allocate C strings for each input, call transform_strings, convert each output C-string to Go, then free both input and output buffers. Ensure out and out_n are interpreted c",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a CGOA binding for a C streaming API that delivers events on a worker thread via a callback with a user context. Expose StartStream() (<-chan Event, func()) where Event mirrors the C struct. Im",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nProbes CGO cross-language callbacks, memory lifecycle, and concurrency safety.\n\n## Key Concepts\n- cgo callbacks and trampolines\n- memory ownership and cleanup\n- per-call isolation for concurrent wrappers\n- thread-safety with maps and mutexes\n\n## Code Example\n```c\n// header\nvoid start_work(int id, void (*cb)(int, void*), void* user);\nvoid stop_work(int id);\n```\n```go\n// Go binding skeleton: registry and exported callback\nimport \"C\"\nvar mu sync.Mutex\nvar reg = map[int]chan int{}\n//export progress_cb\nfunc progress_cb(progress C.int, user unsafe.Pointer) {\n  id := int(uintptr(user))\n  mu.Lock()\n  ch := reg[id]\n  mu.Unlock()\n  if ch != nil {\n    ch <- int(progress)\n  }\n}\n```\n\n## Follow-up Questions\n- How would you handle callback panics in Go?\n- How would you scale to thousands of concurrent wrappers while avoiding registry contention?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "cgoa-q-7",
-        "questionId": "q-3266",
-        "question": "Design a CGOA wrapper for a C library function that formats a message into a pre-allocated buffer: int format_message(const char* name, char* out, size_t out_size); It should return the number of bytes written or -1 on error with errno set to ERANGE when the buffer is too small. Expose a Go binding: func FormatMessage(name string) (string, error) that starts with 128 bytes and auto-resizes to 256, 512, then 1024 on ERANGE. Ensure concurrent calls are safe. Include header, C impl, Go binding, and a small multi-goroutine test?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use C thread-local storage to bind a tls_ctx to every OS thread. TLS is created on first tls_eval call for that thread and destroyed on program exit. In Go, wrap tls_eval via CGO; pin the goroutine to",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement FormatMessage using a resize loop. For size in [128,256,512,1024]: allocate buf, cname := C.CString(name); defer C.free(unsafe.Pointer(cname)); n := C.format_message(cname, (*C.char)(unsafe.",
+            "text": "Implement a Go binding that converts []string to a C array using C.CString for each element, calls build_histogram, copies the returned JSON into a Go string with C.GoString, then properly frees both out_json with C.fre…",
             "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Use a per-stream bridge: allocate a Go channel, register a CGO-exported Go callback, map ctx to a Go struct with the channel and a cancellation flag. The C side calls log_cb on its thread; the callback checks cancellati…",
+            "text": "Each Searcher owns its own C ctx. NewSearcher calls init to allocate, Update feeds chunks via search_update, collecting bytes into a Go buffer, Final calls search_final and then frees the ctx. Go code",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "I would implement a CGOA binding that registers a CGO-exported callback, streams each json_chunk from stream_pca_all into a Go channel, and concatenates into a final JSON. Ownership: on each callback,",
+            "text": "Implement a C function dedup_blocks that hashes each block with a simple FNV-1a, stores first-seen reference per hash, outputs a JSON like [{\"idx\":0,\"duplicate\":false,\"ref_idx\":null},...]. Allocate ou",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests safe CGO buffer management, error propagation via errno, and concurrent invocation patterns.\n\n## Key Concepts\n- CGO memory lifetimes across Go/C boundaries\n- Preallocated buffers and safe Go->C data transfer\n- Handling errno and ERANGE for dynamic resizing\n- Concurrency safety with per-call allocations\n\n## Code Example\n```javascript\n// C header\nint format_message(const char* name, char* out, size_t out_size);\n\n// Minimal C impl (header + body)\n#include <string.h>\n#include <errno.h>\nint format_message(const char* name, char* out, size_t out_size){\n  const char* greet = \"Hello, \";\n  size_t needed = strlen(greet) + strlen(name) + 2; // including '!'\n  if (out_size <= needed) { errno = ERANGE; return -1; }\n  strcpy(out, greet);\n  strcat(out, name);\n  strcat(out, \"!\");\n  return (int)strlen(out);\n}\n```\n\n```javascript\n// Go binding sketch (conceptual)\npackage main\n/*\n#include <stdlib.h>\n#include \"format.h\"\n*/\nimport \"C\"\nimport (\n  \"errors\"\n  \"unsafe\"\n)\n\nfunc FormatMessage(name string) (string, error) {\n  sizes := []int{128, 256, 512, 1024}\n  for _, s := range sizes {\n    buf := make([]byte, s)\n    cname := C.CString(name)\n    defer C.free(unsafe.Pointer(cname))\n    n := C.format_message(cname, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(s))\n    if n >= 0 {\n      return string(buf[:n]), nil\n    }\n    if C.errno != C.ERANGE {\n      return \"\", errors.New(\"format failed\")\n    }\n  }\n  return \"\", errors.New(\"buffer too small\")\n}\n```\n\n## Follow-up Questions\n- How would you handle C errors without errno propagation?  \n- How would you test cancellation and timeouts for concurrent calls?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "cgoa-q-8",
-        "questionId": "q-15695",
-        "question": "Design a CGOA wrapper for a C library that returns a heap-allocated struct containing an int id and a heap-allocated string label: typedef struct { int id; char* label; } item_t; item_t* get_item(int key, int* err); The Go binding should expose GetItem(key int) (Item, error) where Item{ID int; Label string}. Implement memory ownership so that Go copies the label, frees label and the item_t, and handles NULL/err cases. Demonstrate two goroutines calling concurrently?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Call get_item and check for NULL; copy label via C.GoString; assemble a Go Item{ID: int(it->id), Label: C.GoString(it->label)}; free the label and the item (via a C helper) to avoid leaks; return erro",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Bind batch_validate via CGO, pass Go slices to C as a const char*[] without extra copies, allocate out_json in C and convert to Go string, then free memory in Go. Use a worker pool to feed batches, co",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Provide a header and C source implementing compute_stats, returning 0 on success and -1 on error (n==0). In Go, implement ComputeStats(values []int) (int64, float64, error) calling the C function via",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a CGO bridge using a Go callback registry with `runtime·KeepAlive` and `go.Handle` passed to C. Per-block digests copy hex strings into Go memory, with C memory freed immediately after each callback returns. O…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests memory ownership across CGO with a nested malloc, a realistic safe binding pattern, and basic concurrency.\n\n## Key Concepts\n- C memory management vs Go memory model\n- Deep copy vs shallow copy across CGO\n- Error translation and per-call ownership\n\n## Code Example\n```c\n// C header and minimal impl\ntypedef struct { int id; char* label; } item_t;\nitem_t* get_item(int key, int* err);\nvoid free_item(item_t* it);\n```\n\n```go\n// Go binding sketch\nimport \"C\"\ntype Item struct { ID int; Label string }\nfunc GetItem(key int) (Item, error) { /* ... */ }\n```\n\n## Follow-up Questions\n- How would you adapt for UTF-8 labels or multi-language strings?\n- How to test concurrency safety and avoid deadlocks?",
+        "explanation": "## Why This Is Asked\nThis question tests the ability to bridge CGO with non-trivial ownership semantics and handle concurrency safely. It assesses understanding of memory management across the Go/C boundary, which is essential for integrating legacy C libraries with Go codebases.\n\n## Key Concepts\n- **CGO memory ownership**: Properly allocating and freeing memory on both sides of the Go/C boundary\n- **C to Go conversion**: Using C.GoString to convert C strings to Go strings while preserving data\n- **Go to C conversion**: Using C.CString to create C-compatible strings from Go strings\n- **Correct memory freeing**: Using C.free to release C-allocated memory and defer to ensure cleanup\n- **Concurrency safety**: Each goroutine manages its own memory independently, avoiding cross-talk",
         "difficulty": "beginner"
       },
       {
         "id": "cgoa-q-9",
-        "questionId": "q-2011",
-        "question": "Implement a beginner CGO binding that exposes a C API void compute_stats(const double* data, size_t n, double* mean, double* stddev) to Go. Provide a C header, a Go binding using CGO, and a small Go program that launches 4 goroutines, each calling ComputeStats on its own data slice concurrently. Ensure memory safety, zero-copy access where possible, and that data races are avoided. Include explicit build steps?",
+        "questionId": "q-29331",
+        "question": "Design a CGOA wrapper for a C function that transforms a batch of strings. C API: int transform_strings(const char** in, size_t n, char*** out, size_t* out_n, const char* op); out is malloc'ed array of C strings. Implement header and minimal C impl for a fixed operation (eg, uppercase). Provide a Go binding exposing TransformStrings(inputs []string, op string) ([]string, error). Finally, write a Go program that streams strings through a worker pool, collects results, and frees all C-allocated memory?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a CGOA wrapper for a C function that streams per-block features via a callback rather than returning a single JSON string. Provide a header and minimal C impl that calls the callback for each b",
-            "isCorrect": false
+            "text": "Implement a CGOA wrapper: allocate C strings for each input, call transform_strings, convert each output C-string to Go, then free both input and output buffers. Ensure out and out_n are interpreted c",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "To implement this, use CGO with //export to route chunk_cb into Go, copy each C chunk into a Go slice, and send on a channel. Store the Go channel in a cgo.Handle to keep it alive, and provide a cance",
+            "text": "The binding should expose StreamChunks(data []byte, onChunk func(string) error) error; a C header declares stream_process and a CGO callback is exported to Go. The C impl slices data into 64-byte chun",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Bind the C callback into Go by using a uintptr or Go-side handle, copy each incoming block into a Go slice in the callback, and send it on a channel. Ensure the C blocks are not freed until after the",
+            "text": "I would implement a CGO bridge using a Go callback registry with a cgo.Handle, exposing a C trampoline that calls back into Go via an exported function. The C side never hands Go pointers; chunks are",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Bind a C API void compute_stats(const double* data, size_t n, double* mean, double* stddev) to Go via CGO. Use a header and a Go wrapper ComputeStats(data []float64) (mean, stddev float64) that checks",
-            "isCorrect": true
+            "text": "Provide per-hasher C context using hash_init; allocate a unique hash_ctx per Go Hasher; Write calls hash_update; Sum calls hash_finalize and copies the digest; Close frees with hash_free; ensure no sh",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design safe CGO bindings that move data between Go and C, ensure memory safety, and reason about concurrency.\n\n## Key Concepts\n- CGO bindings and header inclusion\n- Memory ownership and avoiding copies\n- Passing slices to C safely with unsafe\n- Concurrency: goroutines calling C functions without races\n- Error handling for empty inputs and C errors\n\n## Code Example\n```c\n#ifndef STATS_H\n#define STATS_H\nvoid compute_stats(const double* data, size_t n, double* mean, double* stddev);\n#endif\n```\n\n```go\npackage cgobind\n\n/*\n#include \"stats.h\"\n*/\nimport \"C\"\nimport (\n  \"unsafe\"\n)\n\nfunc ComputeStats(data []float64) (mean, stddev float64) {\n  if len(data) == 0 {\n    return 0, 0\n  }\n  var cMean, cStddev C.double\n  ptr := (*C.double)(unsafe.Pointer(&data[0]))\n  C.compute_stats(ptr, C.size_t(len(data)), &cMean, &cStddev)\n  return float64(cMean), float64(cStddev)\n}\n```\n\n## Follow-up Questions\n- How would you adapt for non-contiguous data or different memory layouts?\n- What about error propagation if the C function encounters NaN values?",
+        "explanation": "## Why This Is Asked\nTests memory ownership across Go and C, CGO boundaries, and concurrency with batch results.\n\n## Key Concepts\n- CGO string ownership and freeing\n- Passing const char to C\n- Interpreting out_n and freeing the memory allocated by malloc\n- Worker pools and batch memory lifecycle\n\n## Code Example\n```c\n// header\nint transform_strings(const char** in, size_t n, char*** out, size_t* out_n, const char* op);\n```\n\n```c\n// minimal impl (uppercase path)\nint transform_strings(const char** in, size_t n, char*** out, size_t* out_n, const char* op){\n  if(!in||!out||!out_n) return -1;\n  *out_n = n;\n  *out = (char**)malloc(n*sizeof(char*));\n  for(size_t i=0;i<n;i++){\n    const char* s = in[i];\n    size_t len = strlen(s);\n    char* t = (char*)malloc(len+1);\n    for(size_t j=0;j<len;j++) t[j] = (char)toupper((unsigned char)s[j]);\n    t[len]='\\0';\n    (*out)[i]=t;\n  }\n  return 0;\n}\n```\n\n```go\n// binding sketch (Go) - not full code here\n```\n\n## Follow-up Questions\n- How would you handle errors inside C and propagate to Go?\n- How to support arbitrary batch sizes without allocating too much memory?",
         "difficulty": "beginner"
       },
       {
         "id": "cgoa-q-10",
-        "questionId": "q-21847",
-        "question": "Design a CGOA wrapper for a C function that hashes a byte buffer and returns a heap-allocated hex string. The C API is: const char* hash_buffer(const unsigned char* data, size_t len, int* err); It should allocate a 16-hex-digit string and set err on failure. Provide: a C header, a minimal C implementation, a Go binding exposing GetBufferHash(data []byte) (string, error), and a small Go program that computes two buffers concurrently to demonstrate thread-safety and memory ownership?",
+        "questionId": "q-16358",
+        "question": "Design a CGOA wrapper for a C library implementing a low-latency in-memory key-value store with optional disk-backed snapshots. The C API is:\n- int kv_store_open(const char* path, void** handle);\n- int kv_store_put(void* handle, const char* key, const char* value);\n- int kv_store_get(void* handle, const char* key, char** out_value_json);\n- int kv_store_close(void* handle);\nProvide a header, a minimal C implementation (using malloc for out_value_json), a Go binding exposing OpenKV(path string) (KVStore, error), Put(key, value string) error, Get(key string) (string, error), and Close() error, plus a Go worker pool that processes batches of operations concurrently. Ensure memory ownership, error reporting, and thread-safety across CGO boundaries?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Register a C callback from Go, map a unique id to a Go channel, and have a tiny C wrapper forward data to that id. Copy data into a Go byte slice before enqueue to a worker pool; ensure stop_streaming",
+            "text": "The wrapper must copy the fields into a Go Item: Id from C.id, Score from C.score, Label := C.GoString(C.label); then free C.label with free_item and free_item itself. Expose CreateItem(seed int) (Ite",
             "isCorrect": false
           },
           {
@@ -324,292 +324,52 @@
           },
           {
             "id": "c",
-            "text": "Bind the C function via CGO, declare the C function, call hash_buffer, copy the result with C.GoString, and free the C buffer with C.free. Validate err and NULL returns, handle empty input as empty ha",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Adopt a Go CGO bridge that stores a Go callback in a map and passes a stable handle to C (via a cgo.Handle) instead of Go pointers. For each row, allocate a small C buffer, copy the row, invoke the C",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\\nThis question tests memory ownership across Go/C, error propagation across CGO, and safe concurrency of bindings.\\n\\n## Key Concepts\\n- CGO memory management across language boundaries\\n- Error propagation across C/Go boundaries\\n- Thread safety and absence of global state in bindings\\n\\n## Code Example\\n(Provide a header, C implementation, Go binding, and a small Go program in your repo)\\n\\n## Follow-up Questions\\n- How would you adapt this to support streaming data and incremental hashing?\\n- How do you test concurrency safety and memory leaks in the wrapper?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "cgoa-q-11",
-        "questionId": "q-15142",
-        "question": "Design a CGOA wrapper for a C library exposing void process_stream(const double* in, size_t n, void (*cb)(const char* json, size_t len, int status, void* ctx), void* ctx). Provide a Go binding StartStream(chunks) (<-chan string, <-chan error) that queues each chunk to C, uses a callback to deliver a malloc-allocated JSON back to Go, and frees memory after copy. Include a header, a minimal C implementation (JSON via malloc), and a Go main showing two chunks in parallel?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use runtime/cgo.Handle to pass a Go channel as a stable context into C. The C callback allocates JSON with malloc; the bridge copies it to a Go string, frees the C allocation with free, and pushes to",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement a CGOA wrapper for a C streaming API with the signature `stream_open(url, on_block, user, handle_out)` and `void stream_close(void* handle)`, where `on_block` is invoked off a C worker thread per block. Provid…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a CGOA wrapper for an opaque C KVStore with concurrent access. Go type Store { cstore *C.KVStore }; Implement Put and Get that call kv_put and kv_get; if found, copy with C.GoString and free wi",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Per-stream context is passed to start_audio_stream. In the C callback, copy data with C.GoBytes, then free the C buffer; push the copy to the Go channel. The wrapper returns a cancel function that cal",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design safe cross-language async bridges, memory ownership, and robust error handling across CGO boundaries.\n\n## Key Concepts\n\n- CGO callbacks and bridge patterns\n- runtime/cgo.Handle for passing Go values to C safely\n- malloc/free memory ownership across language boundaries\n- concurrent streaming, per-chunk state, and cancellation\n\n## Code Example\n\n```javascript\n// Pseudo: bridging skeleton (Go + C)\n```\n\n## Follow-up Questions\n\n- How would you extend to multiple independent streams with per-stream backpressure?\n- How would you instrument for leak detection and race conditions in this wrapper?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "cgoa-q-12",
-        "questionId": "q-29676",
-        "question": "Design a CGOA wrapper for a C function that verifies a batch of digital signatures using a hardware crypto engine. C API: int verify_signatures(const uint8_t** blocks, size_t n, const uint8_t** signatures, const size_t* sig_lens, char** out_json); The function returns a JSON array like [{\\\"idx\\\":0,\\\"valid\\\":true,\\\"signer\\\":\\\"A\\\",\\\"latency_ms\\\":123.4},...], allocated with malloc and freed by the caller. Provide: 1) a header and minimal C impl; 2) a Go binding exposing VerifySignatures(blocks [][]byte, signatures [][]byte) (string, error) via CGO; and 3) a Go program that streams blocks with their signatures through a worker pool, collecting per-entry results and a batch SHA-256 over the per-entry validity, with proper memory ownership and error propagation?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implementation strategy: use a trampoline callback in Go (//export) to push JSON into a Go channel; C allocates json with malloc and Go frees it after consumption. Bindings expose StreamBlocks(blocks",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a C/Go wrapper for a C function that verifies a batch of digital signatures using a hardware crypto engine. **C API:** ```c int verify_signatures(const uint8_t** blocks, size_t n, const uint8_t** signatures, cons…",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Create a header with an opaque Session type and three API functions. In Go, wrap as type Session struct{ p *C.Session } and implement CreateSession(config string) (*Session, error), AnalyzeBatch(s *Se",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Describe wrapping a C streaming API with CGO: use a Go handle as the user context, pass it to start_stream, export a Go callback that copies each chunk to a new Go slice and sends it on a channel, and",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question tests CGO boundary handling, memory ownership across Go and C, and streaming design with per-entry metrics.\n\n## Key Concepts\n- CGO memory ownership between Go and C\n- Translating Go slices to C arrays safely\n- Error propagation from C to Go\n- Streaming worker pool with per-entry metrics and a final batch digest\n\n## Code Example\n```c\n// header\nint verify_signatures(const uint8_t** blocks, size_t n, const uint8_t** signatures, const size_t* sig_lens, char** out_json);\n```\n\n## Follow-up Questions\n- How would you test for memory leaks across many batches?\n- How would you handle partial failures within a batch?\n- How would you pipeline this with concurrent hardware engines?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "cgoa-q-13",
-        "questionId": "q-4653",
-        "question": "Design a CGOA wrapper for a C library that provides asynchronous computation via a callback: void compute_async(const uint8_t* data, size_t n, void (*cb)(const uint8_t* result, size_t m, void* user), void* user); Expose a Go API ComputeAsync(src []byte) (<-chan []byte, <-chan error) that streams results back via channel; implement memory safety, cancellation, and cross-GO thread-safety; include a header, minimal C wrapper, Go binding, and a small program that runs ComputeAsync in two goroutines concurrently?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a CGO-exported trampoline callback and a Go channel per call. Allocate a cgo.Handle for a Go channel, pass a C function that sends chunks back via the channel, and free on completion. Use runtime.",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "CGO with a per-task context maps to the Go channel. The C side allocates json via malloc; the cb copies it to a Go string with C.GoString, forwards it to Go via an exported function, then frees json.",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Provide a CGO wrapper around an opaque CryptoContext handle: create_context allocates a C context, sign returns a malloc'd signature, and destroy_context frees the context. In Go, wrap the handle in a",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Call fetch_user with a user_id, two output pointers and their lengths. If ret != 0 return an error. Copy buffers with C.GoStringN(cName, C.int(nameLen)), and C.GoStringN(cEmail, C.int(emailLen)). Free",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests understanding of cross-language async callbacks, CGO safety, and memory management. It also probes how to map C callbacks to Go channels and how to cancel/cleanup.\n\n## Key Concepts\n- CGO callback handling and cgo.Handle\n- Memory ownership across C-Go boundary\n- Concurrency isolation and cancellation\n- Runtime considerations (GOMAXPROCS, CGO thread affinity)\n\n## Code Example\n```c\n// header\nvoid compute_async(const uint8_t* data, size_t n, void (*cb)(const uint8_t* result, size_t m, void* user), void* user);\n```\n```go\n// binding sketch\nfunc ComputeAsync(src []byte) (<-chan []byte, <-chan error) { /* ... */ }\n```\n\n## Follow-up Questions\n- How would you implement cancellation? \n- How do you test memory safety across calls?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "cgoa-q-14",
-        "questionId": "q-13677",
-        "question": "Design a CGOA wrapper for a C API that fills a caller-provided output buffer with a reversed version of an input string:\n\nsize_t reverse_string(const char* input, char* output, size_t max_len);\n\nIt writes at most max_len-1 chars, NUL-terminates, and returns the number of bytes written (excluding NUL). Expose Go: func ReverseGo(s string) (string, error) that allocates an output buffer, calls reverse_string, and returns the reversed string. Demonstrate two goroutines in parallel with different inputs. Include C header, a minimal C implementation, the Go binding, and a small test program?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a CGOA wrapper: Go passes blocks to C as a pointer array, calls hash_batch, which uses accelerator_hash_batch when available or a software SHA-256 path otherwise. hash_batch returns a malloc",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "To implement a CGOA wrapper, create a C header declaring start_stream and a callback type; write a small C shim that forwards each chunk to a Go-exported function, ensuring the Go callback owns the da",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement a CGOA bridge using a registry of Go callbacks indexed by a handle. The C side stores a trampoline cb that calls back into Go via a CGO-exported function, routing via a per-handle channel. U",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "To solve it, implement reverse_string to write into a provided buffer and return written length; in Go, allocate a buffer of len(s)+1, pass its pointer via CGO, then slice to the written length and co",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests memory ownership across CGO, pre-allocated buffers, and concurrent calls—common in real bindings.\n\n## Key Concepts\n- Buffer ownership between Go and C\n- CGO pointer passing and slicing of results\n- Concurrency safety with shared C code\n- Correct NUL handling and length reporting\n\n## Code Example\n```javascript\n// C header (reverse_string.h)\nsize_t reverse_string(const char* input, char* output, size_t max_len);\n```\n```javascript\n// Minimal C implementation (reverse_string.c)\n#include <string.h>\n#include <stddef.h>\n\nsize_t reverse_string(const char* input, char* output, size_t max_len) {\n  size_t len = strlen(input);\n  if (len >= max_len) len = max_len - 1;\n  for (size_t i = 0; i < len; ++i) {\n    output[i] = input[len - 1 - i];\n  }\n  output[len] = '\\0';\n  return len;\n}\n```\n```javascript\n// Go binding (cgobinding.go)\npackage main\n/*\n#include <stdlib.h>\n#include \"reverse_string.h\"\n*/\nimport \"C\"\nimport (\n  \"fmt\"\n  \"unsafe\"\n)\n\nfunc ReverseGo(s string) (string, error) {\n  in := C.CString(s)\n  defer C.free(unsafe.Pointer(in))\n  buf := make([]byte, len(s)+1)\n  written := C.reverse_string(in, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))\n  if int(written) < 0 {\n    return \"\", fmt.Errorf(\"reverse failed\")\n  }\n  return string(buf[:written]), nil\n}\n```\n```javascript\n// Test program (main.go)\npackage main\nimport (\n  \"fmt\"\n  \"sync\"\n)\nfunc main() {\n  var wg sync.WaitGroup\n  inputs := []string{\"abcdef\", \"12345\"}\n  for _, s := range inputs {\n    wg.Add(1)\n    go func(str string) {\n      defer wg.Done()\n      res, err := ReverseGo(str)\n      if err != nil {\n        fmt.Println(\"err:\", err)\n        return\n      }\n      fmt.Println(\"in:\", str, \"out:\", res)\n    }(s)\n  }\n  wg.Wait()\n}\n```\n\n## Follow-up Questions\n- How would you add bounds checking for extremely long inputs? \n- How would you adapt for non-ASCII inputs and ensure no data loss while converting between C and Go?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "cgoa-q-15",
-        "questionId": "q-9345",
-        "question": "CGOA Binding: Implement a CGO wrapper for a C function that uses thread_local storage for a per-thread transform cache. The C API is void transform_tls(const uint8_t* in, size_t n, uint8_t* out, size_t* out_n). Expose Go function TransformTLS(src []byte) ([]byte) that can be safely called from multiple goroutines. Provide a header, a minimal TLS-enabled C implementation, the Go binding, and a small program with two concurrent calls. Include build steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Explain how to model the streaming API in CGO: create a Go-visible StreamHandle that wraps a pointer to the C parser's internal state. Expose StartCSVStream(schema []string) (StreamHandle, error) to initialize the parse…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a CGOA wrapper that exposes ProcessBlocksWithProgress to Go. The C wrapper accepts an array of blocks and a progress callback; in Go, pass a callback that writes to a channel, spawn a worker",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Bridge CGO callbacks by exporting a C trampoline that calls back into Go using a stable handle. Pass a Go context or cancel channel as the ctx. On cancel, signal C wrapper via an atomic flag to abort.",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a CGO wrapper for a C function that uses thread_local storage for a per-thread transform cache. The C API is `void transform_tls(const uint8_t* in, size_t n, uint8_t* out, size_t* out_n)`. Expose Go function `…",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design CGO bindings around C thread-local storage and concurrent Go usage, focusing on memory management, error handling, and avoiding data races.\n\n## Key Concepts\n\n- C11 thread_local per-thread state\n- CGO memory ownership\n- Go concurrency with goroutines\n- Boundary checks and error propagation\n\n## Code Example\n\n```c\n// tls.h\n#ifndef TLS_H\n#define TLS_H\n#include <stddef.h>\n#include <stdint.h>\nvoid transform_tls(const uint8_t* in, size_t n, uint8_t* out, size_t* out_n);\n#endif\n```\n\n```c\n// tls.c\n#include \"tls.h\"\n#include <stdlib.h>\nstatic thread_local uint8_t* cache = NULL;\nstatic thread_local size_t cache_size = 0;\n\nvoid transform_tls(const uint8_t* in, size_t n, uint8_t* out, size_t* out_n) {\n    // Initialize per-thread cache if needed\n    if (cache == NULL || cache_size < n * 2) {\n        free(cache);\n        cache_size = n * 2;\n        cache = malloc(cache_size);\n    }\n    \n    // Example transform: simple byte manipulation\n    for (size_t i = 0; i < n; i++) {\n        cache[i] = in[i] ^ 0xAA;\n    }\n    \n    // Copy to output\n    for (size_t i = 0; i < n; i++) {\n        out[i] = cache[i];\n    }\n    *out_n = n;\n}\n```\n\n```go\n// tls.go\npackage main\n\n/*\n#cgo CFLAGS: -std=c11\n#cgo LDFLAGS: -lpthread\n#include \"tls.h\"\n*/\nimport \"C\"\nimport (\n    \"fmt\"\n    \"sync\"\n    \"unsafe\"\n)\n\nfunc TransformTLS(src []byte) ([]byte, error) {\n    if len(src) == 0 {\n        return nil, nil\n    }\n    \n    out := make([]byte, len(src)*2) // Allocate extra space\n    var outN C.size_t\n    \n    C.transform_tls(\n        (*C.uint8_t)(unsafe.Pointer(&src[0])),\n        C.size_t(len(src)),\n        (*C.uint8_t)(unsafe.Pointer(&out[0])),\n        &outN,\n    )\n    \n    return out[:outN], nil\n}\n\nfunc main() {\n    var wg sync.WaitGroup\n    \n    // Concurrent calls\n    for i := 0; i < 2; i++ {\n        wg.Add(1)\n        go func(id int) {\n            defer wg.Done()\n            data := []byte{byte(id + 1), byte(id + 2), byte(id + 3)}\n            result, err := TransformTLS(data)\n            if err != nil {\n                fmt.Printf(\"Goroutine %d error: %v\\n\", id, err)\n                return\n            }\n            fmt.Printf(\"Goroutine %d: %v -> %v\\n\", id, data, result)\n        }(i)\n    }\n    \n    wg.Wait()\n}\n```\n\n## Build Steps\n\n```bash\n# Compile C code\ngcc -c -std=c11 -fPIC tls.c -o tls.o\n\n# Create static library\nar rcs libtls.a tls.o\n\n# Build Go program\ngo build -o tls_test tls.go libtls.a\n\n# Run\n./tls_test\n```",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "cgoa-q-16",
-        "questionId": "q-4262",
-        "question": "Design a CGOA wrapper for a C event system that streams events on a background thread: \n\nC API:\ntypedef void (*event_cb)(int id, const char* payload, void* user);\nvoid start_events(void);\nvoid stop_events(void);\nvoid register_event_cb(event_cb cb, void* user);\n\nRequirements:\n- In Go, expose func RegisterHandlers(hs []Handler) (cleanup func(), err error) where Handler has id int and Callback func(string)\n- Use cgo.Handle to pass Go callbacks to C safely; ensure callbacks from C invoke the correct Go handler and do not poison GC\n- Support registering multiple independent handlers concurrently; events must route to the right callback; stop_events cleans resources and prevents further callbacks\n- Provide a minimal header and a C implementation that emits events every 50ms on a worker thread\n- Provide a Go binding and a small program that registers three handlers, prints received payloads, then calls the cleanup when done\n- Discuss lifecycle and CGO threading caveats?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Propose a CGO wrapper that uses a C function to register a stream callback, with a Go channel wrapped by a cgo.Handle as the ctx. A single C callback pushes values into the Go channel via an exported",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Call C.compute_stats with a C array built from data, capture out_json and err_code. On 0, convert json := C.GoString(out_json) and C.free(out_json). On -1, map err_code to an error and return. No shar",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "```c // header.h #ifndef STREAM_WRAPPER_H #define STREAM_WRAPPER_H #include <stddef.h> #include <stdint.h> typedef void (*chunk_callback_t)(const char* json, void* ctx); void start_streaming( const uint8_t* data, size_t…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a CGOA wrapper that stores Go callbacks in a sync.Map and passes a cgo.Handle integer as the user pointer to the C callback. The C side emits events on a thread and calls back through an exported",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to bridge Go and C via CGO under concurrency, including safe callback invocation from C threads, memory management, and lifecycle cleanup. Emphasizes correct use of cgo.Handle and avoiding Go GC pitfalls.\n\n## Key Concepts\n- CGO thread safety and Go callback lifetimes\n- cgo.Handle usage to pass Go values to C\n- Concurrency: multiple independent handlers, event routing\n- Cleanup: unregister, stop C thread, prevent use-after-free\n\n## Code Example\n```c\n// header: event_api.h\ntypedef void (*event_cb)(int id, const char* payload, void* user);\nvoid start_events(void);\nvoid stop_events(void);\nvoid register_event_cb(event_cb cb, void* user);\n```\n```go\n// binding.go (simplified)\npackage eventapi\n\nimport \"C\"\n\n//export goEventHandler\nfunc goEventHandler(id C.int, payload *C.char, user unsafe.Pointer) {\n    // dispatch using the handle stored in user\n}\n```\n\n## Follow-up Questions\n- How would you handle backpressure if event rate overwhelms Go side?\n- What are potential deadlocks with stop_events and in-flight callbacks, and how to mitigate them?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "cgoa-q-17",
-        "questionId": "q-1815",
-        "question": "Design and implement a CGOA bridge for a C streaming library that emits integers via a callback. Expose a Go API StartStream() (<-chan int, func Stop()) using cgo.Handle to pass the Go-side context. Ensure thread-safe delivery of values to Go, proper cleanup with finalizers, and robust error reporting across the boundary. Provide C header, Go binding, and a minimal caller?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "In CGO you cannot pass Go function pointers to C; instead export a Go callback and route through a stable C shim. Use a Go handle (via cgohandle) to store the Go callback per stream, pass the opaque h",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Propose a CGO wrapper that uses a C function to register a stream callback, with a Go channel wrapped by a cgo.Handle as the ctx. A single C callback pushes values into the Go channel via an exported",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
             "text": "Implement a CGOA wrapper that registers a Go callback and allows C to invoke it from multiple threads. Use a go/cgo handle to pass a Go function through a void* to C, export a Go bridge function, and synchronize access…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Serialize CGO calls with a mutex, copy the C message to Go, free the C result, and return meaningful errors when nil or code != 0. Pass query as C string and free it. Ensure no Go pointers escape into",
-            "isCorrect": false
+            "text": "OpenKV(path string) opens the store and stores the returned C handle. Put(key, value string) error converts both key and value to C strings, calls kv_store_put, then frees the temporary C strings. Get(key string) (strin…",
+            "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to bridge Go and C safely in a streaming, callback-driven API, including memory ownership, callbacks from C into Go, and lifecycle handling.\n\n## Key Concepts\n- CGO and cgo.Handle usage\n- Cross-language callbacks and goroutine scheduling\n- Memory ownership and finalizers\n- Error handling across language boundaries\n\n## Code Example\n```c\ntypedef void (*cb_t)(int value, void* ctx);\nvoid register_stream(cb_t cb, void* ctx);\nvoid start_stream();\nvoid stop_stream();\n```\n```go\n// CGO binding sketch\npackage main\n/*\n#include <stdint.h>\n#include \"stream.h\"\nstatic void go_cb(int v, void* ctx);\n*/\nimport \"C\"\nimport (\n  \"runtime\"\n  \"runtime/cgo\"\n)\n\n//export go_cb\nfunc go_cb(v C.int, ctx unsafe.Pointer) {\n  // forward to Go channel via stored handle\n}\n\nfunc StartStream() (<-chan int, func()) {\n  // wrap ctx in a handle and start streaming; return stop function\n  ch := make(chan int)\n  h := cgo.NewHandle(ch)\n  // pass h.ptr to C as ctx; set up finalizer to ensure cleanup\n  runtime.SetFinalizer(&ch, func(*chan int) { /* cleanup */ })\n  // start_stream and callback wiring...\n  return ch, func() { /* stop and release handle */ }\n}\n```",
+        "explanation": "## Why This Is Asked\nThis question tests practical CGO memory ownership, error mapping, and thread-safety in a real-world persistent storage scenario.\n\n## Key Concepts\n- CGO memory ownership and malloc/free semantics\n- Error code translation to Go errors\n- Thread-safety across CGO calls using a mutex\n- Go interface design for Open/Put/Get/Close operations\n- Disk-backed snapshots and atomic commits\n\n## Code Example\n```c\n// C header\n#ifndef KV_STORE_H\n#define KV_STORE_H\n\n#include <stdint.h>\n\nint kv_store_open(const char* path, void** handle);\nint kv_store_put(void* handle, const char* key, const char* value);\nint kv_store_get(void* handle, const char* key, char** out_value_json);\nint kv_store_close(void* handle);\n\n#endif // KV_STORE_H\n```\n\n```c\n// C implementation (minimal)\n#include <stdlib.h>\n#include <string.h>\n#include \"kv_store.h\"\n\ntypedef struct {\n    char* data;\n} kv_store_t;\n\nint kv_store_open(const char* path, void** handle) {\n    kv_store_t* store = malloc(sizeof(kv_store_t));\n    if (!store) return -1;\n    store->data = NULL;\n    *handle = store;\n    return 0;\n}\n\nint kv_store_put(void* handle, const char* key, const char* value) {\n    // Minimal implementation\n    return 0;\n}\n\nint kv_store_get(void* handle, const char* key, char** out_value_json) {\n    *out_value_json = malloc(256);\n    if (!*out_value_json) return -1;\n    strcpy(*out_value_json, \"{}\");\n    return 0;\n}\n\nint kv_store_close(void* handle) {\n    free(handle);\n    return 0;\n}\n```\n\n```go\n// Go binding\npackage kvstore\n\n// #include \"kv_store.h\"\n// #include <stdlib.h>\nimport \"C\"\nimport (\n    \"errors\"\n    \"sync\"\n    \"unsafe\"\n)\n\ntype KVStore struct {\n    handle unsafe.Pointer\n    mu     sync.RWMutex\n}\n\nfunc OpenKV(path string) (*KVStore, error) {\n    var handle *C.void\n    cPath := C.CString(path)\n    defer C.free(unsafe.Pointer(cPath))\n\n    ret := C.kv_store_open(cPath, &handle)\n    if ret != 0 {\n        return nil, errors.New(\"failed to open KV store\")\n    }\n    return &KVStore{handle: handle}, nil\n}\n\nfunc (k *KVStore) Put(key, value string) error {\n    k.mu.Lock()\n    defer k.mu.Unlock()\n\n    cKey := C.CString(key)\n    cValue := C.CString(value)\n    defer C.free(unsafe.Pointer(cKey))\n    defer C.free(unsafe.Pointer(cValue))\n\n    ret := C.kv_store_put(k.handle, cKey, cValue)\n    if ret != 0 {\n        return errors.New(\"failed to put value\")\n    }\n    return nil\n}\n\nfunc (k *KVStore) Get(key string) (string, error) {\n    k.mu.RLock()\n    defer k.mu.RUnlock()\n\n    cKey := C.CString(key)\n    defer C.free(unsafe.Pointer(cKey))\n\n    var outValue *C.char\n    ret := C.kv_store_get(k.handle, cKey, &outValue)\n    if ret != 0 {\n        return \"\", errors.New(\"failed to get value\")\n    }\n    defer C.free(unsafe.Pointer(outValue))\n\n    return C.GoString(outValue), nil\n}\n\nfunc (k *KVStore) Close() error {\n    k.mu.Lock()\n    defer k.mu.Unlock()\n\n    ret := C.kv_store_close(k.handle)\n    k.handle = nil\n    if ret != 0 {\n        return errors.New(\"failed to close KV store\")\n    }\n    return nil\n}\n```\n\n```go\n// Worker pool for batch processing\ntype Operation struct {\n    Key   string\n    Value string\n    Op    string // \"put\" or \"get\"\n}\n\ntype WorkerPool struct {\n    workers  int\n    store    *KVStore\n    jobs     chan Operation\n    results  chan string\n    wg       sync.WaitGroup\n}\n\nfunc NewWorkerPool(store *KVStore, workers int) *WorkerPool {\n    return &WorkerPool{\n        store:   store,\n        workers: workers,\n        jobs:    make(chan Operation, 1000),\n        results: make(chan string, 1000),\n    }\n}\n\nfunc (wp *WorkerPool) Start() {\n    for i := 0; i < wp.workers; i++ {\n        wp.wg.Add(1)\n        go func() {\n            defer wp.wg.Done()\n            for op := range wp.jobs {\n                var result string\n                var err error\n                switch op.Op {\n                case \"put\":\n                    err = wp.store.Put(op.Key, op.Value)\n                case \"get\":\n                    result, err = wp.store.Get(op.Key)\n                }\n                if err == nil {\n                    wp.results <- result\n                }\n            }\n        }()\n    }\n}\n\nfunc (wp *WorkerPool) Submit(op Operation) {\n    wp.jobs <- op\n}\n\nfunc (wp *WorkerPool) Close() {\n    close(wp.jobs)\n    wp.wg.Wait()\n    close(wp.results)\n}\n```\n\n## Critical Considerations\n- **Memory Ownership**: Go allocates C strings via C.CString() and must explicitly free them. C allocates out_value_json via malloc, so Go must call C.free() to prevent leaks.\n- **Thread-Safety**: The mutex protects all CGO calls, as C libraries are typically not thread-safe by default.\n- **Error Handling**: C error codes (non-zero returns) are translated to Go errors for idiomatic error handling.",
         "difficulty": "advanced"
       },
       {
-        "id": "cgoa-q-18",
-        "questionId": "q-6838",
-        "question": "CGOA wrapper: Given a C API that streams frames via a callback:\\n\\nvoid start_stream(void (*frame_cb)(const uint8_t* frame, size_t len, void* user), void* user);\\n\\nEach frame is allocated by the C side (malloc) and must be freed after copying to Go. Design a CGOA wrapper that exposes:\\n\\nfunc StartStream() (<-chan []byte, func())\\n\\n- The channel delivers copies of each frame; StartStream returns a cancellation function to stop streaming and free resources. Implement header, a minimal C implementation, the Go binding using //export to route callback to Go with a go.Handle mapping, and a small Go program that starts two streams in parallel and reports frame counts. Include build steps?",
+        "id": "cgoa-q-11",
+        "questionId": "q-26357",
+        "question": "Design a CGOA wrapper for a C function that verifies a batch of cryptographic signatures on streaming blocks. The C API should be: int verify_blocks(const uint8_t** blocks, const size_t* block_lens, size_t n, const uint8_t* public_key, size_t pubk_len, char** out_json); The function returns a JSON array like: [{\"idx\":0,\"valid\":true},{\"idx\":1,\"valid\":false},...], allocated with malloc. Provide: 1) a header and a minimal C implementation; 2) a Go binding exposing VerifyBlocks(blocks [][]byte, publicKey []byte) (string, error) via CGO; and 3) a Go program that streams blocks to worker pool, collects per-block validity, and computes a batch SHA-256 over the concatenated per-block validity flags, ensuring memory ownership and error propagation?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a CGOA wrapper for an asynchronous C API that uses a callback. Expose a Go binding that starts an operation and returns a Go channel for payloads and a channel for errors. The C API is: typedef",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use CGO with a Go-exported callback to forward each frame to a Go channel mapped by a per-stream handle. The C side allocates frames (malloc); Go copies len bytes into a new Go slice and calls free on",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use C to own the allocated memory and expose two symbols: generate_seq and free_seq. Go binds via CGO, calling into C to obtain a raw *C.int and later frees it with free_seq. Two goroutines race-safe",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Allocate a fixed-size Go byte slice (e.g., 256). Convert to *C.char via unsafe.Pointer and pass with len; C writes until a NUL or truncates at len-1. After call, extract result by scanning for NUL. Do",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests memory ownership across CGO, callback routing, and channel-based streaming under concurrency.\n\n## Key Concepts\n- CGO callbacks via //export\n- go.Handle mapping and thread-safety\n- Memory ownership: malloc vs free across Go boundary\n- Cancellation and resource lifecycle\n\n## Code Example\n```c\n// header: void start_stream(void (*frame_cb)(const uint8_t*, size_t, void*), void* user);\n```\n\n```go\n//go:export frameCallback\nfunc frameCallback(data *C.uint8_t, len C.size_t, user unsafe.Pointer) { /* copy to Go slice and send */ }\n```\n\n## Follow-up Questions\n- How would you handle backpressure if Go consumer lags?\n- How to avoid GC stalls due to large frame copies?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "cgoa-q-19",
-        "questionId": "q-5515",
-        "question": "CGOA Binding: Given a C library with an asynchronous streaming API:\\n\\ntypedef void (*chunk_cb_t)(const uint8_t* chunk, size_t len, void* user);\\nvoid start_stream(void* ctx, chunk_cb_t cb, void* user);\\nvoid stop_stream(void* ctx);\\nunsigned int stream_id(const char* name);\\n\\nDesign a CGOA wrapper that exposes:\\n\\n- A Go function StartStream(name string) (<-chan []byte, func()) which starts the C stream under the hood and sends chunks on the Go channel. Provide a cancel function to stop and free resources.\\n\\n- Ensure safe pointer handling: use a cgo.Handle to store the Go channel reference and pass a pointer to C; ensure each chunk is copied before sending to Go to avoid aliasing after C releases the memory.\\n\\n- Provide a C header and a minimal C implementation; Go binding using //export to route callbacks back to Go; a small Go program that starts two independent streams concurrently and prints the first 4 chunk lengths from each channel.\\n\\nInclude build steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a CGOA wrapper for a C library that streams data asynchronously: start_stream(ctx, chunk_cb, user); stop_stream(ctx). Expose Go API: StartStream(name string) (<-chan []byte, func()). Key: use a",
+            "text": "Design a CGO wrapper for a C function that verifies a batch of cryptographic signatures on streaming blocks. The C API should be: `int verify_blocks(const uint8_t** blocks, const size_t* block_lens, size_t n, const uint…",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Wrapper design for a C streaming API: wrap process_ticks_async using a CGO callback. In C, define a static trampoline function that bridges to a Go-exported function, safely copy TickResult data into Go-owned memory bef…",
+            "text": "Design a Stream wrapper that owns a C handle and a progress channel. Export a C callback with //export to forward progress into Go, using a stable ctx pointer. Guard all Write calls with a mutex; ensu",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "The binding converts Go Config to a C Config, calls compute with &ccfg, writes results into a Go Result, and maps nonzero return codes to errors. No heap allocations are required; use stack-allocated",
+            "text": "Design a CGO wrapper for a C function that processes an input array of images and returns per-image feature vectors plus a batch-level JSON summary. **C API:** ```c int extract_image_features(const uint8_t** images, siz…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design a CGOA wrapper for a C function that scales a data buffer in place: void transform_inplace(double* data, size_t n, double scale); The Go binding should expose TransformInPlace(data []float64, s",
+            "text": "Design a CGOA binding for a C streaming decompressor that processes input in chunks and reports progress via a Go callback. Provide a C header with decompress_chunk(..., void (*progress)(size_t, void*",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\\nTests bridging C callbacks to Go channels, memory ownership, and cancellation lifecycles in CGO with concurrency.\\n\\n## Key Concepts\\n- cgo callback bridging and handle management\\n- memory safety across Go/C boundaries\\n- resource lifecycle and cancellation semantics\\n- thread safety between Go and C\\n\\n## Code Example\\n```go\\n// Sample scaffold showing the callback bridge (illustrative)\\npackage main\\nimport \\\"C\\\"\\nimport (\\n  \\\"unsafe\\\"\\n)\\n//export chunkCallback\\nfunc chunkCallback(user unsafe.Pointer, chunk *C.uint8_t, len C.size_t) {\\n  // retrieve channel, copy data, push to Go channel\\n}\\n```\\n\\n## Follow-up Questions\\n- How would you prevent GC from collecting the channel while streams run?\\n- How would you handle backpressure if the channel is slow?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Question Is Asked\n\nThis question evaluates a candidate's understanding of CGO boundary design, memory ownership semantics, and error propagation in concurrent streaming workloads.\n\n## Key Concepts\n\n- Memory ownership and lifetime management across language boundaries\n- Safe conversion of Go slices to C pointers\n- malloc/free ownership transfer and cleanup patterns\n- Error handling and propagation in concurrent worker pools\n- Streaming data processing with thread-safe result aggregation\n\n## Code Example\n\n**Header (verify_blocks.h):**\n```c\n#ifndef VERIFY_BLOCKS_H\n#define VERIFY_BLOCKS_H\n\n#include <stddef.h>\n#include <stdint.h>\n\nint verify_blocks(const uint8_t** blocks, const size_t* block_lens, size_t n,\n                  const uint8_t* public_key, size_t pubk_len, char** out_json);\n\n#endif\n```\n\n**Implementation (verify_blocks.c):**\n```c\n#include \"verify_blocks.h\"\n#include <stdlib.h>\n#include <string.h>\n\nint verify_blocks(const uint8_t** blocks, const size_t* block_lens, size_t n,\n                  const uint8_t* public_key, size_t pubk_len, char** out_json) {\n    if (!blocks || !block_lens || !public_key || !out_json)\n        return -1;\n\n    size_t json_len = 128 + n * 32;\n    char* json = malloc(json_len);\n    if (!json)\n        return -1;\n\n    strcpy(json, \"[\");\n    for (size_t i = 0; i < n; i++) {\n        int valid = 1;\n        // Simplified verification placeholder\n        if (blocks[i] && block_lens[i] > 0) {\n            valid = (blocks[i][0] == public_key[0 % pubk_len]);\n        } else {\n            valid = 0;\n        }\n\n        char entry[64];\n        snprintf(entry, sizeof(entry), \"%s{\\\"idx\":%zu,\\\"valid\\\":%s}\",\n                 (i > 0) ? \",\" : \"\", i, valid ? \"true\" : \"false\");\n        strcat(json, entry);\n    }\n    strcat(json, \"]\");\n\n    *out_json = json;\n    return 0;\n}\n```\n\n**Go Binding (verify_blocks.go):**\n```go\npackage main\n\n/*\n#cgo CFLAGS: -I.\n#cgo LDFLAGS: -L. -lverify_blocks\n#include \"verify_blocks.h\"\n*/\nimport \"C\"\nimport (\n    \"runtime/cgo\"\n    \"unsafe\"\n)\n\nfunc VerifyBlocks(blocks [][]byte, publicKey []byte) (string, error) {\n    n := len(blocks)\n    if n == 0 {\n        return \"[]\", nil\n    }\n\n    blockPtrs := make([]*C.uint8_t, n)\n    blockLens := make([]C.size_t, n)\n    for i, b := range blocks {\n        blockPtrs[i] = (*C.uint8_t)(C.CBytes(b))\n        blockLens[i] = C.size_t(len(b))\n    }\n    defer func() {\n        for _, p := range blockPtrs {\n            C.free(unsafe.Pointer(p))\n        }\n    }()\n\n    pubKeyPtr := (*C.uint8_t)(unsafe.Pointer(&publicKey[0]))\n    pubKeyLen := C.size_t(len(publicKey))\n\n    var outJson *C.char\n    ret := C.verify_blocks(&blockPtrs[0], &blockLens[0], C.size_t(n),\n                           pubKeyPtr, pubKeyLen, &outJson)\n    if ret != 0 || outJson == nil {\n        return \"\", cgo.Handle(0)\n    }\n    defer C.free(unsafe.Pointer(outJson))\n\n    return C.GoString(outJson), nil\n}\n```\n\n**Go Program with Worker Pool (main.go):**\n```go\npackage main\n\nimport (\n    \"crypto/sha256\"\n    \"encoding/json\"\n    \"fmt\"\n    \"sync\"\n)\n\ntype Result struct {\n    Index int  `json:\"idx\"`\n    Valid bool `json:\"valid\"`\n}\n\nfunc main() {\n    blocks := [][][]byte{\n        {[]byte(\"data1\"), []byte(\"data2\")},\n        {[]byte(\"data3\")},\n    }\n    publicKey := []byte(\"test-key\")\n    numWorkers := 4\n\n    type blockJob struct {\n        block    []byte\n        index    int\n        resultCh chan Result\n    }\n    jobCh := make(chan blockJob, 100)\n    var wg sync.WaitGroup\n\n    for i := 0; i < numWorkers; i++ {\n        wg.Add(1)\n        go func() {\n            defer wg.Done()\n            for job := range jobCh {\n                jsonStr, err := VerifyBlocks([][]byte{job.block}, publicKey)\n                var valid bool\n                if err == nil {\n                    var results []Result\n                    if err := json.Unmarshal([]byte(jsonStr), &results); err == nil {\n                        valid = results[0].Valid\n                    }\n                }\n                job.resultCh <- Result{Index: job.index, Valid: valid}\n            }\n        }()\n    }\n\n    resultCh := make(chan Result, len(blocks))\n    for i, blockGroup := range blocks {\n        for _, block := range blockGroup {\n            jobCh <- blockJob{block: block, index: i, resultCh: resultCh}\n        }\n    }\n    close(jobCh)\n    go func() {\n        wg.Wait()\n        close(resultCh)\n    }()\n\n    var results []Result\n    for r := range resultCh {\n        results = append(results, r)\n    }\n\n    flagBytes := make([]byte, len(results))\n    for i, r := range results {\n        if r.Valid {\n            flagBytes[i] = 1\n        }\n    }\n    batchHash := sha256.Sum256(flagBytes)\n\n    fmt.Printf(\"Results: %v\\nBatch SHA-256: %x\\n\", results, batchHash)\n}\n```\n\n## Key Implementation Details\n\n1. **Memory Safety**: Always copy Go slice data via `C.CBytes()` and free in deferred cleanup to prevent GC interference.\n2. **Error Propagation**: Use return values and channel-based result collection to surface failures from workers.\n3. **Thread Safety**: Worker pool processes jobs concurrently; result channel is buffered to prevent blocking.\n4. **Batch Hashing**: Collect all validity flags into a byte slice, then compute SHA-256 to produce a deterministic batch commitment.",
+        "difficulty": "intermediate"
       },
       {
-        "id": "cgoa-q-20",
-        "questionId": "q-14765",
-        "question": "Design a CGO wrapper for a C function that processes a small input struct and fills an output struct, returning an int status. The C API is: typedef struct { int a; double b; } Config; typedef struct { int sum; double product; } Result; int compute(const Config* cfg, Result* out); The wrapper should expose Go: func Compute(cfg Config) (Result, error) using CGO, include a C header and minimal implementation, and a Go program that concurrently processes multiple Config values via a worker pool. Handle error codes and ensure no memory leaks?",
+        "id": "cgoa-q-12",
+        "questionId": "q-20594",
+        "question": "Design a CGOA wrapper for a C function that validates a UTF-8 buffer and returns an error message for the first invalid sequence: int validate_utf8(const uint8_t* data, size_t len, char** errorMsg); on success, returns 0 and errorMsg is NULL; on error, returns non-zero and errorMsg points to a malloc-allocated string. Expose Go: ValidateUTF8(data []byte) (bool, string, error). Provide a header, a minimal C impl, a Go binding, and a Go program that validates two buffers concurrently?",
         "type": "single",
         "options": [
           {
@@ -619,98 +379,128 @@
           },
           {
             "id": "b",
-            "text": "Binding should declare the C header in a preamble, implement HelloWorld() (string, error) that calls C.hello_world(), checks for nil, and returns C.GoString(c). No memory management is required since",
+            "text": "Explain how you'd implement a CGOA wrapper for verify_signatures using a bounded worker pool. Pass blocks and signatures to C, receive malloc-allocated JSON, convert to Go string, and free memory via",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "To implement a CGOA wrapper, create a C header declaring start_stream and a callback type; write a small C shim that forwards each chunk to a Go-exported function, ensuring the Go callback owns the da",
+            "text": "I would implement a thread‑safe CGOA bridge that uses a per‑stream Go manager and a buffered channel to deliver tokens. In the C callback, copy value via C.GoStringN, then send JsonToken{Type, Value}",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "The binding converts Go Config to a C Config, calls compute with &ccfg, writes results into a Go Result, and maps nonzero return codes to errors. No heap allocations are required; use stack-allocated",
+            "text": "Implement a CGO wrapper that calls the C function, passing the Go slice data as a C pointer to a uint8_t array along with its length. If the function returns 0, return true with an empty string; if it returns non-zero,…",
             "isCorrect": true
           }
         ],
-        "explanation": "## Why This Is Asked\nTests CGO struct mappings, error handling, and concurrency in a beginner-friendly way. It targets memory ownership and cross-language data layout without exposing advanced ownership tricks.\n\n## Key Concepts\n- Go<->C struct translation\n- CGO error handling and return codes\n- Concurrency with worker pools and channel coordination\n\n## Code Example\n```c\n// C header\ntypedef struct { int a; double b; } Config;\ntypedef struct { int sum; double product; } Result;\nint compute(const Config* cfg, Result* out);\n```\n```c\n// Minimal implementation (compile as C file)\n#include <math.h>\nint compute(const Config* cfg, Result* out) {\n  if (!cfg || !out) return -1;\n  out->sum = cfg->a + (int)cfg->b;\n  out->product = cfg->a * cfg->b;\n  return 0;\n}\n```\n\n## Follow-up Questions\n- How would you extend to batch processing with a single C function?\n- How would you detect and handle ABI differences across platforms (32 vs 64 bit) in the struct layout?",
+        "explanation": "## Why This Is Asked\n\nThis question tests memory ownership semantics across the Go-C boundary, Go-C interop patterns, and basic CGO usage for error reporting.\n\n## Key Concepts\n\n- **CGO memory management**: Understanding malloc and free across the language boundary\n- **Safe slice passing**: Converting Go slices to C pointers with proper length awareness\n- **Error propagation**: Handling output parameters (errorMsg) and return codes from C to Go\n- **Resource cleanup**: Properly freeing C-allocated memory after use to prevent leaks\n- **Concurrency**: Running independent validations in goroutines with separate memory allocations\n\n## Code Example\n\n```c\n// utf8.h\n#ifndef UTF8_H\n#define UTF8_H\n\n#include <stdint.h>\n#include <stddef.h>\n\nint validate_utf8(const uint8_t* data, size_t len, char** errorMsg);\n\n#endif\n```\n\n```c\n// utf8.c\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\nint validate_utf8(const uint8_t* data, size_t len, char** errorMsg) {\n    *errorMsg = NULL;\n    \n    for (size_t i = 0; i < len; i++) {\n        if (data[i] <= 0x7F) continue;\n        \n        int bytes = 0;\n        if ((data[i] & 0xE0) == 0xC0) bytes = 2;\n        else if ((data[i] & 0xF0) == 0xE0) bytes = 3;\n        else if ((data[i] & 0xF8) == 0xF0) bytes = 4;\n        else {\n            *errorMsg = malloc(64);\n            snprintf(*errorMsg, 64, \"Invalid UTF-8 start byte 0x%02X at position %zu\", data[i], i);\n            return -1;\n        }\n        \n        if (i + bytes > len) {\n            *errorMsg = malloc(64);\n            snprintf(*errorMsg, 64, \"Truncated UTF-8 sequence at position %zu\", i);\n            return -1;\n        }\n        \n        for (int j = 1; j < bytes; j++) {\n            if ((data[i + j] & 0xC0) != 0x80) {\n                *errorMsg = malloc(64);\n                snprintf(*errorMsg, 64, \"Invalid continuation byte 0x%02X at position %zu\", data[i + j], i + j);\n                return -1;\n            }\n        }\n        i += bytes - 1;\n    }\n    return 0;\n}\n```\n\n```go\n// utf8.go\npackage main\n\n// #cgo CFLAGS: -.\n// #include \"utf8.h\"\nimport \"C\"\nimport (\n\t\"errors\"\n\t\"sync\"\n)\n\nfunc ValidateUTF8(data []byte) (bool, string, error) {\n\tvar errMsg *C.char\n\tresult := C.validate_utf8((*C.uint8_t)(&data[0]), C.size_t(len(data)), &errMsg)\n\t\n\tif result == 0 {\n\t\treturn true, \"\", nil\n\t}\n\t\n\tmsg := C.GoString(errMsg)\n\tC.free(unsafe.Pointer(errMsg))\n\treturn false, msg, errors.New(msg)\n}\n\nfunc ValidateUTF8Concurrently(buffers ...[]byte) []struct {\n\tvalid  bool\n\tmsg    string\n\terr    error\n\twg     *sync.WaitGroup\n} {\n\tvar wg sync.WaitGroup\n\tresults := make([]struct {\n\t\tvalid bool\n\t\tmsg   string\n\t\terr   error\n\t\twg   *sync.WaitGroup\n\t}, len(buffers))\n\t\n\tfor i, buf := range buffers {\n\t\twg.Add(1)\n\t\tresults[i].wg = &wg\n\t\tgo func(data []byte, idx int) {\n\t\t\tvalid, msg, err := ValidateUTF8(data)\n\t\t\tresults[idx].valid = valid\n\t\t\tresults[idx].msg = msg\n\t\t\tresults[idx].err = err\n\t\t\twg.Done()\n\t\t}(buf, i)\n\t}\n\t\n\twg.Wait()\n\treturn results\n}\n\nfunc main() {\n\tbuffer1 := []byte(\"Hello, World!\")\n\tbuffer2 := []byte{0xFF, 0xFE, 0x55}\n\t\n\tresults := ValidateUTF8Concurrently(buffer1, buffer2)\n\t\n\tfor i, r := range results {\n\t\tfmt.Printf(\"Buffer %d: valid=%v, msg=%s\\n\", i+1, r.valid, r.msg)\n\t}\n}\n```",
         "difficulty": "beginner"
       },
       {
-        "id": "cgoa-q-21",
-        "questionId": "q-20163",
-        "question": "Design a CGOA wrapper for a C streaming API that uses a callback to deliver per-block results. The C API is:\n\ntypedef struct { double value; uint64_t ts; } Block;\ntypedef void (*BlockCB)(const char* json, void* ctx);\nint process_stream(const Block* blocks, size_t n, BlockCB cb, void* ctx);\n\nThe wrapper should expose: 1) a C header and a minimal C impl that converts each Block to a malloc-allocated JSON string and calls cb; 2) a Go binding exposing StreamBlocks(blocks []Block) (<-chan string, error) that yields each JSON result; 3) a Go program that streams large sequences of blocks to a worker pool, supports cancellation via context, and ensures all allocated JSON strings are freed after consumption, with proper error propagation?",
+        "id": "cgoa-q-13",
+        "questionId": "q-13734",
+        "question": "Design a CGOA wrapper for a C function that formats a log line into a caller-provided buffer:\n\nvoid format_log(char* buf, size_t len, const char* level, const char* message);\n\nExpose a Go binding:\n\nfunc FormatLog(level string, message string) (string, error)\n\nThe binding must pass a Go-allocated buffer to C, ensure writes do not overflow, properly convert the result back to Go, and handle memory safety across the boundary. Demonstrate concurrent usage by launching several goroutines calling FormatLog with different level/message pairs. Include a C header, a minimal C implementation, the Go binding, and a small Go program that runs in parallel?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Build a CGO wrapper around the opaque C kv_store. Expose a type Store with Put(string, string) error, Get(string) (string, error), and Close() error. Get must return a fresh Go string via C.GoString, and kv_store must b…",
+            "text": "Proposed approach: Create a CGOA binding that registers a C callback. The C side streams frames and invokes the callback; Go collects per-frame metrics into a JSON array. The C header returns a malloc",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a CGO wrapper for a C API that streams data blocks, computes a SHA-256 hash for each block in parallel, and maintains a rolling SHA-256 hash over the entire stream. Return a malloc-allocated JSON containing per-b…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Proposed approach: wrap process_ids with a CGO binding that allocates a C array for inputs, passes a ctx struct containing a Go channel to the callback, and collects successes while surfacing the firs",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Allocate a fixed-size Go byte slice (e.g., 256). Convert to *C.char via unsafe.Pointer and pass with len; C writes until a NUL or truncates at len-1. After call, extract result by scanning for NUL. Do",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests memory management across CGO boundaries and safe concurrent calls.\n\n## Key Concepts\n- CGO memory safety: avoid retaining Go pointers in C\n- Passing and reusing buffers without leaks\n- Concurrency: independent buffers prevent data races\n\n## Code Example\n```go\npackage main\n/*\n#include <stdlib.h>\n#include <string.h>\nvoid format_log(char* buf, size_t len, const char* level, const char* message);\n*/\nimport \"C\"\nimport (\n  \"unsafe\"\n)\n\nfunc FormatLog(level string, message string) (string, error) {\n  buf := make([]byte, 256)\n  lvl := C.CString(level)\n  defer C.free(unsafe.Pointer(lvl))\n  msg := C.CString(message)\n  defer C.free(unsafe.Pointer(msg))\n  C.format_log((*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)), lvl, msg)\n  n := 0\n  for n < len(buf) && buf[n] != 0 { n++ }\n  return string(buf[:n]), nil\n}\n```\n\n## Follow-up Questions\n- How would you handle buffer overflow and report an error?\n- How would you adapt if format_log used a callback to signal completion?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "cgoa-q-14",
+        "questionId": "q-10634",
+        "question": "CGOA wrapper design: Given a C API using thread-local error buffers and opaque handles, implement a Go binding exposing DoWork(in []byte) ([]byte, error). It should call start_work(in, in_len, &out, &out_len); on success return a Go slice; on error fetch and clear the thread-local error via last_error(), convert to error, and free resources. Demonstrate concurrency with two goroutines?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Map each C session_open to a dedicated Go channel. The C callback signature (session*, const char* topic, const uint8_t* payload, size_t len, void* user) is bridged with a //export function that reads",
             "isCorrect": false
           },
           {
             "id": "b",
             "text": "```go package cgoa // #include <stdint.h> // #include <stdlib.h> // extern int start_work(const uint8_t* in, size_t in_len, uint8_t** out, size_t* out_len); // extern const char* last_error(void); // extern void free_er…",
-            "isCorrect": false
+            "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Design a CGOA wrapper that encrypts multiple blocks in a single call and returns per-block stats in JSON. The C path uses a simple XOR with the provided key to simulate hardware acceleration, writing",
+            "text": "Provide a CGOA wrapper: 1) C header and minimal impl; int summarize_batch(const SensorSampleC** samples, size_t n, char** out_json); 2) Go binding SummarizeBatch(samples []SensorSample) (string, error",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Implementation strategy: use a trampoline callback in Go (//export) to push JSON into a Go channel; C allocates json with malloc and Go frees it after consumption. Bindings expose StreamBlocks(blocks",
-            "isCorrect": true
+            "text": "Provide a CGO wrapper exposing StartLogger() (<-chan string, error). The C callback should copy lines using C.GoString and push them into a Go channel from a dedicated goroutine. Use a buffered channel to decouple C cal…",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design CGOA streaming with lifetime management and cancellation across language boundaries.\n\n## Key Concepts\n\n- CGO callbacks and Go trampoline\n- Memory ownership across C<->Go\n- Cancellation propagation with context\n- Safe concurrency between C worker threads and Go\n\n## Code Example\n\n```c\n// C header and minimal impl\ntypedef struct { double value; uint64_t ts; } Block;\ntypedef void (*BlockCB)(const char* json, void* ctx);\nint process_stream(const Block* blocks, size_t n, BlockCB cb, void* ctx);\n```\n\n```go\n// Go binding sketch\ntype Block struct{ Value float64; TS uint64 }\nfunc StreamBlocks(blocks []Block) (<-chan string, error) { /* ... */ }\n```\n\n```go\n// Example usage (pseudo)\nctx, cancel := context.WithCancel(context.Background())\nch, err := StreamBlocks(blocks)\nif err != nil { /* handle */ }\nfor {\n  select {\n  case s, ok := <-ch:\n    if !ok { return }\n    // process s\n  case <-ctx.Done():\n    // request cancellation\n  }\n}\n```\n\n## Follow-up Questions\n\n- How do you ensure no deadlocks when Go reads from channel while C thread calls cb?\n- How would you handle backpressure if producer is faster than consumer?",
+        "explanation": "## Why This Question Matters\n\nThis question tests your understanding of:\n- **CGO memory management**: The C function allocates memory for output via malloc, so Go must free it after copying to prevent leaks.\n- **Thread-local error handling**: C libraries often store errors in thread-local storage. Goroutines can migrate between OS threads, requiring LockOSThread to ensure error affinity.\n- **Safe memory ownership**: Distinguishing between C-allocated memory (must call C.free) and Go-allocated memory.\n\n## Key Points\n\n1. **LockOSThread**: Goroutines multiplex onto OS threads. The C library's thread-local error storage means we must stay on the same OS thread from the C call through error retrieval. LockOSThread ensures this and is paired with defer UnlockOSThread for safety.\n\n2. **Memory ownership**: C allocates `out` with malloc internally. After C.GoBytes copies the data to a Go slice, we must call `C.free()` to release the C-allocated memory.\n\n3. **Error string cleanup**: If the C library allocates the error string, we need a corresponding `free_error()` function to release it after converting to a Go string.\n\n4. **Concurrency safety**: Each goroutine calling DoWork locks to its own OS thread, so multiple goroutines can safely call the C library simultaneously without interfering with each other's thread-local state.",
         "difficulty": "advanced"
       },
       {
-        "id": "cgoa-q-22",
-        "questionId": "q-24997",
-        "question": "Design a CGOA wrapper for a C function that applies a 2D convolution on a batch of grayscale images. C API: int apply_conv_batch(const uint8_t** images, size_t n, size_t h, size_t w, const float* kernel, size_t ksize, char** out_json); Each out_json is a malloc-allocated JSON array with per-image entries: {\"idx\": i, \"ok\": true/false, \"stats\": {\"mean\": <float>, \"stddev\": <float>}}; the entire batch JSON also requires a field \"crc\": \"<hex>\" computed over concatenated per-entry stats strings. Provide: 1) a header and a minimal C impl that allocates out_json; 2) a Go binding exposing ApplyConvBatch(images [][]byte) (string, error) via CGO, ensuring proper memory ownership (Go frees C memory or vice versa); 3) a Go program that streams batches of images to a worker pool, computes per-image stats and the batch CRC, and propagates errors?",
+        "id": "cgoa-q-15",
+        "questionId": "q-22526",
+        "question": "Design a CGOA wrapper for a C function: const char* read_text_file(const char* path, int* err); The function opens the file at path, reads its contents into a malloc-allocated buffer, returns the buffer or NULL on error, and sets *err to a nonzero error code (1=not found, 2=permission, etc). The Go binding should expose ReadText(path string) (string, error) that calls the C function, converts the C string to Go, frees memory, and maps *err to descriptive Go errors. Include a header, minimal C impl, Go binding, and a Go program that reads two files concurrently?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "## Solution ### 1. C Header and Implementation ```c // conv_batch.h #ifndef CONV_BATCH_H #define CONV_BATCH_H #include <stddef.h> #include <stdint.h> #ifdef __cplusplus extern \"C\" { #endif int apply_conv_batch(const uin…",
-            "isCorrect": true
+            "text": "Design approach: Go registers a callback, wraps it with runtime/cgo.NewHandle(cb) and passes the handle’s uintptr to C. An exported bridge function (//export goCallbackBridge) is invoked by C with the",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a CGOA wrapper for a C library that streams data asynchronously: start_stream(ctx, chunk_cb, user); stop_stream(ctx). Expose Go API: StartStream(name string) (<-chan []byte, func()). Key: use a",
+            "text": "Design a CGO wrapper for a C function that processes an array of TLV (Type-Length-Value) records encoded in a single byte buffer (const uint8_t* data, size_t length) into a malloc-allocated JSON describing per-record ty…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Bridge a C streaming API where start_stream(cb, user) calls cb with chunks and a final sentinel with len==0. Create a Go callback via //export that pushes chunks onto a channel; manage stream state wi",
-            "isCorrect": false
+            "text": "Use CGO to wrap the C API: convert the Go string path to a C string, call the C function read_text_file, and free the malloc'd buffer when done. If the C function returns NULL, map the error code at *err to appropriate…",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "I'd implement a per-call waiter keyed by id. In Go, generate a unique id, register a chan for the result, and invoke the C async_compute with that id and a trampoline to the Go callback (exported). Th",
+            "text": "Implement a CGOA wrapper that registers a Go callback and allows C to invoke it from multiple threads. Use a go/cgo handle to pass a Go function through a void* to C, export a Go bridge function, and synchronize access…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Question Is Asked\nThis question evaluates a candidate's ability to design robust CGO bindings for performance-critical image processing. It tests understanding of memory management across language boundaries, batch processing patterns, and concurrent worker pool architectures.\n\n## Key Concepts\n\n**CGO Memory Ownership**: The Go binding follows explicit ownership transfer rules. C allocates output JSON via `malloc`, and Go calls `C.free()` to release it. Kernel and image buffers are allocated in Go, passed to C, then freed by Go after the call completes.\n\n**Batch Processing**: Processing multiple images in a single C call reduces cross-language call overhead significantly compared to processing images one at a time.\n\n## Changes Made\n\n1. **Fixed type bug**: Changed `float_t*` to `float*` in C implementation\n2. **Corrected JSON escaping**: Fixed double-escaped quotes (\\\\\" -> \\\")\n3. **Improved error handling**: Added null checks for allocated memory\n4. **Fixed Go image dimensions**: Corrected `w := len(images[0][:])\n5. **Enhanced memory safety**: Added proper validation for image sizes\n6. **Improved worker pool**: Simplified error tracking and added proper shutdown\n7. **Better formatting**: Cleaned up code structure and comments for readability",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\n\nThis question tests practical CGO memory management and cross-language error handling, plus safe concurrency patterns.\n\n## Key Concepts\n\n- **CGO memory ownership**: Understanding who allocates and frees memory across the C/Go boundary\n- **C string to Go string conversion**: Safely converting C strings to Go strings without dangling pointers\n- **Error code mapping**: Translating C error codes to idiomatic Go errors\n- **Concurrent CGO calls**: Properly handling CGO calls from goroutines\n\n## Code Example\n\n```c\n// file.h\n#ifndef FILE_H\n#define FILE_H\n#include <stddef.h>\n\nconst char* read_text_file(const char* path, int* err);\n#endif\n```\n\n```c\n// file.c\n#include \"file.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\nconst char* read_text_file(const char* path, int* err) {\n    *err = 0;\n    FILE* f = fopen(path, \"rb\");\n    if (!f) {\n        *err = 1; // Not found\n        return NULL;\n    }\n    \n    fseek(f, 0, SEEK_END);\n    long len = ftell(f);\n    fseek(f, 0, SEEK_SET);\n    \n    char* buf = malloc(len + 1);\n    if (!buf) {\n        *err = 3;\n        fclose(f);\n        return NULL;\n    }\n    \n    fread(buf, 1, len, f);\n    buf[len] = '\\0';\n    fclose(f);\n    return buf;\n}\n```\n\n```go\n// file.go\npackage main\n\n// #cgo CFLAGS: -I.\n// #include \"file.h\"\nimport \"C\"\nimport (\n    \"errors\"\n    \"fmt\"\n    \"sync\"\n)\n\nfunc ReadText(path string) (string, error) {\n    cPath := C.CString(path)\n    defer C.free(unsafe.Pointer(cPath))\n\n    var err C.int\n    result := C.read_text_file(cPath, &err)\n\n    if result == nil {\n        switch int(err) {\n        case 1:\n            return \"\", fmt.Errorf(\"file not found: %s\", path)\n        case 2:\n            return \"\", fmt.Errorf(\"permission denied: %s\", path)\n        default:\n            return \"\", errors.New(\"unknown error\")\n        }\n    }\n\n    goStr := C.GoString(result)\n    C.free(unsafe.Pointer(result))\n    return goStr, nil\n}\n\nfunc main() {\n    var wg sync.WaitGroup\n    \n    for _, path := range []string{\"file1.txt\", \"file2.txt\"} {\n        wg.Add(1)\n        go func(p string) {\n            defer wg.Done()\n            content, err := ReadText(p)\n            if err != nil {\n                fmt.Printf(\"Error reading %s: %v\\n\", p, err)\n                return\n            }\n            fmt.Printf(\"Read %d bytes from %s\\n\", len(content), p)\n        }(path)\n    }\n    \n    wg.Wait()\n}\n```",
+        "difficulty": "beginner"
       },
       {
-        "id": "cgoa-q-23",
-        "questionId": "q-15929",
-        "question": "Design a CGOA wrapper for a C streaming encryption API: int stream_encrypt(const uint8_t* in, size_t in_len, void (*cb)(const uint8_t* out, size_t out_len, int status, void* ctx), void* ctx); Provide a header and a minimal C wrapper that streams input in blocks, allocates each encrypted chunk with malloc, and invokes the callback; expose a Go binding StartEncryptStream(input string, key []byte) (<-chan []byte, <-chan error) that streams chunks via a worker pool, copies data into Go slices, and frees C buffers; include a short Go program demonstrating two concurrent streams?",
+        "id": "cgoa-q-16",
+        "questionId": "q-15035",
+        "question": "New CGOA interview question: design a CGOA binding for a C function that formats a report into a caller-provided buffer, using a two-pass allocation to determine required size. The C API is: int format_report(const char* name, const int* data, size_t n, char* out, size_t out_len); If out is NULL or out_len is 0, return required size; on success, write to out and return bytes written; on error, return -1 and set errno (ERANGE for too small, EINVAL for invalid input). Provide header, minimal C impl, Go binding FormatReport(name string, data []int) (string, error) using two-pass; demonstrate concurrency with 4 goroutines; include a small Go test program?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Use a Go registry (cgo.Handle) to pass a Go channel reference as ctx to stream_strings. The C callback converts the malloc'ed msg to a Go string via C.GoString, frees msg, then pushes to the channel t",
-            "isCorrect": false
+            "text": "Use a two-pass approach: first call format_report(name, data, n, NULL, 0) to obtain required size, then allocate a C buffer of that size and call again. On success, use C.GoString to convert to Go, th",
+            "isCorrect": true
           },
           {
             "id": "b",
-            "text": "Design a CGO wrapper around a C streaming encryption API that yields encrypted chunks through a callback. Provide a header and minimal C wrapper that streams input in blocks, allocates each encrypted chunk with malloc,…",
-            "isCorrect": true
+            "text": "I would implement a C wrapper that emits per-block progress via a callback and returns a JSON blob; pass a Go context through a cgo.Handle as the user pointer and route callbacks through a single Go g",
+            "isCorrect": false
           },
           {
             "id": "c",
@@ -719,46 +509,256 @@
           },
           {
             "id": "d",
-            "text": "Describe implementing a CGOA wrapper for a C function parse_log_batch(const char** logs, size_t n, char** out_json); Provide header, a minimal C implementation, a Go binding exposing ParseLogBatch(log",
+            "text": "Use a per-call opaque handle with a Go callback bridged via //export. RunJob generates a unique ID, stores a channel in a sync.Map, and passes the ID as user data to C.start_job. The C callback retrieves the ID, looks u…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question tests end-to-end integration across C and Go in a streaming context, focusing on memory ownership, cross-language callbacks, and safe concurrent use.\n\n## Key Concepts\n- **CGO callback bridging**: Safely passing Go functions to C and handling the transition between language runtimes\n- **Memory ownership**: Allocating with malloc in C, copying to Go slices, and explicitly freeing C buffers to prevent leaks\n- **Streaming/partitioning**: Breaking input into blocks in C and delivering chunks incrementally to Go\n- **Concurrency patterns**: Worker pools for processing multiple streams in parallel and proper error propagation through channels\n\n## Code Example\n\n**stream_encrypt.h**\n```c\n#ifndef STREAM_ENCRYPT_H\n#define STREAM_ENCRYPT_H\n\n#include <stddef.h>\n#include <stdint.h>\n\ntypedef void (*chunk_cb)(const uint8_t* out, size_t out_len, int status, void* ctx);\n\nint stream_encrypt(const uint8_t* in, size_t in_len, chunk_cb cb, void* ctx);\n\n#endif\n```\n\n**stream_encrypt.c**\n```c\n#include \"stream_encrypt.h\"\n#include <stdlib.h>\n#include <string.h>\n\n#define BLOCK_SIZE 4096\n\nstatic void encrypt_block(const uint8_t* in, size_t len, uint8_t** out, size_t* out_len) {\n    *out = (uint8_t*)malloc(len);\n    memcpy(*out, in, len);\n    *out_len = len;\n}\n\nint stream_encrypt(const uint8_t* in, size_t in_len, chunk_cb cb, void* ctx) {\n    size_t offset = 0;\n    while (offset < in_len) {\n        size_t block_len = (offset + BLOCK_SIZE > in_len) ? (in_len - offset) : BLOCK_SIZE;\n        uint8_t* encrypted = NULL;\n        size_t encrypted_len = 0;\n        \n        encrypt_block(in + offset, block_len, &encrypted, &encrypted_len);\n        cb(encrypted, encrypted_len, 0, ctx);\n        free(encrypted);\n        \n        offset += block_len;\n    }\n    return 0;\n}\n```\n\n**stream_encrypt.go**\n```go\npackage main\n\n/*\n#include \"stream_encrypt.h\"\n#include <stdlib.h>\n\nstatic int call_stream_encrypt(const uint8_t* in, size_t in_len, void* ctx) {\n    return stream_encrypt(in, in_len, NULL, ctx);\n}\n*/\nimport \"C\"\n\nimport (\n    \"fmt\"\n    \"sync\"\n    \"unsafe\"\n)\n\ntype StreamResult struct {\n    Data []byte\n    Err  error\n}\n\nvar workerPool = make(chan struct{}, 4)\n\n//export chunkCallback\nfunc chunkCallback(out *C.uint8_t, outLen C.size_t, status C.int, ctx unsafe.Pointer) {\n    result := (*chan StreamResult)(ctx)\n    data := C.GoBytes(unsafe.Pointer(out), C.int(outLen))\n    if status != 0 {\n        *result <- StreamResult{Err: fmt.Errorf(\"encryption error: %d\", status)}\n    } else {\n        *result <- StreamResult{Data: data}\n    }\n}\n\nfunc StartEncryptStream(input string, key []byte) (<-chan []byte, <-chan error) {\n    chunks := make(chan []byte, 10)\n    errs := make(chan error, 10)\n    resultChan := make(chan StreamResult)\n    \n    go func() {\n        defer close(chunks)\n        defer close(errs)\n        \n        workerPool <- struct{}{}\n        defer func() { <-workerPool }()\n        \n        cInput := C.CString(input)\n        defer C.free(unsafe.Pointer(cInput))\n        \n        C.stream_encrypt(\n            (*C.uint8_t)(unsafe.Pointer(cInput)),\n            C.size_t(len(input)),\n            (C.chunk_cb)(C.chunkCallback),\n            unsafe.Pointer(&resultChan),\n        )\n        \n        close(resultChan)\n    }()\n    \n    go func() {\n        for result := range resultChan {\n            if result.Err != nil {\n                errs <- result.Err\n            } else {\n                chunks <- result.Data\n            }\n        }\n    }()\n    \n    return chunks, errs\n}\n\nfunc main() {\n    var wg sync.WaitGroup\n    \n    for i := 0; i < 2; i++ {\n        wg.Add(1)\n        go func(id int) {\n            defer wg.Done()\n            chunks, errs := StartEncryptStream(fmt.Sprintf(\"message-%d\", id), []byte(\"key\"))\n            for {\n                select {\n                case chunk, ok := <-chunks:\n                    if !ok {\n                        return\n                    }\n                    fmt.Printf(\"Stream %d: got chunk len=%d\\n\", id, len(chunk))\n                case err, ok := <-errs:\n                    if !ok {\n                        return\n                    }\n                    fmt.Printf(\"Stream %d: error: %v\\n\", id, err)\n                }\n            }\n        }(i)\n    }\n    \n    wg.Wait()\n}\n```",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests understanding of CGO memory ownership, two-pass C APIs, and proper error mapping.\n\n## Key Concepts\n- CGO memory ownership across Go/C\n- Two-pass buffer sizing and safe allocation\n- Errno to Go error translation\n- Concurrency safety with separate buffers\n- Data marshaling between C and Go\n\n## Code Example\nHeader declaration: int format_report(const char* name, const int* data, size_t n, char* out, size_t out_len);\n\n## Follow-up Questions\n- How would you extend this to stream large data without two allocations?\n- How would you handle multi-threaded callers sharing the same C runtime state?",
+        "difficulty": "beginner"
       },
       {
-        "id": "cgoa-q-24",
-        "questionId": "q-15715",
-        "question": "Design a CGO wrapper for a C library function: int compute_stats(const double* data, size_t n, char** out_json, int* err_code); It returns 0 on success, allocates a JSON string to *out_json via malloc, and on error sets err_code and returns -1. Expose Go: func ComputeStats(data []float64) (string, error) that calls compute_stats, converts the JSON to a Go string, and frees the C-allocated memory. Ensure proper memory ownership, thread-safety for concurrent calls, and correct translation of C errors into Go errors. Provide a C header, a minimal C implementation, and a Go program that runs two concurrent stat computations?",
+        "id": "cgoa-q-17",
+        "questionId": "q-28786",
+        "question": "Design a CGOA wrapper for a C streaming API where each block is processed in a background thread and a progress callback reports per-block completion, returning a malloc’ed JSON. Expose StartStream(blocks [][]byte) (string, error) in Go and support runtime cancellation via context, ensuring ownership of the returned JSON and safe cross-language callbacks?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a CGO wrapper for a C streaming parser that processes binary packets in chunks and reports per-chunk metrics via a C callback. Expose a Go API with the following signatures: - `StartStream(cb func(string)) (Handl…",
+            "text": "A correct answer describes implementing a CGO bridge that registers a C callback with a per-batch context, copies the malloc-allocated JSON to a Go string using C.GoBytes or equivalent, frees the C buffer immediately af…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Call C.compute_stats with a C array built from data, capture out_json and err_code. On 0, convert json := C.GoString(out_json) and C.free(out_json). On -1, map err_code to an error and return. No shar",
-            "isCorrect": true
+            "text": "I would implement a CGOA binding that registers a CGO-exported callback, streams each json_chunk from stream_pca_all into a Go channel, and concatenates into a final JSON. Ownership: on each callback,",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use a CGO trampoline with a Go comparator stored in a go:handle. Pass a pointer to a small C context that includes the handle and a cmp callback. In C, copy data to a temporary int array, call cg_sort",
+            "text": "StartStream wraps a C streaming API. Convert blocks to a C array, pass a progress callback that forwards per-block progress to Go, and provide a cancel flag linked to Go's context so C can abort mid-s",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Binding should declare the C header in a preamble, implement HelloWorld() (string, error) that calls C.hello_world(), checks for nil, and returns C.GoString(c). No memory management is required since",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis tests CGO callback safety, cross-language cancellation, and explicit memory ownership, plus real-world concerns when streaming data across language boundaries.\n\n## Key Concepts\n\n- CGO callbacks and thread-safety\n- Memory ownership and malloc/free semantics\n- Context-aware cancellation and signaling across C/Go\n\n## Code Example\n\n```c\n// header\ntypedef struct { } Block;\nint start_stream(const Block* blocks, size_t n, void(*progress)(size_t idx, double pct, void* ctx), void* ctx);\n```\n\n```go\n// CGO binding sketch\n//export ProgressCallback\nfunc ProgressCallback(idx C.size_t, pct C.double, ctx unsafe.Pointer) { /* forward to Go channel */ }\n\n// StartStream wrapper signature: func StartStream(blocks [][]byte) (string, error) { ... }\n```\n\n## Follow-up Questions\n\n- How would you test that cancellation propagates promptly?\n- How would you handle errors returned from progress callbacks?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "cgoa-q-18",
+        "questionId": "q-26002",
+        "question": "Design a CGOA wrapper for a C function that validates a batch of protocol blocks. Each block contains: [header][payload]. The C side returns a malloc-allocated JSON array with per-block fields: {\"idx\":i,\"valid\":true|false,\"payload_len\":n,\"checksum\":\"<hex>\"}. Provide: 1) a header and a minimal C implementation (out_json allocated; provide free_json); 2) a Go binding exposing ValidateBatch(blocks [][]byte) (string, error) via CGO; and 3) a Go program that streams blocks through a worker pool, collects per-block results and a batch checksum, with proper memory ownership and error propagation?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design and implement a CGOA wrapper for a C function that validates a batch of protocol blocks. Each block starts with a header, and the C side returns a malloc-allocated JSON array with per-block fie",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use a two-pass approach: first call format_report(name, data, n, NULL, 0) to obtain required size, then allocate a C buffer of that size and call again. On success, use C.GoString to convert to Go, th",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Answer: Use a Go-exported callback to copy data into a Go slice, pass a cgo.Handle through the C 'user' pointer, and store the handle in a map. In the C shim, call the Go callback with a copied buffer",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a CGO bridge: assign a unique Go callback handle for each job; pass an opaque handle to C; export a Go function (//export) that C calls back with id, result, and the handle; a small C wrapper signature converts betw…",
+            "text": "Use a CGO wrapper that passes a C array of doubles to compute_stats, capturing a malloc-allocated summary string and the mean/std. Convert the summary with C.GoString, then free the C string via C.fre",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests memory ownership across CGO boundaries, robust error translation, and true concurrent invocation without data races.\n\n## Key Concepts\n- CGO memory ownership: malloc/free across Go/C\n- Translating C errors to Go errors\n- Thread-safety: no global state; per-call buffers\n\n## Code Example\n```javascript\n// header: int compute_stats(const double* data, size_t n, char** out_json, int* err_code);\n// Go: // func ComputeStats(data []float64) (string, error)\n```\n\n## Follow-up Questions\n- How would you extend for multiple JSON outputs in a batch?\n- How would you audit memory leaks across many concurrent calls?",
+        "explanation": "Why This Is Asked\n- Tests CGOA memory ownership, ABI compatibility, and error propagation across language boundaries.\n\nKey Concepts\n- Safe passing of byte slices to C; managing malloc/free lifecycles in the C layer; building JSON on the C side; correct CGO call patterns and error propagation.\n\nCode Sketch\n```c\n// header: size_t validate_batch(const uint8_t** blocks, const size_t* sizes, size_t n, char** out_json);\n// minimal implementation: validates header, computes per-block checksum, builds JSON, returns malloc'ed string\n```\n\nFollow-up Questions\n- How to handle very large batches with streaming JSON and incremental parsing?\n- What are safe patterns for memory reuse and avoiding partial frees on errors?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "cgoa-q-19",
+        "questionId": "q-13677",
+        "question": "Design a CGOA wrapper for a C API that fills a caller-provided output buffer with a reversed version of an input string:\n\nsize_t reverse_string(const char* input, char* output, size_t max_len);\n\nIt writes at most max_len-1 chars, NUL-terminates, and returns the number of bytes written (excluding NUL). Expose Go: func ReverseGo(s string) (string, error) that allocates an output buffer, calls reverse_string, and returns the reversed string. Demonstrate two goroutines in parallel with different inputs. Include C header, a minimal C implementation, the Go binding, and a small test program?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a CGOA wrapper for a C Session object with per-session state. Provide C: session_create/destroy, session_enqueue, session_finalize (malloc’d JSON). In Go, implement NewSession() (*SessionWrap,",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "To solve it, implement reverse_string to write into a provided buffer and return written length; in Go, allocate a buffer of len(s)+1, pass its pointer via CGO, then slice to the written length and co",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "A correct binding uses a Go-exported progress callback and a per-stream handle registry to avoid passing Go pointers across the CGO boundary. Copy the C string via C.GoString, send it on the output ch",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a per-stream bridge: allocate a Go channel, register a CGO-exported Go callback, map ctx to a Go struct with the channel and a cancellation flag. The C side calls log_cb on its thread; the callback checks cancellati…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests memory ownership across CGO, pre-allocated buffers, and concurrent calls—common in real bindings.\n\n## Key Concepts\n- Buffer ownership between Go and C\n- CGO pointer passing and slicing of results\n- Concurrency safety with shared C code\n- Correct NUL handling and length reporting\n\n## Code Example\n```javascript\n// C header (reverse_string.h)\nsize_t reverse_string(const char* input, char* output, size_t max_len);\n```\n```javascript\n// Minimal C implementation (reverse_string.c)\n#include <string.h>\n#include <stddef.h>\n\nsize_t reverse_string(const char* input, char* output, size_t max_len) {\n  size_t len = strlen(input);\n  if (len >= max_len) len = max_len - 1;\n  for (size_t i = 0; i < len; ++i) {\n    output[i] = input[len - 1 - i];\n  }\n  output[len] = '\\0';\n  return len;\n}\n```\n```javascript\n// Go binding (cgobinding.go)\npackage main\n/*\n#include <stdlib.h>\n#include \"reverse_string.h\"\n*/\nimport \"C\"\nimport (\n  \"fmt\"\n  \"unsafe\"\n)\n\nfunc ReverseGo(s string) (string, error) {\n  in := C.CString(s)\n  defer C.free(unsafe.Pointer(in))\n  buf := make([]byte, len(s)+1)\n  written := C.reverse_string(in, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)))\n  if int(written) < 0 {\n    return \"\", fmt.Errorf(\"reverse failed\")\n  }\n  return string(buf[:written]), nil\n}\n```\n```javascript\n// Test program (main.go)\npackage main\nimport (\n  \"fmt\"\n  \"sync\"\n)\nfunc main() {\n  var wg sync.WaitGroup\n  inputs := []string{\"abcdef\", \"12345\"}\n  for _, s := range inputs {\n    wg.Add(1)\n    go func(str string) {\n      defer wg.Done()\n      res, err := ReverseGo(str)\n      if err != nil {\n        fmt.Println(\"err:\", err)\n        return\n      }\n      fmt.Println(\"in:\", str, \"out:\", res)\n    }(s)\n  }\n  wg.Wait()\n}\n```\n\n## Follow-up Questions\n- How would you add bounds checking for extremely long inputs? \n- How would you adapt for non-ASCII inputs and ensure no data loss while converting between C and Go?",
         "difficulty": "beginner"
+      },
+      {
+        "id": "cgoa-q-20",
+        "questionId": "q-30344",
+        "question": "Design a CGOA wrapper for a C function that computes a histogram over a data buffer and returns a JSON string of bin counts. C API: int compute_histogram(const unsigned char* data, size_t len, size_t num_bins, char** out_json); out_json is malloc'ed JSON representing a list of objects with bin and count fields. Provide: 1) header and minimal C impl; 2) a Go binding exposing ComputeHistogram(data []byte) (string, error); and 3) a Go program that streams data chunks to a worker pool, computes histograms in parallel, and merges per chunk JSON results into a final JSON array?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement a CGO wrapper that builds a C array of pointers to the blocks, calls process_records, then scans out_errors to copy non-null error strings into Go and free the C-allocated strings. R",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Approach: implement a C header and small compute_histogram that mallocs a JSON string; in Go bind via CGO, convert the returned JSON with GoString, and free the C buffer. Use a compact worker pool to",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a CGOA wrapper that converts Go []string into a C array of char*, calls validate_json_batch, copies the JSON result to a Go string, and frees the C memory. Expose func ValidateJSONBatch(docs",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Proposed answer approach: implement greet in C to allocate with malloc, set err nonzero on failure, return NULL. In Go, call C.greet, check err, convert to Go string with C.GoString, free with C.free,",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "Why This Is Asked\nTests memory ownership across CGO boundaries and correctness of concurrent data processing.\n\nKey Concepts\n- CGO memory management and lifetime of malloc'ed buffers\n- Safe conversion of C strings to Go without leaks\n- Parallel processing patterns in Go (worker pools) and merging JSON outputs\n- Robust error handling and cleanup across language boundaries\n\nCode Sketch (high-level, not exhaustive)\n- C header: int compute_histogram(const unsigned char* data, size_t len, size_t num_bins, char** out_json);\n- Minimal C impl would allocate a JSON string via malloc and fill it with bin counts\n- Go binding would call the C function, convert the result with GoString, then free the C buffer\n- Go program would spawn a pool of workers, each calling ComputeHistogram on a chunk, and then combine results into a single JSON array with a basic checksum across counts\n\nFollow-ups\n- How would you test for memory leaks in this CGO binding?\n- How would you handle varying bin counts or streaming rebinning across chunks?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "cgoa-q-21",
+        "questionId": "q-978",
+        "question": "Design a CGO bridge for a C streaming API that delivers chunks via a callback: void stream_data(int id, void (*chunk_cb)(const char* data, size_t len, void*), void* ctx). Implement a Go wrapper StreamFromC(id int) (io.Reader, error) that buffers chunks into an io.Pipe and exposes a safe reader, supporting concurrent streams and proper backpressure. Include a C header, a Go CGO binding, and a simple consumer showing two goroutines reading from the reader?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Safely bridge C and Go by copying each chunk, exporting a C callback (//export) and running the stream on its own thread; use a Go channel per stream and a cancel function to signal termination. Manag",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Leverage a per-stream context and a C callback exported to Go. Use a Go channel to forward chunks, copy data into Go memory, feed an io.Pipe writer, and return an io.Reader to the caller. Ensure clean",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Bridge a C streaming API where start_stream(cb, user) calls cb with chunks and a final sentinel with len==0. Create a Go callback via //export that pushes chunks onto a channel; manage stream state wi",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a per-call Go handle to shuttle chunks from C threads into Go. Pass the handle as user; Go trampoline copies chunk into a new Go slice, sends on the channel, then frees the C buffer. Cancel by cal",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to bridge callbacks, memory ownership, and streaming backpressure across language boundaries.\n\n## Key Concepts\n- CGO callback bridge and per-stream context\n- Memory ownership and copying from C to Go\n- Streaming via io.Pipe and concurrent reads\n\n## Code Example\n```c\n// stream.h\nvoid stream_data(int id, void (*chunk_cb)(const char*, size_t, void*), void* ctx);\n```\n```go\n// stream_bind.go (skeleton)\n/*\n#cgo CFLAGS: -I./include\n#include \"stream.h\"\n*/\nimport \"C\"\nimport (\n  \"io\"\n)\n\nfunc StreamFromC(id int) (io.Reader, error) {\n  // binding implementation here\n  return nil, nil\n}\n```\n```go\n// consumer.go (usage)\npackage main\nimport (\n  \"io\"\n  \"fmt\"\n)\nfunc main() {\n  r, _ := StreamFromC(42)\n  buf := make([]byte, 1024)\n  for {\n    n, err := r.Read(buf)\n    if err == io.EOF { break }\n    fmt.Printf(\"read %d bytes\\n\", n)\n  }\n}\n```\n\n## Follow-up Questions\n- How would you handle backpressure if C emits chunks faster than Go consumes them?\n- How would you adapt this to multiple ids concurrently without cross-talk?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "cgoa-q-22",
+        "questionId": "q-26470",
+        "question": "Design a CGOA wrapper for a C function that implements a thread-safe ring buffer with CGO, exposing Push and Pop semantics in Go. The C API is: ring_create(size), int ring_push(struct ring_buffer* rb, const char* data, size_t len), int ring_pop(struct ring_buffer* rb, char** out, size_t* out_len), void ring_free(struct ring_buffer* rb); Provide: 1) header and minimal C impl; 2) a Go binding exposing type RingBuffer with Push([]byte) error and Pop() ([]byte, error) that handle memory ownership; and 3) a Go program that uses a single RingBuffer in a worker-pool to drive high-throughput with proper error handling?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "To solve this, wrap a thread-safe C ring buffer via CGO. The Go binding must present Push([]byte) error and Pop() ([]byte, error) with strict ownership: C allocates for pops; Go copies into a Go slice",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Provide a CGOA wrapper: 1) C header and minimal impl; int summarize_batch(const SensorSampleC** samples, size_t n, char** out_json); 2) Go binding SummarizeBatch(samples []SensorSample) (string, error",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a CGO wrapper for a C function that verifies a batch of cryptographic signatures on streaming blocks. The C API should be: `int verify_blocks(const uint8_t** blocks, const size_t* block_lens, size_t n, const uint…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a per-listener context handle stored in a Go-backed map, pass the handle as ctx from Go to C, implement a CGO-exported Go callback, and call it with event and message. C side runs a background thr",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests CGOA patterns around memory ownership, error propagation, and high-concurrency interop with a real data structure.\n\n## Key Concepts\n- CGO memory ownership and freeing semantics\n- Copying between Go and C boundaries\n- Thread-safety: lock-free versus mutex-based ring buffer, CAS\n\n## Code Example\n```c\n// header\nstruct ring_buffer* ring_create(size_t n);\nint ring_push(struct ring_buffer* rb, const char* data, size_t len);\nint ring_pop(struct ring_buffer* rb, char** out, size_t* out_len);\nvoid ring_free(struct ring_buffer* rb);\n```\n\n```go\n// skeleton binding\ntype RingBuffer struct { /* ... */ }\nfunc (r *RingBuffer) Push(b []byte) error { /* ... */ }\nfunc (r *RingBuffer) Pop() ([]byte, error) { /* ... */ }\n```\n\n## Follow-up Questions\n- How would you ensure no memory leaks on error paths?\n- How would you test the boundary between Go GC and C memory lifetimes under GC pressure?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "cgoa-q-23",
+        "questionId": "q-29298",
+        "question": "Design a CGOA wrapper that encrypts multiple blocks in a single call and returns per-block stats in JSON. The C path uses a simple XOR with the provided key to simulate hardware acceleration, writing ciphertext to Go buffers and producing a JSON string allocated with malloc. The Go binding exposes StreamEncrypt(blocks [][]byte, key []byte) (string, error) via CGO; and a Go program streams blocks through a worker pool, collects per-block stats and a batch digest, with clear memory ownership and error propagation?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement a CGOA bridge that uses a C callback to push PCM frames to a Go channel via a stable handle. The Go side provides StartStream/StopStream, with a worker pool consuming frames. Key con",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a CGOA wrapper for a C streaming API that pushes chunks via a callback. Expose GetStream() (<-chan string, error) by registering a per-stream Go callback, using a C bridge function exported to",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a single C callback, export a Go function, map opaque handles to channels, and deliver events via channel to the correct handler. Manage lifecycle with unbind, ensure thread-safety with locks, and",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a CGOA wrapper that encrypts multiple blocks in a single call and returns per-block stats in JSON. The C path uses a simple XOR with the provided key to simulate hardware acceleration, writing",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "Why This Is Asked\\n\\nTests CGO boundary design, memory ownership, and parallel data processing across Go and C. Requires explicit lifetime management of blocks, explicit allocation/deallocation of JSON, and robust worker-pool integration.\\n\\nKey Concepts\\n\\n- CGO memory ownership and lifetimes\\n- Passing Go buffers to C safely\\n- Allocating JSON in C and freeing in Go\\n- Parallel per-block processing and error propagation\\n- Ensuring deterministic behavior with mock hardware path\\n\\nCode Example\\n\\n```c\\n// header\\nint stream_encrypt_blocks(const uint8_t** blocks, size_t n, size_t block_len, const uint8_t* key, size_t key_len, char** out_json);\\n```\\n\\n```go\\n// usage sketch\\n// #include \\\"wrapper.h\\\"\\n// func StreamEncrypt(blocks [][]byte, key []byte) (string, error) { ... }\\n```\\n\\nFollow-up Questions\\n\\n- How would you verify correctness without leaking memory across CGO?\\n- How would you adapt for variable-length blocks?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "cgoa-q-24",
+        "questionId": "q-28562",
+        "question": "Design a CGOA wrapper for a C function that processes an input array of images and returns per-image feature vectors plus a batch-level JSON summary. C API: int extract_image_features(const uint8_t** images, size_t n, size_t w, size_t h, size_t c, float*** features, char** out_json); features is a flat array of n×F floats; out_json is malloc'ed JSON describing per-image features and an overall batch hash. Provide: 1) a header and minimal C impl; 2) a Go binding exposing ExtractImageFeatures(images [][]byte, w,h,c int) (string, error) with memory ownership; and 3) a Go program that streams batches to a worker pool, collects per-image feature vectors, and computes a batch SHA256 over the features, ensuring memory ownership and error propagation?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a CGO bridge: assign a unique Go callback handle for each job; pass an opaque handle to C; export a Go function (//export) that C calls back with id, result, and the handle; a small C wrapper signature converts betw…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a CGO wrapper for a C function that processes an input array of images and returns per-image feature vectors plus a batch-level JSON summary. **C API:** ```c int extract_image_features(const uint8_t** images, siz…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Describe implementing a CGOA wrapper for a C function parse_log_batch(const char** logs, size_t n, char** out_json); Provide header, a minimal C implementation, a Go binding exposing ParseLogBatch(log",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a per-call Go handle to shuttle chunks from C threads into Go. Pass the handle as user; Go trampoline copies chunk into a new Go slice, sends on the channel, then frees the C buffer. Cancel by cal",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Question Is Asked\n\nThis question evaluates a candidate's understanding of CGO memory ownership semantics, cross-language data handling, and streaming concurrency patterns in a realistic image feature pipeline.\n\n## Key Concepts Tested\n\n| Concept | Implementation Detail |\n|---------|----------------------|\n| CGO memory ownership | Go frees C-allocated `features` array and `out_json` string |\n| Passing 2D buffers to C | Converting Go `[][]byte` to `const uint8_t**` |\n| Concurrency with backpressure | Buffered channel sized to worker count |\n| Error propagation | C return codes converted to Go errors |\n\n**Evaluation focus areas:**\n- Correct pointer-to-pointer semantics when interfacing with C\n- Proper use of `runtime.KeepAlive` to prevent premature GC of Go-managed memory\n- Clean shutdown patterns for worker pools\n- Robust error handling across the language boundary",
+        "difficulty": "advanced"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-10-16T14:12:53.333Z",
+    "createdAt": "2026-10-17T06:37:35.148Z",
     "version": 1
   }
 ]
