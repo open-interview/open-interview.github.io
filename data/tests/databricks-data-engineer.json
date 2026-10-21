@@ -8,74 +8,194 @@
     "questions": [
       {
         "id": "databricks-data-engineer-q-0",
-        "questionId": "q-15218",
-        "question": "Scenario: a multi-tenant Databricks Delta Live Tables pipeline ingests JSON/Parquet from S3 daily. A previously ingested file reappears corrected. Design an idempotent re-ingest: (a) per-file provenance with source_path, file_timestamp, and a derived source_file_version, (b) version-aware MERGE into Silver to prevent duplicates, (c) propagate fixes to Gold, (d) an AuditFiles lineage table, (e) Unity Catalog RBAC with masking to limit tenant visibility. Include data model and a testing plan with tombstoned files?",
+        "questionId": "q-27885",
+        "question": "Design a Databricks pipeline ingesting 90 GB/day of multi-tenant Parquet/JSON logs from S3. Propose a Silver layer that uses a central per-tenant schema registry with versioned, backward-compatible contracts, enforces schema drift policies during Auto Loader ingestion, records per-file provenance, and writes a tenant-scoped Gold table for dashboards. Describe how data contracts, Unity Catalog RBAC, and a parallel, test-driven migration plan for schema upgrades across tenants would work, including rollback?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "DLT Bronze from S3 JSON to Bronze_raw; Silver normalizes timestamps to UTC, flattens nested fields, and enforces non-null customer_id and session_id; Gold outputs per-event rows with a deterministic k",
+            "text": "Design a streaming DLT pipeline: Bronze landing per-tenant JSON from API gateway; Silver with event_id dedupe and CDC-style MERGE; Gold aggregates per-tenant. Enforce Unity Catalog RBAC and tenant_id",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design an idempotent re-ingest: derive source_file_version from file_timestamp and a content hash; track provenance in AuditFiles (tenant_id, source_path, file_timestamp, source_file_version). Use ver",
+            "text": "Implement a central, versioned schema registry keyed by tenant_id, enforcing backward-compatible contracts. Ingest with Auto Loader using schemaEvolutionMode='addNewColumns' and per-file provenance via the `handleExisti…",
             "isCorrect": true
           },
           {
             "id": "c",
-            "text": "Implement a Silver layer using Delta Live Tables that preserves per-file provenance (source_path, file_timestamp, ingest_ts) and exposes a provenance view. Handle per-tenant schema drift through a central schema registr…",
+            "text": "Use Auto Loader to ingest Parquet into Bronze Delta, then Spark SQL to flatten nested fields and aggregate by tenant_id and date into Silver. Create AuditFiles with batch_id via UDF(source_path, inges",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Implement a Canonical Schema Registry in Delta Lake to maintain a unified schema with per-field metadata (name, type, source_schema_id). Ingest data using Auto Loader with per-file provenance tracking, and use a lightwe…",
+            "text": "Proposed approach: load with Auto Loader using file provenance columns populated by a lightweight UDF; implement a Silver delta table with dedup by event_id and a 10-minute watermark for late data; cr",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to reason about idempotent re-ingest, per-file provenance, and safe propagation of corrections in a multi-tenant, RBAC-governed environment.\n\n## Key Concepts\n- Idempotent re-ingest with file-versioning\n- Provenance and audit trails for lineage\n- Safe upserts via versioned MERGE in Silver\n- End-to-end RBAC and masking across tenants\n- Testing with tombstoned/corrected inputs\n\n## Code Example\n```sql\n-- Example: deduplicate by file_version during MERGE into Silver\nMERGE INTO silver_table AS s\nUSING staging_table AS st\nON s.event_id = st.event_id AND s.source_file_version = st.source_file_version\nWHEN MATCHED THEN UPDATE SET *\nWHEN NOT MATCHED THEN INSERT *;\n```\n\n## Follow-up Questions\n- How would you validate lineage queries across tenants?\n- What are trade-offs of deriving source_file_version from hash vs timestamp?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Question Is Asked\n\nThis question evaluates your ability to design governance and operational practices for multi-tenant data lakes on Databricks, with emphasis on schema contracts, data lineage, and safe migrations.\n\n## Key Concepts\n\n- **Central Schema Registry**: Versioned, per-tenant schemas stored in a dedicated metastore or external registry, enabling strict contract enforcement and auditability.\n- **Backward-Compatible Contracts**: New fields default to nullable or have safe defaults; removed fields are deprecated, never dropped, ensuring existing queries remain valid.\n- **Auto Loader with Schema Evolution**: `schemaEvolutionMode='addNewColumns'` auto-appends new columns; drift policies reject unexpected schema changes to protect downstream consumers.\n- **Per-File Provenance**: Every ingested file is tagged with tenant_id, ingestion timestamp, source path, and schema version, enabling full lineage and audit trails.\n- **Tenant-Scoped Gold Tables**: Partitioned or bucketed by tenant_id, these tables serve deterministic MERGE operations and feed dashboards with isolated, performant queries.\n- **Unity Catalog RBAC**: Column-level security and row filters enforce data isolation across tenants, preventing cross-tenant data leakage.\n- **Parallel, Test-Driven Migration**: Schema upgrades are validated in parallel branches per tenant using synthetic data, with gradual rollouts and automated rollback on failure.\n\n## Code Example\n\n```scala\nimport io.delta.tables.DeltaTable\nimport org.apache.spark.sql.functions._\nimport org.apache.spark.sql.types._\n\n// Define the versioned schema contract for a tenant\nval tenantSchema = StructType(Seq(\n  StructField(\"event_id\", StringType, nullable = false),\n  StructField(\"tenant_id\", StringType, nullable = false),\n  StructField(\"timestamp\", TimestampType, nullable = false),\n  StructField(\"payload\", StringType, nullable = true) // nullable for backward compat\n))\n\n// Auto Loader ingestion with provenance and drift policy\nspark.readStream\n  .format(\"cloudFiles\")\n  .option(\"cloudFiles.format\", \"json\")\n  .option(\"schemaEvolutionMode\", \"addNewColumns\")\n  .option(\"cloudFiles.schemaLocation\", s\"/mnt/provenance/$tenantId/_schemas\")\n  .schema(tenantSchema)\n  .load(s\"s3://logs-bucket/tenant=$tenantId/\")\n  .withColumn(\"ingested_at\", current_timestamp())\n  .withColumn(\"source_file\", input_file_name())\n  .writeStream\n  .format(\"delta\")\n  .option(\"mergeSchema\", \"true\")\n  .trigger(availableNow = true)\n  .toTable(s\"silver.raw_events\")\n\n// Deterministic MERGE into tenant-scoped Gold table\nDeltaTable.forName(spark, s\"gold.tenant_events\")\n  .as(\"target\")\n  .merge(\n    silverDF.as(\"source\"),\n    expr(\"target.tenant_id = source.tenant_id AND target.event_id = source.event_id\")\n  )\n  .whenMatched.updateAll()\n  .whenNotMatched.insertAll()\n  .execute()\n```",
+        "difficulty": "advanced"
       },
       {
         "id": "databricks-data-engineer-q-1",
-        "questionId": "q-14906",
-        "question": "In a Databricks data lake ingesting 25 GB/day of Parquet logs from S3 across three tenants, design a beginner-friendly pipeline that (1) preserves per-file provenance, (2) handles nested schema drift with a simple evolution policy, (3) upserts silver data by a stable key, and (4) emits a BI-friendly Gold table with tenant_id and date. Add a lightweight data-refresh governance gate: if no new files arrive for 48 hours, trigger an automated re-ingest test and report results. What steps would you take?",
+        "questionId": "q-19006",
+        "question": "In a multi-tenant data lake ingesting 60 GB/day of JSON/Parquet events from per-tenant S3 folders, design a Silver layer using Delta Live Tables that (1) preserves per-file provenance in AuditFiles with source_path and timestamps, (2) uses a central EvolutionPolicy to drive schema drift handling for nested JSON, (3) performs CDC-like upserts into Silver using event_id and a tombstone flag for deletes, (4) materializes a tenant-scoped Gold table for BI (tenant_id, date, metrics), (5) enforces Unity Catalog RBAC with masking and dynamic filters so tenants access only their data, (6) adds a data-quality gate and a bounded late-data watermark with fault-tolerant Auto Loader, and (7) includes a concrete testing plan with synthetic late and partial data. Provide concrete steps and trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Propose a per-tenant shadow-CDC delta path, with an AuditFiles table for provenance and a TenantCDC Delta table fed by a per-tenant MERGE into Silver, followed by Gold. Use Unity Catalog to enforce RB",
+            "text": "Implement a Delta Live Tables workflow with per-tenant Bronze sources using Auto Loader from S3, Silver tables leveraging Change Data Feed for CDC with tenant-specific schema contracts, automatic schema evolution for dr…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use Auto Loader for Bronze with per-file provenance (path, ingest_ts). Silver dedup by event_id; implement a light schema-evolution policy for nested fields. Build Gold with BI-friendly columns (tenan",
-            "isCorrect": true
+            "text": "DLT Silver plan: ingest Bronze Parquet with schema evolution (allow_unsafe_schema_evolution) to accept new fields; gate access via Unity Catalog RBAC and mask PII with masking policy/view; implement d",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Design and implement a Silver layer in Delta Live Tables to meet enterprise governance and data quality requirements. The implementation addresses seven key areas: 1. **Per-File Provenance**: Leverage Auto Loader with `…",
-            "isCorrect": false
+            "text": "Use a Silver table keyed by event_id; maintain AuditFiles capturing source_path and ingest_ts; apply schema drift via EvolutionPolicy stored in a Delta table; implement MERGE into Silver on event_id w",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Proposed approach: Use a DLT pipeline with Bronze ingest from JSON, then Silver derived from Bronze. Deduplicate on event_id, keeping the latest by ingest_time. Join to users_dim on user_id to validat",
+            "text": "Leverage Delta Live Tables to ingest Kafka streams into Bronze layer with auto-schema evolution, then implement CDC-like upserts into Silver layer using MERGE operations. Create versioned online feature tables in Databr…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests practical, beginner-friendly mastery of Delta Lake concepts, Auto Loader, simple schema evolution, and governance in multi-tenant environments. It also checks automation of re-ingest tests and integration with Unity Catalog RBAC.\n\n## Key Concepts\n\n- Auto Loader Bronze ingestion and per-file provenance\n- Silver dedup and schema drift handling\n- Gold BI-ready schema design\n- Lightweight governance gate triggering automated tests\n- Unity Catalog RBAC and multi-tenant data sharing basics\n\n## Code Example\n\n```javascript\n// Pseudo DLT-like test harness in JS-like syntax\nfunction testReingest(prevCount, newFiles) {\n  if (newFiles === 0 && prevCount > 0) throw new Error(\"Stale data\");\n  return true;\n}\n```\n\n## Follow-up Questions\n\n- How would you adapt the governance gate for variable ingest rates?\n- How do you test the evolution policy without breaking existing data?",
-        "difficulty": "beginner"
+        "explanation": "## Why This Is Asked\nNew angle on governance and drift control via a central EvolutionPolicy; tests and tenancy are practical at scale.\n\n## Key Concepts\n- Delta Live Tables, EvolutionPolicy, MERGE, Unity Catalog, masking, data quality gate, watermark, Auto Loader fault tolerance.\n\n## Code Example\n```python\nimport dlt\n@dlt.table\ndef silver():\n  raw = dlt.read_stream(\"bronze\")\n  evolved = evolve_with_policy(raw, policy_table)\n  return upsert_by_event_id(evolved)\n```\n\n## Follow-up Questions\n- How would you validate EvolutionPolicy across tenants?\n- How would you ensure cross-tenant dashboards cannot leak data?",
+        "difficulty": "intermediate"
       },
       {
         "id": "databricks-data-engineer-q-2",
-        "questionId": "q-8019",
-        "question": "Design a Bronze-Silver-Gold pipeline in Databricks for a multi-tenant SaaS product using Auto Loader and Delta Live Tables. Bronze ingests Parquet files from S3 with per-tenant_id; Silver applies a CDC-like MERGE from Bronze to Silver with a 2-minute watermark; Gold provides tenant-scoped aggregates. Enforce Unity Catalog RBAC on Silver and an AuditDelta per file. Add a lineage table and a schema-evolution policy (new columns default NULL). Propose a synthetic-tenant test plan validating lineage, RBAC, and data quality?",
+        "questionId": "q-4915",
+        "question": "In a Databricks pipeline, 10–20 GB/day of Parquet clickstream data lands in S3 and is loaded into a Bronze Delta table via Auto Loader, with a Silver layer that must cope with weekly schema drift (new fields, renamed columns) and perform event_id deduplication, before a Gold aggregation layer used for dashboards. Describe an implementation that enables robust Delta Lake schema evolution, preserves downstream query compatibility, and includes a lightweight test plan to validate drift handling across environments. How would you guard against breaking changes while keeping retroactive queries correct?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Bronze: Auto Loader ingests S3 Parquet with tenant_id; Silver: CDC-like MERGE Bronze->Silver with 2-minute watermark; Gold: tenant-scoped aggregates. Enforce Unity Catalog RBAC on Silver and AuditDelt",
+            "text": "Implement the Silver layer using Auto Loader with schema inference and explicit file provenance metadata. Enforce a permissive-but-validated evolution policy for schema drift, derive tenant-scoped features using Spark w…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Explain a Silver-layer observability-first design for 60 GB/day multi-tenant ingestion. Include per-file/per-tenant latency metrics in Delta, a provenance view, drift alerts with thresholds, a backoff",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Adopt Delta schema evolution with mergeSchema enabled and a target schema version. Silver casts/renames to the target, while Bronze stores original driftable columns. Use event_id dedupe via MERGE CDC",
             "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement Silver with Delta Live Tables and an AuditFiles Delta table that records path, ingest_ts, file_size, source_system; expose a provenance view; handle JSON schema drift via Delta schema evolut",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes practical schema evolution management, drift testing, and end-to-end stability in a Databricks lakehouse.\n\n## Key Concepts\n- Delta schema evolution and mergeSchema\n- Silver/Gld layering with drift handling\n- Backward/forward compatibility views\n- Lightweight drift test strategy\n\n## Code Example\n```javascript\n// Enable auto-merge of schemas in Delta Lake\nspark.conf.set(\"spark.databricks.delta.mergeSchema.autoMerge.enabled\",\"true\")\n```\n\n## Follow-up Questions\n- How would you roll back a drift that breaks downstream dashboards?\n- What tests would you automate to guard future schema changes?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "databricks-data-engineer-q-3",
+        "questionId": "q-1409",
+        "question": "Describe an end-to-end approach for a fraud-detection streaming pipeline using two Kafka topics (transactions, account_updates): Bronze ingest, join to a versioned SCD2 customer_dim, compute risk in Silver, upsert via MERGE with a deterministic key, watermark late data, handle schema drift with Delta Lake evolution, and enforce governance with Unity Catalog RBAC and lineage. Include testing with synthetic late-arriving data?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use Auto Loader to ingest Parquet with per-file provenance, create a Silver table, compute and store a file checksum and per-file data-quality metrics for nulls/duplicates/schema drift, and MERGE into",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Ingest two Kafka topics into Bronze, join to a versioned SCD2 customer_dim, compute per-event risk in Silver, and upsert into Silver with MERGE on tx_id. Use watermarking for late data, enable Delta L",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Load 3 GB/day Parquet logs from S3 into a Bronze Delta table using Auto Loader. Build a Silver layer that enriches each event by left joining with the small static dimension table customers (customer_id, country, segmen…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Auto Loader to Bronze with source_path and ingest_ts; Silver MERGE on event_id; SchemaChangeLog versioning for drift; data_dict view with name, type, sample; RBAC and masking for PII; test plan with s",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssesses ability to design multi-source streaming with versioned references, robust late-data handling, idempotent upserts, schema evolution, and governance.\n\n## Key Concepts\n- Multi-source streaming from Kafka into Bronze\n- Slowly changing dimension (SCD2) for customer_dim\n- Idempotent MERGE semantics on deterministic keys\n- Watermarking and late data handling\n- Delta Lake schema evolution for drift\n- Unity Catalog RBAC and data lineage\n\n## Code Example\n```javascript\n// Pseudo-sample: MERGE into Silver risk table from Bronze transactions\nspark.sql(`MERGE INTO silver_risk AS s\nUSING bronze_transactions AS b\nON s.tx_id = b.tx_id\nWHEN MATCHED THEN UPDATE SET s.score = b.score, s.updated_at = current_timestamp()\nWHEN NOT MATCHED THEN INSERT (tx_id, score, updated_at) VALUES (b.tx_id, b.score, current_timestamp())`)\n```\n\n## Follow-up Questions\n- How would you test end-to-end with synthetic late-arriving data?\n- What metrics would you monitor to detect backpressure or data skew in this design?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "databricks-data-engineer-q-4",
+        "questionId": "q-20431",
+        "question": "Design a Databricks Delta Live Tables pipeline for a multi-tenant dataset arriving as JSON and Parquet in S3 (50-100 GB/day). Your Silver layer should implement OpenLineage-compliant data lineage by recording inputs and transformations into a dedicated Lineage table, capture run_id, source_path, file_timestamp, ingest_ts, transform_name, input_table, output_table, and a hash. Explain how you'd expose lineage through a view, enforce access with Unity Catalog RBAC, and validate lineage integrity with synthetic tests?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement OpenLineage-compliant lineage by recording inputs and transformations into a Lineage table keyed by run_id; capture: source_path, file_timestamp, ingest_ts, transform_name, input_table, outp",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Design a Silver layer that preserves per-file provenance in an AuditFiles table, supports JSON schema drift through schema enforcement and evolution policies, streams CDC via Change Data Feed with MERGE upserts into Sil…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use Auto Loader to land per‑tenant Parquet files into Bronze, create Silver with schema enforcement, and MERGE into Gold on event_id/date. Add AuditFiles with path, ingest_ts, file_size, and checksum;",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a DLT Silver layer that streams per-tenant features into the Databricks Feature Store, handles feature-versioning for drift, validates compatibility before writes, preserves per-file provenance",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssess governance and lineage skills across Bronze-Silver-Gold with OpenLineage, Unity Catalog, and synthetic testing.\n\n## Key Concepts\n- OpenLineage integration\n- Delta Live Tables lineage capture\n- Lineage table schema and versioning\n- Unity Catalog RBAC and views\n- Synthetic tests for lineage completeness\n\n## Code Example\n```javascript\n// Pseudo-code to insert lineage for a batch\nconst lineage_entry = spark.createDataFrame([\n  [run_id, source_path, file_timestamp, ingest_ts, transform_name, input_table, output_table, lineage_hash]\n], { schema: [...] })\nlineage_entry.write.mode('append').saveAsTable('lineage_openlineage')\n```\n\n## Follow-up Questions\n- How would you handle lineage for schema-evolving nested JSON inputs?\n- How would you monitor and alert on lineage gaps across runs?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "databricks-data-engineer-q-5",
+        "questionId": "q-22553",
+        "question": "Design a Databricks Delta Live Tables Silver layer for a 60 GB/day ingestion of mixed JSON and Parquet data from S3 across multiple tenants. Implement per-tenant data contracts stored in a central Contracts table. Your solution should: (1) project incoming data to the contract schema using a UDF and drop/ quarantine fields not in the contract; (2) support evolving contract fields with a governance policy and automatic updates to the contract; (3) implement a CDC-like upsert into a tenant-scoped Gold table; (4) enforce Unity Catalog RBAC with masking so tenants only see their data; (5) include data-quality gates and late-data handling with watermark; (6) provide a test plan with synthetic drift events and quarantine cases. Outline concrete steps, trade-offs, and how you would monitor and roll back if the contract changes unexpectedly?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a multi-tenant Databricks streaming pipeline ingesting IoT JSON telemetry for five tenants. Build a Silver layer that handles evolving schemas, preserves per-file provenance in an AuditFiles structure (source_pat…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a Silver layer using Delta Live Tables (DLT) that processes 60 GB/day of mixed JSON and Parquet data from S3 across multiple tenants. The architecture centers on a central Contracts table that defines per-tenant…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Design a Silver layer with per-tenant provenance tracking and CDC-like MERGE operations for upserts, implementing schema drift handling via explicit evolution rules. The Gold layer aggregates metrics into a BI-ready tab…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a Delta Live Tables pipeline (Silver/Gold) for 200 GB/day, multi-tenant on S3. Enforce per-tenant schema evolution, implement SCD2-style history in Gold, and use Unity Catalog RBAC with masking",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests the ability to design enterprise-grade data pipeline governance in a multi-tenant lakehouse environment. It validates understanding of Databricks DLT, data contracts, schema drift handling, and operational safety mechanisms.\n\n## Key Concepts\n- **Per-tenant data contracts**: Centralized schema definition stored in Delta tables\n- **UDF-driven projection**: Custom logic to enforce contract boundaries\n- **Quarantine pattern**: Isolating non-conforming records for investigation\n- **Schema evolution governance**: Controlled field addition with approval workflows\n- **CDC upserts**: Merge semantics preserving change history\n- **Unity Catalog RBAC**: Fine-grained access control with column masking\n- **Watermarks**: Handling late-arriving data with configurable windows\n\n## Trade-offs\n| Aspect | Consideration |\n|--------|---------------|\n| UDF vs. Native Projection | UDFs offer flexibility but impact performance; consider Spark native projection for high-throughput paths |\n| Auto-evolution vs. Manual Approval | Auto-update reduces latency but risks propagating bad schemas; governance queues provide safety net |\n| Quarantine Storage | Balancing cost vs. observability—retain quarantine data for SLA-defined periods |\n\n## Monitoring & Observability\n- **Pipeline health**: DLT pipeline metrics via Databricks SDK\n- **Contract drift alerts**: Stream quality expectations failure rates\n- **Quarantine metrics**: Track quarantine volume by tenant and field\n- **Rollback automation**: CI/CD pipeline integration with contract version tags\n\n## Code Example\n```python\nfrom pyspark.sql.functions import col, when, to_json, from_json\nfrom pyspark.sql.types import StructType\n\ndef project_to_contract(df, contract_schema):\n    \"\"\"Project DataFrame to contract schema, quarantine unknown fields\"\"\"\n    contract_fields = set(contract_schema.fieldNames())\n    \n    selected = [c for c in df.columns if c in contract_fields]\n    quarantine = [c for c in df.columns if c not in contract_fields]\n    \n    return df.select(*selected).withColumn(\"_quarantined_fields\", to_json(struct(*quarantine)))\n\n# DLT Pipeline Definition\n@dlt.table\ndef silver_tenant_data():\n    contract = spark.read.table(\"catalog.governance.contracts\").filter(col(\"tenant_id\") == current_tenant_id)\n    \n    return (\n        dlt.read_stream(\"bronze_ingestion\")\n        .transform(project_to_contract, contract)\n        .filter(\"_quarantined_fields IS NULL\")\n    )\n\n# Quality Gates\n@dlt.expect(\"valid_contract_fields\", \"_quarantined_fields IS NULL\")\n@dlt.expect(\"no_null_keys\", \"tenant_id IS NOT NULL AND record_id IS NOT NULL\")\n```",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "databricks-data-engineer-q-6",
+        "questionId": "q-24490",
+        "question": "In a Databricks data platform, you ingest 10 GB/hour of nested JSON events from Kinesis into Bronze; build a Silver layer that preserves per-event provenance via a provenance view and AuditEvents with fields source_stream, shard_id, seq_no, ingest_ts; evolves JSON schema drift with a defined evolution policy; implements CDC-like MERGE into Silver; produces a Gold table for fraud features (customer_id, window_start 5-min, total_events_5m, distinct_devices_5m, mean_session_len_5m, fraud_risk); enforces Unity Catalog RBAC with masking for PII; adds a data quality gate that blocks downstream if anomaly_rate > 2% or validity_rate < 0.98; outlines fault tolerance for Auto Loader with late data; and a synthetic test plan for late/out-of-order events?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a multi-tenant Databricks governance pattern with a centralized Feature Registry, Unity Catalog RBAC, and a lineage from raw sources to feature outputs. Include an AuditFeatures table tracking",
+            "isCorrect": false
           },
           {
             "id": "b",
@@ -84,127 +204,247 @@
           },
           {
             "id": "c",
-            "text": "Design a comprehensive Delta Live Tables pipeline with multi-source ingestion, composite-key deduplication, late data handling, PII masking, and Unity Catalog governance. The pipeline ingests from S3 Auto Loader (JSON w…",
-            "isCorrect": false
+            "text": "Propose a Silver design that preserves per-event provenance via an AuditEvents table and a UDF-based provenance view, evolves nested JSON with a 2-stage merge policy, uses MERGE for CDC into Silver, a",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Use Delta Live Tables with streaming Bronze→Silver→Gold. In Silver, preserve per-tenant lineage (ingest_ts, source) and upsert to a Gold table keyed by tenant_id, event_time. Enforce Unity Catalog RBA",
+            "text": "Implement governance with Unity Catalog RBAC and per-tenant catalogs, plus an AuditFiles and Lineage table. Use Auto Loader file metadata to capture source_path, file_timestamp, ingest_ts in provenanc",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design end-to-end multi-tenant pipelines with strict isolation, lineage, and schema evolution, plus practical testing strategies.\n\n## Key Concepts\n\n- Delta Live Tables, Auto Loader, Unity Catalog RBAC, row-level security, AuditDelta\n- CDC-like MERGE, watermarking, lineage capture\n- Schema evolution with safe defaults, synthetic data testing\n\n## Code Example\n\n```javascript\n// Example: DLT pipeline snippet placeholder\n```\n\n## Follow-up Questions\n\n- How would you handle schema drift across tenants without downtime?\n- How would you verify lineage across successive pipeline runs?",
+        "explanation": "## Why This Is Asked\nTests end-to-end pipeline design under real-world constraints: provenance, schema drift, CDC, RBAC, data quality, and late data in Databricks.\n\n## Key Concepts\n- Silver/Gold layering with CDC MERGE\n- Per-event provenance and provenance views\n- Schema evolution in nested JSON\n- Unity Catalog masking/RBAC\n- Data quality gates and late-data handling\n\n## Code Example\n```javascript\n// Example placeholder: UDF for provenance field enrichment\n```\n\n## Follow-up Questions\n- How would you tune the schema evolution policy for aggressive drift? \n- What monitoring would you add for latency and data quality gates?",
         "difficulty": "intermediate"
       },
       {
-        "id": "databricks-data-engineer-q-3",
-        "questionId": "q-30255",
-        "question": "In a Databricks pipeline ingesting 40 GB/day of Parquet logs from S3 for multiple tenants, design a beginner Silver layer that automatically loads with Auto Loader, records per-file provenance, computes per-file data-quality metrics (null counts, duplicates, schema drift) stored in a Delta table DQ_METRICS, validates a simple file checksum to detect corruption, and performs a deterministic upsert into Gold on (tenant_id, event_id). Outline concrete steps and a minimal test harness that exercises late-arriving files?",
+        "id": "databricks-data-engineer-q-7",
+        "questionId": "q-19918",
+        "question": "Design a multi-tenant Databricks Silver layer ingesting 60 GB/day of mixed JSON and Parquet from S3. Your design must preserve per-file provenance, handle schema drift, implement CDC-like MERGE to a tenant-scoped Gold table, enforce Unity Catalog RBAC with data masking, include a data-quality gate and late-data watermark, and provide a test plan with synthetic late data. Outline concrete steps and trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a Silver layer that computes per-minute anomaly scores with a 60-minute sliding window on event_time, writes to Delta table AnomalyScores, and exposes a read-only masking view; include a lightw",
+            "text": "Design a Delta Live Tables pipeline to ingest multi-tenant Parquet logs using Auto Loader, enforce per-tenant RBAC through Unity Catalog, and export to Delta Sharing with tenant-scoped column masking. Implement per-file…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a canonical Silver layer featuring a unified event schema with comprehensive provenance tracking (source_system, ingest_timestamp, trace_id, record_hash). Leverage Delta Lake's schema evolution capabilities to au…",
+            "text": "Design a Databricks Silver layer for 25 GB/day Parquet logs that records per-file provenance in an AuditFiles Delta table (path, file_timestamp, ingest_ts, size, status) via a batch_id UDF; upserts Si",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use Auto Loader to ingest Parquet with per-file provenance, create a Silver table, compute and store a file checksum and per-file data-quality metrics for nulls/duplicates/schema drift, and MERGE into",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Leverage Auto Loader to ingest Bronze JSON data, flatten nested structures into a canonical schema with defined columns (user_id, session_id, event_id, event_time, device, geo_country, geo_city), and implement MERGE ope…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question evaluates practical understanding of end-to-end data quality observability, per-file provenance, and deterministic upserts in Databricks, plus handling late data with testable governance.\n\n## Key Concepts\n- Auto Loader provenance and per-file tracking\n- Delta Lake schema enforcement and drift handling\n- Data-quality metrics table (DQ_METRICS)\n- File checksums for corruption detection\n- Idempotent MERGE upserts into Gold\n- Late-arriving data testing\n\n## Code Example\n```javascript\n// Pseudo-implementation: MERGE into Gold from Silver\ndeltaTable(\"gold\").merge({\n  source: deltaTable(\"silver\").alias(\"s\"),\n  condition: \"s.tenant_id = g.tenant_id AND s.event_id = g.event_id\"\n}).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()\n```\n\n## Follow-up Questions\n- How would you validate DQ_METRICS thresholds and alerting?\n- How would you handle schema drift without breaking downstream consumers?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "databricks-data-engineer-q-4",
-        "questionId": "q-22452",
-        "question": "In a Databricks data platform receiving 200 GB/day of mixed JSON and Parquet data from 3 tenants into Bronze Silver Gold, design a robust Silver layer that (1) preserves per-file provenance (source_path, file_timestamp, ingest_ts) via a provenance view (2) evolves nested JSON schemas gracefully (3) uses Delta CDF with MERGE for CDC into Silver (4) produces a BI-ready Gold table with tenant_id/date (5) enforces Unity Catalog RBAC with masking (6) adds a probabilistic anomaly detector as a data quality gate that blocks downstream on high anomaly probability (7) handles late data with watermarking and fault-tolerant checkpointing (8) tests with synthetic late data and partial files Outline concrete ingestion partitioning drift policy and testing plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Adopt Silver with Auto Loader ingesting JSON and Parquet into per-file provenance AuditFiles; use Delta Lake schema evolution with a drift policy for nested JSON; CDC into Silver via Delta CDF and MER",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Design a robust multi-tenant Databricks pipeline using Delta Live Tables with a Bronze-Silver-Gold medallion architecture. The Bronze layer ingests 100 GB/day of mixed JSON/Parquet logs from S3 and YAML configurations i…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a comprehensive Delta Live Tables pipeline with multi-source ingestion, composite-key deduplication, late data handling, PII masking, and Unity Catalog governance. The pipeline ingests from S3 Auto Loader (JSON w…",
+            "text": "Use Auto Loader with schema evolution for Bronze; Silver uses MERGE CDC on session_id; set a 5-minute watermark for late data; implement Unity Catalog masking policy to redact IP and email at query ti",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use Delta Live Tables with streaming Bronze→Silver→Gold. In Silver, preserve per-tenant lineage (ingest_ts, source) and upsert to a Gold table keyed by tenant_id, event_time. Enforce Unity Catalog RBA",
-            "isCorrect": false
+            "text": "Approach: ingest with Auto Loader; store per-file provenance in AuditFiles (source_path, file_timestamp, ingest_ts); use Delta schema evolution for nested JSON; CDC-like upserts to Gold on (tenant_id,",
+            "isCorrect": true
           }
         ],
-        "explanation": "Why This Is Asked\n\nTests the ability to design a practical Silver layer that handles multi-tenant drift, data quality gates, and RBAC with masking in a real Databricks stack; emphasizes concrete ingestion strategies, schema evolution, CDC, and late data handling.\n\n## Key Concepts\n\n- Delta Lake schema evolution and drift policy\n- Delta CDF and MERGE for CDC\n- Unity Catalog RBAC and masking\n- Data quality gates using anomaly detection\n- Auto Loader, provenance, and checkpointing\n- Late data handling and watermarking\n\n## Code Example\n\n```javascript\n// Implementation sketch (not executable in interview)\n```\n\n## Follow-up Questions\n\n- How would you tune latency vs drift coverage?\n- How would you test the anomaly detector thresholds?",
+        "explanation": "## Why This Is Asked\n\nTests ability to design scalable Silver/Gold with multi-tenant governance, schema evolution, and data quality. It also probes practical trade-offs between Delta Live Tables and Auto Loader, plus RBAC masking and late-data handling.\n\n## Key Concepts\n\n- Auto Loader provenance and Delta schema evolution\n- CDC-like MERGE for multi-tenant Gold\n- Unity Catalog RBAC and dynamic masking\n- Data-quality gates and watermarking for late data\n- Fault tolerance, checkpointing, and synthetic late-data testing\n\n## Code Example\n\n```sql\nMERGE INTO gold_table AS g\nUSING staging AS s\nON g.tenant_id = s.tenant_id AND g.event_time = s.event_time\nWHEN MATCHED THEN UPDATE SET ...\nWHEN NOT MATCHED THEN INSERT ...\n```\n\n## Follow-up Questions\n\n- How would you monitor SLA and pause quality gates if latency spikes occur?\n- What metrics and dashboards would you create to observe provenance and schema drift over time?",
         "difficulty": "intermediate"
       },
       {
-        "id": "databricks-data-engineer-q-5",
-        "questionId": "q-28351",
-        "question": "Design a Delta Live Tables pipeline with Bronze from Auto Loader (per-file provenance: source_path, ingest_ts, file_timestamp) and tenant_id; Silver uses CDC MERGE with Evolution for JSON drift; add an ML anomaly gate at Silver that flags issues but doesn't block Gold; Gold partitioned by tenant_id/date for dashboards; enforce Unity Catalog RBAC with masking; include a test plan with synthetic late data and partial files?",
+        "id": "databricks-data-engineer-q-8",
+        "questionId": "q-26484",
+        "question": "In a Databricks pipeline ingesting 100 GB/day of Parquet logs from S3 for 200 tenants, design a multi-tenant Silver layer that (1) preserves per-file provenance via Auto Loader, (2) enforces per-tenant data contracts stored in a Contracts table, (3) runs a policy-evaluator to block writes to Gold when any contract fails, (4) performs idempotent MERGE-based upserts into a tenant-scoped Gold table, (5) applies Unity Catalog masking and tenant RBAC, and (6) includes a validation test plan with synthetic late data and contract-violating records. Provide concrete steps and testing strategy?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design Silver with dedup by record_id, add processing_timestamp, and daily QA gate: if count falls outside baseline +/- 20%, stop downstream. Use Auto Loader for Bronze, MERGE to upsert Silver, mainta",
+            "text": "Use Auto Loader to ingest per-file, extract tenant_id, load tenant schema from contracts/tenant_id.json, cast fields to expected types, and compare against the contract. If mismatch, write file metada",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design a Delta Live Tables pipeline with Bronze from Auto Loader (per-file provenance: source_path, ingest_ts, file_timestamp) and tenant_id; Silver uses CDC MERGE with Evolution for JSON drift; add a",
-            "isCorrect": true
+            "text": "Ingest 5 GB/day JSON clickstream from S3 to Bronze via Auto Loader; flatten nested payloads into Silver, deduplicate by event_id with MERGE CDC, and apply a 2-minute watermark. Build Gold as daily act",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use Auto Loader with cloudFiles to ingest 150 GB/day, add an immutable AuditTrail capturing source_path and file_timestamp per file; enable Delta CDF for CDC and populate a CDC table; build a BI-ready",
+            "text": "Propose a Silver layer that tracks provenance per file, uses Delta schema evolution for nested JSON drift, applies a CDC-like MERGE into Silver, then writes a tenant-scoped offline feature table to th",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Design a Delta Live Tables pipeline: Bronze from S3 Parquet, Silver with per-file provenance (path, ingest_ts) and schema enforcement, compute a lightweight file_checksum on load, then upsert into Gol",
-            "isCorrect": false
+            "text": "Design a multi-tenant Silver layer ingesting 100 GB/day of Parquet from S3 with Auto Loader provenance. Add a Contracts table describing per-tenant schemas, required fields, and ranges, plus a policy",
+            "isCorrect": true
           }
         ],
-        "explanation": "Why This Is Asked\nTests end-to-end Delta Live Tables design, per-file provenance, schema drift handling, ML-driven data quality, tenant isolation, Unity Catalog masking, and test strategy.\n\nKey Concepts\n- Delta Live Tables, Auto Loader, per-file provenance\n- Schema evolution with Evolution policy\n- CDC via MERGE\n- ML-based anomaly gate for quality signals\n- Tenants isolation in RBAC + masking\n- Late-data handling and autoscaling cost considerations\n- Synthetic test plan with late/partial data\n\nCode Example\n```python\n# Pseudocode: ML anomaly gate in Silver\ndef anomaly_score(record):\n    # compute score from features; return 0-1\n    pass\n```\n\nFollow-up Questions\n- How would you roll back a failing schema evolution gracefully?\n- What metrics and alerts would you configure for the ML gate and cost autoscaling?",
+        "explanation": "## Why This Is Asked\nThis question probes data contracts in a multi-tenant Databricks setup, combining provenance, schema drift, and gating into Gold. It tests isolation, safety, and practical governance tradeoffs.\n\n## Key Concepts\n- Data contracts and policy evaluation\n- Per-tenant governance with Unity Catalog RBAC\n- Auto Loader provenance and idempotent MERGE\n- Test strategies with late data and contract violations\n\n## Code Example\n```python\n# Pseudo: evaluate_contracts(row, contracts_df) -> bool\n```\n\n## Follow-up Questions\n- How would you scale the policy engine to thousands of tenants?\n- How would you surface contract breaches to operators?",
         "difficulty": "advanced"
       },
       {
-        "id": "databricks-data-engineer-q-6",
+        "id": "databricks-data-engineer-q-9",
+        "questionId": "q-24351",
+        "question": "In a multi-tenant Databricks lakehouse ingesting ~200 GB/day of Parquet/JSON logs into Bronze, design a per-tenant retention and archival policy that ages data, archives to a cost-efficient Delta table, and preserves point-in-time access via Delta Time Travel. Include (1) per-tenant retention metadata, (2) archival/cleanup workflow with VACUUM, (3) impact on Silver/Gold dashboards and query correctness, (4) testing with synthetic holds and late data, (5) Unity Catalog access controls. How would you implement and test this?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Nightly two-phase compaction: Phase A creates a staging Delta table by reading the Bronze with read-consistency, rewrites small Parquet files into larger ones (target ~128 MB) using OPTIMIZE with ZORD",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Instrument per-batch metrics: total events, duplicates, nulls, late data, latency; use Delta table stats for schema drift; apply KS-test on key fields vs baseline; publish to a central Databricks SQL",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Strategy: Use Auto Loader to ingest 50 GB/day of Parquet web logs from S3 into Bronze with cost-aware partitioning by date and user_id. Implement Silver layer with MERGE-based CDC upserts on event_id, maintain AuditFile…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a per-tenant retention registry (tenant_id, retention_days, hold_flag) and partition Bronze/Silver by tenant_id/date. Archive data older than retention to a separate Delta archive table; prune wit",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nEvaluates lifecycle design for multi-tenant data, balancing cost, accessibility, and governance; tests whether the candidate can implement per-tenant policies, archival workflows, and PIT access without breaking dashboards.\n\n## Key Concepts\n\n- Per-tenant retention metadata\n- Archival vs. purging strategy\n- Delta Time Travel accessibility\n- VACUUM and data gravity considerations\n- Unity Catalog RBAC and masking implications\n\n## Code Example\n\n```sql\n-- Archive older per-tenant data\nINSERT INTO archive.bronze_archive\nSELECT * FROM bronze\nWHERE date < DATE_SUB(CURRENT_DATE(), INTERVAL 365 DAY);\n\n-- Purge from main Bronze table\nVACUUM bronze RETAIN 365 DAYS;\n```\n\n## Follow-up Questions\n\n- How would you handle legal holds that override retention windows?\n- How would you test performance and ensure dashboards reflect current data correctly?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "databricks-data-engineer-q-10",
+        "questionId": "q-21913",
+        "question": "In a Databricks pipeline ingesting 30 GB/day of Parquet logs from S3 for multi-tenant use, design a beginner Silver layer prioritized around observability and lineage. Requirements: - Add a lightweight lineage table recording source_file_path, ingested_at, and target_table; - Use a manifest-based approach to enable replay of failed batches; - Implement a deterministic upsert into a per-tenant Gold table; - Enforce Unity Catalog RBAC for lineage access; - Data-quality gates: non-null tenant_id and event_time, and an ingest_latency constraint. Outline concrete steps including Auto Loader, Delta tables, partitioning by tenant/date, and a test plan with synthetic late-delivery files?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a Silver layer that logs lineage and enables replay. Use Auto Loader to ingest Parquet into silver_logs, write a lineage_delta table with source_file_path, ingested_at, batch_id, and target_",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Implement Delta Live Tables (DLT) for Bronze-Silver-Gold pipelines with a versioned Databricks Feature Store integrated with Unity Catalog RBAC. For the Bronze layer, create streaming tables for Kafka orders (5 MB/s) us…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Bronze -> Silver path with validation: require event_id, product_id, user_id, price not null, price >= 0, and correct types. Use a MERGE CDC from Bronze to Silver. Gold denormalizes to daily total_sal",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Leverage Unity Catalog Dynamic Views to enforce per-tenant access. Bronze→Silver deduplication by event_id with MERGE CDC; create Silver_Tenant as a dynamic view filtered by tenant_id using current_user(). Gold layer ag…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nExplores observability and lineage in a beginner-friendly Databricks task, essential for multi-tenant data governance and reliable dashboards.\n\n## Key Concepts\n- Auto Loader and file manifests\n- Delta tables and lineage tracking\n- MERGE upserts for per-tenant Gold\n- Unity Catalog RBAC for restricted access\n- Data quality gates and replayable batch manifests\n\n## Code Example\n```sql\nCREATE TABLE lineage (\n  source_file_path STRING,\n  ingested_at TIMESTAMP,\n  batch_id STRING,\n  target_table STRING\n);\n```\n\n## Follow-up Questions\n- How would you verify replay of a failed batch using the manifest?\n- How would schema drift be detected and managed in this setup?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "databricks-data-engineer-q-11",
+        "questionId": "q-23486",
+        "question": "In a Databricks Delta Live Tables pipeline ingesting 100 GB/day of JSON events from multi-tenant S3 folders, design a Silver layer that (1) preserves per-tenant provenance and file metadata, (2) handles schema drift for nested JSON with a defined evolution policy, (3) performs CDC-like MERGE into a tenant-scoped Gold table with deterministic keys, (4) enforces Unity Catalog RBAC with masking, (5) adds a data-quality gate and a late-data watermark, (6) ensures fault-tolerant checkpointing and retries; outline tests with synthetic late data and tenant churn?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a Delta Live Tables pipeline with Bronze (raw Parquet from S3) → Silver (per-tenant isolation partitioned by tenant_id/date) → Gold (BI-ready). Enforce schema via DLTable expectations, use a wa",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Enforce Delta constraints on Silver and Gold layers (NOT NULL for event_id, canonical_id, ingest_ts; strict type validation) to block schema evolutions that conflict with downstream marts. Implement a QualityGuard befor…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Proposed approach: load with Auto Loader using file provenance columns populated by a lightweight UDF; implement a Silver delta table with dedup by event_id and a 10-minute watermark for late data; cr",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a DLT Silver pipeline that stores per-tenant provenance (source_path, ingest_ts, tenant_id), leverages Change Data Feed for CDC, applies a schema evolution policy for nested JSON using STRICT mode or ADD_COLUMNS…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question evaluates the ability to design a robust, multi-tenant Delta Live Tables solution with real-time CDC, schema drift handling, provenance tracking, RBAC masking, and late-data resilience.\n\n## Key Concepts\n- Delta Live Tables CDC and MERGE semantics with deterministic keys\n- Schema drift handling for nested JSON using evolution policies\n- Unity Catalog RBAC and column-level masking for tenant isolation\n- Per-tenant provenance and audit trails for compliance\n- Late-data watermarking and fault-tolerant checkpointing with retries\n\n## Code Example\n```python\n# Silver layer configuration\n@dlt.table(\n    name=\"silver_events\",\n    comment=\"Silver layer with per-tenant provenance and schema evolution\"\n)\ndef silver_events():\n    return (\n        dlt.read_stream(\"bronze_events\")\n        .with_column(\"tenant_id\", col(\"source_path\").split(\"/\")[1])\n        .with_column(\"ingest_ts\", current_timestamp())\n        .withSchemaEvolutionPolicy(\"STRICT\")  # or \"ADD_COLUMNS\"\n    )\n\n# Gold layer with deterministic MERGE\n@dlt.table(\n    name=\"gold_events\",\n    comment=\"Gold layer with tenant-scoped partitioning\"\n)\ndef gold_events():\n    stream = dlt.read_stream(\"silver_events\")\n    dlt.create_streaming_live_table(\"gold_events\")\n    \n    dlt.applyChanges(\n        target=\"gold_events\",\n        source=\"silver_events\",\n        keys=[\"tenant_id\", \"event_id\"],\n        sequenceBy=\"ingest_ts\"\n    )\n```",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "databricks-data-engineer-q-12",
+        "questionId": "q-8700",
+        "question": "Design an advanced Databricks Silver layer for a lakehouse ingesting 40 GB/day of Parquet logs from S3 into Bronze. The Silver layer must normalize to a canonical schema with optional fields that evolve, capture per-file provenance, enforce Delta check constraints (not null event_time; event_type in ['click','view','purchase']), apply Unity Catalog RBAC per-tenant, implement a 15-minute late-data watermark with a MERGE-based CDC to Silver, and expose a masking view for PII. Provide concrete steps and a lightweight test plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design and implement a Silver layer in Delta Live Tables to meet enterprise governance and data quality requirements. The implementation addresses seven key areas: 1. **Per-File Provenance**: Leverage Auto Loader with `…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a Bronze→Silver→Gold pipeline using Auto Loader to ingest 200 GB/day of JSON events from two e-commerce APIs into Delta Lake on S3. The Bronze layer uses Auto Loader with schema inference and cloudFiles to land r…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Outline a Silver layer that normalizes to a canonical, evolvable schema with optional fields; include per-file provenance via a file_metadata table; enforce Delta CHECK constraints: not null event_tim",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Three-layer Delta Live Tables pipeline: Bronze layer ingests raw JSON/Parquet from S3 with per-file provenance tracking; Silver layer applies tenant-scoped schema registry with compatibility checks and automatic evoluti…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question probes ability to design a robust Silver layer that handles evolving schemas, strict data quality, per-tenant access, late data, and privacy masking in a production-grade Databricks environment.\n\n## Key Concepts\n- Schema evolution with optional fields\n- Delta Lake CHECK constraints\n- Unity Catalog RBAC and masking views\n- CDC with MERGE and late data watermark\n- Per-file provenance and synthetic-data testing\n\n## Code Example\n```sql\n-- Example skeleton for a MERGE CDC into Silver\nMERGE INTO silver_table AS s\nUSING bronze_table AS b\nON s.event_id = b.event_id\nWHEN MATCHED THEN UPDATE SET s.* = b.*\nWHEN NOT MATCHED THEN INSERT (*)\n```\n\n## Follow-up Questions\n- How would you backfill existing data after introducing a new optional field?\n- How would you validate that the masking view enforces tenant isolation across tenants?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "databricks-data-engineer-q-13",
+        "questionId": "q-19438",
+        "question": "In a Databricks workflow ingesting 60 GB/day of Parquet logs from S3 across three tenants, design a beginner-friendly Silver layer that provides per-tenant materialized aggregates to accelerate dashboards. Use Delta Cache or Spark caching to store tenant-scoped aggregates, implement a simple invalidation policy when new data arrives, ensure RBAC so tenants see only their caches, and outline a lightweight test plan with synthetic data validating cache warm-up, accuracy, and eviction. How would you implement this end-to-end?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use Autoloader to ingest JSON into Bronze Delta Lake, then Silver via MERGE on user_id to upsert latest state. Enforce Delta constraints: NOT NULL user_id, age > 0, and non-empty payload. Add a Spark",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a Silver layer with a formal data contract: event_id STRING NOT NULL, event_time TIMESTAMP NOT NULL, user_id STRING, and an optional extra_field STRING. Use Delta constraints and MERGE by ev",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "To implement: in Silver layer, materialize an enrichment stream from a REST service (minutely updated) as a separate streaming source; join with Bronze by a stable key; retain provenance fields (sourc",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Create per-tenant delta tables for aggregates in Silver, partitioned by tenant_id. Ingest from Bronze via MERGE into Silver, then enable Delta Cache on those partitions. Implement a TTL-based refresh",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nAssesses practical end-to-end data engineering skills: multi-tenant isolation, per-tenant materialization for performance, and cache-based optimization in a Databricks lakehouse.\n\n## Key Concepts\n\n- Delta Cache and Spark caching\n- Tenant isolation with Unity Catalog RBAC\n- Per-tenant materialized views / aggregates\n- MERGE-based incremental updates\n- Cache invalidation TTL and refresh logic\n- Lightweight test plan with synthetic data\n\n## Code Example\n\n```python\n# Pseudo: refresh tenant cache post-ingest\nfrom delta.tables import DeltaTable\nfor tenant in tenants_list:\n    tbl = DeltaTable.forPath(spark, f\"/mnt/silver/aggregates/{tenant}\")\n    # materialize cache by reading once (cached)\n    df = tbl.toDF().filter(\"1=1\").cache()\n    df.count()\n```\n\n## Follow-up Questions\n\n- How would you measure cache effectiveness and decide eviction policy?\n- How would you handle tenants with highly skewed data volumes?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "databricks-data-engineer-q-14",
         "questionId": "q-24635",
         "question": "In a Databricks pipeline ingesting 40 GB/day of JSON clickstream logs from S3, with nested user and events fields, design a beginner Silver layer that: (1) flattens user fields and explodes the events array into per-event rows; (2) computes per-user daily event_count and a simple active flag based on last_event_ts within 24h; (3) partitions Silver by country and date and upserts per-user daily aggregates into a Gold table via MERGE; (4) masks user.email via a Unity Catalog policy; (5) adds basic data-quality gates (non-null user_id, event_type, and event_ts); (6) outlines a test plan with synthetic late-arriving events and a minor schema drift scenario?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Ingest 20 GB/day of JSON logs from S3 into Silver. Use Auto Loader with a defined schema; flatten nested fields, derive 15‑minute windows and per-user features: session_id, duration, page_views. Write",
+            "text": "Propose a multi-tenant DLT: Bronze via Auto Loader per tenant; Silver with per-tenant masking and Unity Catalog RBAC; schema drift handled via evolving schemas in DLTPipeline expectations; CDC-like ME",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design Silver with dedup by record_id, add processing_timestamp, and daily QA gate: if count falls outside baseline +/- 20%, stop downstream. Use Auto Loader for Bronze, MERGE to upsert Silver, mainta",
+            "text": "Leverage a Silver layer that materializes a versioned feature_store Delta table per tenant. Ingest JSON via Auto Loader with schema inference, and maintain an AuditFiles table for per-file provenance. Use Delta schema e…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Design a multi-tenant Bronze-Silver-Gold pipeline: Bronze layer ingests from two tenant-specific S3 folders using Auto Loader with cloudFiles; Silver layer enforces per-tenant isolation through Unity Catalog RBAC combin…",
+            "text": "Design a Delta Live Tables Silver layer with tenant-scoped CDC, per-tenant compute pools for isolation, and Unity Catalog RBAC. Enforce a schema evolution policy for nested fields, preserve per-file p",
             "isCorrect": false
           },
           {
@@ -217,75 +457,135 @@
         "difficulty": "beginner"
       },
       {
-        "id": "databricks-data-engineer-q-7",
-        "questionId": "q-8176",
-        "question": "In a Databricks data platform ingesting 150 GB/day Parquet web logs from S3 and 40 GB/day JSON telemetry from a REST API, in a multi-tenant setup, design a Silver layer that deduplicates by a canonical_id using MERGE CDC, applies a 15-minute watermark, and adds an AuditDelta per file (path ingest_ts file_size source_name). Enforce Unity Catalog RBAC on Silver and AuditDelta and implement tenant-scoped dynamic masking policies for PII fields via views. Include a lightweight synthetic-data test plan and discuss how you would observe CDC and RBAC in production?",
+        "id": "databricks-data-engineer-q-15",
+        "questionId": "q-11463",
+        "question": "In a Databricks pipeline ingesting 8 GB/day of JSON clickstream from S3 into Bronze, design a beginner Silver layer that (1) flattens nested JSON into a canonical schema (user_id, session_id, event_id, event_time, device, geo_country, geo_city), (2) deduplicates by event_id via MERGE, (3) tolerates minor schema drift with Delta Schema Evolution, (4) exposes a masking view to hide PII like user_email, (5) enforces Unity Catalog RBAC for read, (6) data quality: non-null event_id and event_time within 30 days; outline steps and test plan with a partially written line and late events?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement a three-layer Lakehouse (Bronze/Silver/Gold) with Delta Lake. Silver uses MERGE CDC on canonical_id, 15-minute watermark, and writes AuditDelta per file (path, ingest_ts, file_size, source_n",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement a 2-region DLt plan: Silver preserves per-file provenance with an AuditFiles row and a file_hash dedupe; drift detected against a central schema registry with fallback evolution rules; per-t",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Silver: AuditFiles per-file provenance; schema evolution to tolerate JSON drift; Delta CDF for tenant-scoped CDC. Gold: tenant_id/date with masked, RBAC-controlled views. Gate: data-quality checks blo",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Configure DLT to ingest from Kafka into the Bronze layer, then apply schema evolution with the ALLOW_ANY policy in the Silver layer to handle dynamic JSON payloads. Compute real-time fraud scores using sliding-window ag…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design multi-tenant governed lakehouse with CDC, watermark, per-file auditing, and masking.\n\n## Key Concepts\n- Delta Lake CDC merges, canonical_id dedup\n- Watermarking for late data\n- AuditDelta per file for provenance\n- Unity Catalog RBAC and masking policies per tenant\n- Synthetic data test and production lineage observability\n\n## Code Example\n```sql\nMERGE INTO silver_table AS s\nUSING staged AS st\nON s.canonical_id = st.canonical_id\nWHEN MATCHED THEN UPDATE SET ...\nWHEN NOT MATCHED THEN INSERT ...\n```\n\n## Follow-up Questions\n- How would you test masking policy correctness across tenants?\n- How would you monitor CDC latency and audit delta freshness at scale?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "databricks-data-engineer-q-8",
-        "questionId": "q-2199",
-        "question": "How would you implement a compliant, zero-duplication deletion workflow in a Databricks streaming pipeline that ingests user events from Kafka into Delta Lake? A deletions log triggers row-level removals across Bronze/Silver, handling late data with tombstones, ensuring idempotent MERGE, and preserving an auditable deletion history via a separate Delta table. Describe architecture, data flow, and validation?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Read Bronze with a permissive schema; map to a canonical Silver schema: tenant_id, event_id, event_ts, and payload (struct). Unknown fields go into payload to avoid drift. Use a MERGE into Silver on (",
+            "text": "Cross-region replication: maintain a centralized Gold table partitioned by region_tag, with Bronze and Silver layers replicated via near-real-time CDC using Databricks Auto Loader or Spark Structured Streaming. The mult…",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Implement a deletion workflow with a DeletionLog stream; when a deletion request arrives, publish user_id and deletion_ts to a Delta table and a separate DeletionLog; on Bronze and Silver, use MERGE t",
-            "isCorrect": true
+            "text": "Implement a per-tenant residency sandbox in Unity Catalog, encode provenance in AuditFiles during Silver-upsert, mask data at export time with tenant-scoped filters, expose Delta Sharing exports via p",
+            "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Implement per-tenant Bronze ingestion using Auto Loader with cloudFiles.notification options, then create a Silver layer with per-tenant watermarking and file-availability gates that function as SLA watchdogs. Use CDC-b…",
-            "isCorrect": false
+            "text": "Leverage Auto Loader to ingest Bronze JSON data, flatten nested structures into a canonical schema with defined columns (user_id, session_id, event_id, event_time, device, geo_country, geo_city), and implement MERGE ope…",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Implement OpenLineage-compliant lineage by recording inputs and transformations into a Lineage table keyed by run_id; capture: source_path, file_timestamp, ingest_ts, transform_name, input_table, outp",
+            "text": "Design a Silver layer with an SCD Type 2 customer dimension table (customer_sk, customer_id, validity_start, validity_end, is_current) and a corresponding CustomerHistory audit table. Use MERGE to upsert from Bronze int…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests the ability to design compliant, end-to-end data deletion in a streaming Delta Lake pipeline. It covers change data capture semantics, idempotency, auditability, and cross-layer consistency (Bronze to Silver), which are critical at scale.\n\n## Key Concepts\n\n- Delta Lake MERGE for row-level deletions\n- Deletion log and tombstone handling\n- Idempotent operations and deleted_at auditing\n- Data lineage, governance, and RBAC in Unity Catalog\n\n## Code Example\n\n```javascript\n// Pseudo-Delta MERGE for deletion\nconst stmt = `\nMERGE INTO BronzeDelta AS b\nUSING DeletionLog AS d\nON b.user_id = d.user_id\nWHEN MATCHED THEN DELETE\n`;\ndb.run(stmt);\n```\n\n## Follow-up Questions\n\n- How would you test end-to-end deletion latency and ensure no residual copies in backups? \n- How would you scale the deletion workflow when deletions are frequent and from multiple sources?",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nThis question evaluates practical data engineering skills including JSON normalization, idempotent data processing, schema evolution techniques, PII protection, access control, and data quality enforcement in a real-world streaming scenario.\n\n## Key Concepts\n- JSON flattening and canonical schema design\n- MERGE operations for idempotent upserts\n- Delta Schema Evolution for drift tolerance\n- Data masking views for PII protection\n- Unity Catalog RBAC implementation\n- Data quality validation with constraints\n\n## Code Example\n```python\n# PySpark implementation for JSON flatten",
+        "difficulty": "beginner"
       },
       {
-        "id": "databricks-data-engineer-q-9",
-        "questionId": "q-19482",
-        "question": "Design a cross-region DR plan for a multi-tenant Databricks Bronze-Silver-Gold pipeline ingesting 100 GB/day of JSON/Parquet from S3. Explain how to (1) replicate Bronze/Silver with Delta Lake across regions, (2) preserve per-file provenance in AuditFiles, (3) implement tenant-scoped CDC-like MERGE into Silver, (4) materialize Gold with tenant_id/date, (5) enforce Unity Catalog RBAC with masking, (6) test DR with region outages and late data, and (7) address cost and RPO/RTO trade-offs?",
+        "id": "databricks-data-engineer-q-16",
+        "questionId": "q-12390",
+        "question": "Ingesting 40 GB/day of JSON clickstream logs from S3 into Bronze, design a beginner Silver layer that flattens a nested, evolving payload into a stable schema. How would you: (1) auto-evolve schema for new fields, (2) extract top-level columns and keep the rest as a map, (3) upsert via MERGE from a staging view, (4) build a BI-ready Gold with a users dim, (5) enforce Unity Catalog RBAC to restrict access, (6) implement a data-quality gate with tests including a newly added field?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Implement Delta Live Tables (DLT) for Bronze-Silver-Gold pipelines with a versioned Databricks Feature Store integrated with Unity Catalog RBAC. For the Bronze layer, create streaming tables for Kafka orders (5 MB/s) us…",
+            "text": "Implement a Canonical Schema Registry in Delta Lake to maintain a unified schema with per-field metadata (name, type, source_schema_id). Ingest data using Auto Loader with per-file provenance tracking, and use a lightwe…",
             "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "I would enable Auto Loader with schema evolution, flatten fields like user.id, session.id, event_time, page.url, device.type, geo.country into Silver, store remaining as map<string,string>, upsert via",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use Delta Live Tables to build Bronze→Silver with a deterministic experiment split: compute exp_id via a stable hash(tenant_id, event_ts) modulo 5, routing ~20% of events to Gold_ExperimentExp and ~80",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement a Silver layer with a formal data contract: event_id STRING NOT NULL, event_time TIMESTAMP NOT NULL, user_id STRING, and an optional extra_field STRING. Use Delta constraints and MERGE by ev",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis checks practical handling of evolving JSON in Delta Lake, simple flattening, and governance.\n\n## Key Concepts\n- JSON schema evolution in Databricks Delta Lake\n- Flattening nested fields and preserving extras as a map\n- MERGE-based CDC in a beginner-friendly flow\n- Unity Catalog RBAC for data access\n- Lightweight data-quality gating and tests\n\n## Code Example\n```python\nfrom pyspark.sql.functions import col\n\ndf = spark.read.json('s3://bucket/logs/')\ndf_flat = df.select(\n  col('user.id').alias('user_id'),\n  col('session.id').alias('session_id'),\n  col('event_time').alias('event_time'),\n  col('page.url').alias('page'),\n  col('device.type').alias('device_type'),\n  col('geo.country').alias('geo_country'),\n  col('payload').cast('map<string,string>').alias('attributes')\n)\n```\n\n## Follow-up Questions\n- How would you validate schema evolution with a newly added field?\n- How would you test the MERGE CDC logic end-to-end?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "databricks-data-engineer-q-17",
+        "questionId": "q-15110",
+        "question": "In a Databricks pipeline ingesting 12 GB/day of Parquet logs from S3 with tenant prefixes, design a beginner Silver layer plus a lightweight Observability layer. Use Auto Loader for Bronze, a simple MERGE-based CDC into Silver, and implement a per-file provenance table plus a latency-observability dashboard capturing ingestion latency and error counts per tenant. Outline concrete steps and a test plan that injects synthetic bad files to verify alerting thresholds?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use Auto Loader for Bronze with per-file metadata; implement foreachBatch to MERGE into Silver by event_id; create an IngestObservability Delta table recording tenant_id, file_timestamp, ingest_ts, la",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Design a CDC-driven SCD2 history per tenant in a Delta table. Ingest via Delta Live Tables into a Silver table partitioned by tenant_id and timestamp. On MERGE, close previous history rows by setting",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Enforce Delta constraints on Silver and Gold layers (NOT NULL for event_id, canonical_id, ingest_ts; strict type validation) to block schema evolutions that conflict with downstream marts. Implement a QualityGuard befor…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a Delta Live Tables Silver layer with tenant-scoped CDC, per-tenant compute pools for isolation, and Unity Catalog RBAC. Enforce a schema evolution policy for nested fields, preserve per-file p",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests practical setup of a beginner Databricks pipeline with a simple observability layer, ensuring reliability and testability.\n\n## Key Concepts\n- Auto Loader Bronze landing and per-file provenance\n- foreachBatch streaming to implement CDC-like MERGE\n- Silver upserts by event_id\n- Observability table with latency and error metrics per tenant\n- Synthetic data tests for alerting thresholds\n\n## Code Example\n```python\nfrom delta.tables import DeltaTable\n\ndef upsert_to_silver(batch_df, batch_id):\n    batch_df.createOrReplaceTempView(\"batch\")\n    delta = DeltaTable.forPath(spark, \"/delta/silver\")\n    delta.alias(\"t\").merge(\n        batch_df.alias(\"s\"),\n        \"t.event_id = s.event_id\"\n    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()\n```\n\n## Follow-up Questions\n- How would you scale the Observability table for many tenants?\n- How would you test synthetic bad files and verify alerts across tenants?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "databricks-data-engineer-q-18",
+        "questionId": "q-29723",
+        "question": "In a Databricks pipeline ingesting 40 GB/day of Parquet logs from S3 across multiple tenants, design a beginner Silver layer using Delta Live Tables (DLT) to auto-enforce schema, capture per-file provenance, and apply data quality expectations with a simple checksum; then perform a deterministic upsert into Gold and implement Unity Catalog RBAC and a basic test plan with synthetic late data?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a Delta Live Tables Silver layer that ingests Parquet from us-west-2 and eu-central-1 via Auto Loader, with region-aware schema drift policies and a centralized ProvenanceFiles table (source",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design a Delta Live Tables pipeline: Bronze from S3 Parquet, Silver with per-file provenance (path, ingest_ts) and schema enforcement, compute a lightweight file_checksum on load, then upsert into Gol",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Implement a per-tenant residency sandbox in Unity Catalog, encode provenance in AuditFiles during Silver-upsert, mask data at export time with tenant-scoped filters, expose Delta Sharing exports via p",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "I would implement a per-tenant, Bronze→Silver→Gold pipeline: Bronze ingests 60–100 GB/day via Auto Loader from S3; Silver preserves per-file provenance (source_path, file_timestamp, ingest_ts) and enables schema evoluti…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThey want to assess practical DLT usage for beginner-level ingestion, data quality, and RBAC with real-world constraints.\n\n## Key Concepts\n- Delta Live Tables, per-file provenance, and schema enforcement\n- Data quality via expectations and a simple checksum\n- Deterministic MERGE into Gold and Unity Catalog RBAC\n- Testing with synthetic late data and a corrupted file\n\n## Code Example\n\n```python\nimport dlt\n@dlt.table\ndef bronze_logs():\n  return spark.read.parquet('s3://bucket/logs/*')\n\n@dlt.table\ndef silver_logs(bronze_logs):\n  df = bronze_logs.select('tenant_id','event_time','event_type','payload')\n  df = df.withColumn('ingest_ts', current_timestamp())\n  df = df.withColumn('source_path', input_file_name())\n  df = df.withColumn('file_checksum', sha2(col('source_path'), 256))\n  return df\n\n@dlt.table\ndef gold_aggregates(silver_logs):\n  return silver_logs.groupBy('tenant_id').count()\n```\n\n## Follow-up Questions\n\n- How would you handle schema drift in Silver over time?\n- How would you test the checksum and late-arriving files in CI?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "databricks-data-engineer-q-19",
+        "questionId": "q-9089",
+        "question": "In a Databricks pipeline ingesting 40 GB/day of mixed Parquet and JSON logs from S3 into Bronze, design a Silver layer that supports schema evolution, upserts by a composite key (tenant_id, event_id), records per-file provenance (path, ingest_ts, file_size, source_format) via a batch_id UDF, masks PII in a view, and enforces Unity Catalog RBAC for read to Silver and Gold. Include a robust test plan with synthetic data including partially written files and recovery?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Leverage Auto Loader for mixed Parquet/JSON into Bronze, with Delta schema evolution and a Silver MERGE by (tenant_id, event_id). Add a per-file provenance AuditFilesDelta via a simple UDF that return",
+            "isCorrect": true
           },
           {
             "id": "b",
@@ -294,82 +594,52 @@
           },
           {
             "id": "c",
-            "text": "Design a DLT Silver pipeline that stores per-tenant provenance (source_path, ingest_ts, tenant_id), leverages Change Data Feed for CDC, applies a schema evolution policy for nested JSON using STRICT mode or ADD_COLUMNS…",
+            "text": "Ingest Parquet from S3 via Auto Loader into Bronze; Silver adds per-file provenance using an Audit table and upserts to Silver on event_id; Gold aggregates to a BI-friendly table. Track ingestion_lag,",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Propose cross-region DR for a 100 GB/day multi-tenant Bronze-Silver-Gold Delta pipeline. Implement near-synchronous Delta Lake replication for Bronze and Silver, carry per-file provenance in AuditFile",
-            "isCorrect": true
+            "text": "Use Auto Loader to ingest Parquet into Bronze with schema enforcement. Merge into Silver by event_id to deduplicate. In Silver, join with a small country_whitelist delta table on country; create a boo",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n realism and cross-region DR for multi-tenant data lakes is a common production demand. The prompt checks practical replication, provenance, access controls, and testing.\n\n## Key Concepts\n - Delta Lake cross-region replication\n - AuditFiles provenance per file\n - Tenant-scoped MERGE for CDC into Silver\n - Gold partitioning by tenant_id/date\n - Unity Catalog masking/RLS for DR\n - DR testing with outages and late data; cost vs resilience\n\n## Code Example\n```sql\n-- Pseudo MERGE into Silver preserving provenance\nMERGE INTO Silver AS s\nUSING AuditFiles AS a\nON s.event_id = a.event_id\nWHEN MATCHED THEN UPDATE SET s.value = a.value\nWHEN NOT MATCHED THEN INSERT (event_id, value) VALUES (a.event_id, a.value);\n```\n\n## Follow-up Questions\n - How would you validate RPO/RTO in CI/CD?\n - What metrics would you monitor to detect DR drift?",
+        "explanation": "## Why This Is Asked\n\nTests handling of schema evolution, CDC-like upserts, provenance, masking, and RBAC in a real Databricks flow; also evaluates a concrete test strategy for partial data and failures.\n\n## Key Concepts\n\n- Auto Loader with multi-format ingest\n- Delta Lake schema evolution and MERGE\n- per-file provenance with AuditFilesDelta\n- UDF to generate batch_id and attach source metadata\n- PII masking policy and masking view\n- Unity Catalog RBAC for Silver/Gold\n- robust test plan including partial writes and recovery\n\n## Code Example\n\n```javascript\n// Example: batch_id UDF pseudocode\nfunction batch_id(path, ingest_ts) {\n  // deterministic ID based on path and timestamp\n  return hash(path + ':' + ingest_ts);\n}\n```\n\n## Follow-up Questions\n\n- How would you handle evolving nested fields without breaking downstream queries?\n- How would you monitor and alert on data quality breaches across environments?",
         "difficulty": "intermediate"
       },
       {
-        "id": "databricks-data-engineer-q-10",
-        "questionId": "q-11793",
-        "question": "In a Databricks pipeline ingesting 40 GB/day of JSON events from multi-tenant S3 folders into Bronze, design a Silver layer (DLT) that (1) preserves per-file provenance via a lightweight UDF into an AuditFiles table (source_path, file_timestamp, ingest_ts); (2) handles JSON schema drift; (3) applies CDC-like MERGE into Silver by event_id; (4) materializes a denormalized Gold table; (5) enforces Unity Catalog RBAC with masking; (6) adds a data-quality gate; (7) supports late data with a 5-minute watermark; (8) includes tests with synthetic late/partial files?",
+        "id": "databricks-data-engineer-q-20",
+        "questionId": "q-12286",
+        "question": "In a Databricks Delta Live Tables pipeline ingesting 120–150 GB/day of Parquet for 3 tenants from S3, design a governance-and-quality framework that: (1) enforces per-tenant isolation with Unity Catalog RBAC and masking, (2) handles schema drift in Silver and records provenance, (3) performs CDC-like upserts into a tenant-aware Gold, (4) blocks downstream on data-quality gate failures and emits alerts, (5) exports data via Delta Sharing with time-bound access, (6) handles late data with watermark and reprocess tests. List concrete steps and trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
+            "text": "Leverage Delta Lake with a 3-layer Lakehouse; Bronze ingests Parquet/JSON from S3 and REST; Silver normalizes to a canonical schema and performs MERGE CDC on (canonical_id, event_time_bucket); late da",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use DLT with an AuditFiles table capturing source_path, file_timestamp, ingest_ts via a lightweight UDF; apply a schema-evolution policy for nested drift; implement CDC-like MERGE into Silver; derive",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a Delta Live Tables pipeline that establishes per-tenant namespaces within Unity Catalog, applies RBAC controls and column-level masking for data isolation, utilizes a Silver layer that accommodates schema evo…",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
             "text": "Propose a Delta Live Tables Silver layer that ingests 100 GB/day of S3 Parquet per tenant via Auto Loader, attaches per-tenant provenance in an AuditFiles table, enforces a controlled schema-evolution",
             "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use Autoloader to ingest JSON into Bronze Delta Lake, then Silver via MERGE on user_id to upsert latest state. Enforce Delta constraints: NOT NULL user_id, age > 0, and non-empty payload. Add a Spark",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a Delta Live Tables Silver layer to ingest 40 GB/day of multi-tenant JSON from S3. Preserve per-file provenance via a lightweight UDF into an AuditFiles table (source_path, file_timestamp, inge",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Automate ingestion using Auto Loader with explicit per-file provenance tracking via event logs and `_metadata`; model Silver and Gold layers in Delta Live Tables with tenant-scoped materialization to enforce strict tena…",
-            "isCorrect": false
           }
         ],
-        "explanation": "Why This Is Asked\n- Tests end-to-end Databricks pipeline design: provenance, schema drift handling, CDC-style upserts, RBAC, data quality, late data, and testing.\n\nKey Concepts\n- Delta Live Tables, per-file provenance, and audit tables\n- Schema drift handling for semi-structured JSON\n- MERGE-based CDC into Silver\n- Star/denormalized Gold for dashboards\n- Unity Catalog RBAC and masking views\n- Data-quality gates and late-data watermark\n- Synthetic data testing and fault tolerance\n\nCode Example\n```python\n# placeholder UDF sketch for provenance\nfrom pyspark.sql.functions import udf, struct\nfrom pyspark.sql.types import StructType, StructField, StringType, TimestampType\n\n@udf(returnType=StructType([StructField('source_path', StringType()),\n                          StructField('file_timestamp', TimestampType()),\n                          StructField('ingest_ts', TimestampType())]))\ndef provenance(source_path, file_ts, ingest_ts):\n    return {'source_path': source_path, 'file_timestamp': file_ts, 'ingest_ts': ingest_ts}\n```\n\nFollow-up Questions\n- How would you test schema drift handling and verification of lineage across tenant boundaries?\n- What monitoring would you add to detect spikes in late data and correlate with file-level provenance?",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\n\nThis question assesses expertise in designing enterprise-scale, multi-tenant data pipelines on Databricks that prioritize governance, quality assurance, and operational resilience. It evaluates knowledge of Unity Catalog security frameworks, Delta Live Tables architecture, change data capture methodologies, data quality validation mechanisms, secure data sharing protocols, and strategies for managing real-world challenges such as schema evolution and late-arriving data.\n\n## Key Concepts\n\n- Unity Catalog RBAC and column-level masking for tenant isolation\n- Delta Live Tables with per-tenant namespaces and environment-specific configurations\n- Schema evolution and provenance tracking in the Silver layer\n- CDC-style MERGE operations for incremental data processing\n- Data quality gates with downstream blocking and alerting mechanisms\n- Delta Sharing with time-bound access controls\n- Watermarking strategies and reprocess validation for late data handling",
+        "difficulty": "advanced"
       },
       {
-        "id": "databricks-data-engineer-q-11",
-        "questionId": "q-23994",
-        "question": "In a multi-tenant gaming telemetry pipeline on Databricks ingesting ~100 GB/day from S3 with JSON events and Parquet, design a Silver layer that preserves per-file provenance, handles nested JSON schema drift, captures per-tenant CDC into Silver, and outputs a BI-ready Gold table; enforce Unity Catalog masking and RBAC, add a data-quality gate, and implement late-data handling with watermarking, plus a test plan with synthetic late data and drifted fields?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Leverage Auto Loader for per-tenant landing into Bronze, then Silver with a provenance UDF that emits (source_path, file_timestamp, ingest_ts) and is surfaced via a provenance view. Use Delta CDF to c",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Propose a pipeline that emits OpenLineage events at each stage, stores lineage in a dedicated Lineage table, plugs Unity Catalog masking/rbac for tenant isolation, uses Delta Sharing to expose curated",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement Delta Live Tables (DLT) for Bronze-Silver-Gold pipelines with a versioned Databricks Feature Store integrated with Unity Catalog RBAC. For the Bronze layer, create streaming tables for Kafka orders (5 MB/s) us…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use Bronze→Silver CDC pattern with Delta Lake. Silver holds latest state per (tenant_id, user_id); History preserves all changes. Use a 10-minute watermark to bound late data; MERGE INTO Silver WHEN M",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question probes practical pipeline design under real constraints: multi-tenancy, evolving schemas, data provenance, CDC, RBAC, data quality, and late data handling. It tests how a candidate reasoned about end-to-end data movement, governance, and testability in Databricks.\n\n## Key Concepts\n\n- Delta Live Tables\n- Delta Lake CDC (CDF)\n- Schema evolution in nested JSON\n- Unity Catalog RBAC and masking\n- Data quality gates and late-data watermarking\n\n## Code Example\n\n```sql\n-- example: create a masked view (pseudo)\nCREATE VIEW masked_users AS SELECT user_id, CAST(phone AS STRING) AS phone_masked FROM users\n```\n\n## Follow-up Questions\n\n- How would you monitor and alert for schema drift and data quality degradation?\n- How would you simulate late data in tests and validate repairs?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "databricks-data-engineer-q-12",
-        "questionId": "q-21220",
-        "question": "Design a Databricks Bronze-Silver-Gold pipeline ingesting 70–100 GB/day of mixed JSON and Parquet from S3 for 4 tenants. Silver must preserve per-file provenance (source_path, file_timestamp, ingest_ts) via Delta metadata (no heavy UDFs); handle nested JSON drift with schema evolution; implement CDC using Delta CDF and MERGE into a tenant_id/date-partitioned Gold; expose BI-ready views with Unity Catalog RBAC masking; add a data-quality gate and late-data watermark; enable day-level on-demand reprocessing via Delta time travel; provide a test harness with synthetic late/partial files?",
+        "id": "databricks-data-engineer-q-21",
+        "questionId": "q-11126",
+        "question": "In a Databricks environment ingesting 15 GB/day Parquet logs from S3 into Bronze via Auto Loader, design a beginner Silver layer with Delta Live Tables (DLT) that (1) records per-file provenance in an AuditFiles Delta table with a batch_id UDF, (2) deduplicates by event_id with a 2-minute watermark, (3) masks PII via a masking view, (4) enforces Unity Catalog RBAC and exposes a read-only auditor view, (5) uses DL T expectations for data quality: non-null event_id and event_time within 7 days, (6) test plan with synthetic late/partial files, and (7) leverages Delta Time Travel for recovery. Explain trade-offs?",
         "type": "single",
         "options": [
           {
@@ -379,132 +649,12 @@
           },
           {
             "id": "b",
-            "text": "Implement a Delta Live Tables Silver layer that ingests Parquet from us-west-2 and eu-central-1 via Auto Loader, with region-aware schema drift policies and a centralized ProvenanceFiles table (source",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
             "text": "Leverage Auto Loader for 200 GB/day; Silver with Delta Live Tables + CDC to incrementally refresh versioned features; AuditFiles for per-file provenance; JSON drift handled via Evolution with defaults",
             "isCorrect": false
           },
           {
-            "id": "d",
-            "text": "Leverage Auto Loader for Bronze, then Silver with per-file provenance via AuditFiles using Delta metadata; implement schema drift handling with evolution; CDC via Delta CDF and MERGE into a tenant-sco",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "\"Why This Is Asked\": Tests practical, scalable multi-tenant lakehouse design, including provenance, CDC, schema evolution, RBAC, data quality, late data, and reprocessing. \n\n\"Key Concepts\":\n- Delta Lake provenance and AuditFiles integration\n- Schema evolution for nested JSON\n- Delta Change Data Feed and MERGE-based upsert\n- Unity Catalog RBAC with masking\n- Data-quality gates and late-data watermark\n- Time travel for on-demand reprocessing\n\n\"Code Example\":\n```javascript\n// Example: replay Silver for a specific day using time travel (conceptual)\nconst day = '2026-03-03';\nspark.sql(`CREATE OR REPLACE VIEW silver_day AS SELECT * FROM silver_table WHERE partition_date = '${day}'`);\n```\n\n\"Follow-up Questions\":\n- How would you test the time-travel reprocessing workflow end-to-end?\n- What monitoring would you put in place for data quality and lateness?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "databricks-data-engineer-q-13",
-        "questionId": "q-27362",
-        "question": "In a Databricks Delta Live Tables pipeline ingesting a MongoDB CDC stream (Debezium) at ~200 GB/day, design a Silver layer that preserves per-tenant provenance, handles evolving schema, and upserts into a tenant-scoped Gold table. Include a MERGE-based upsert, Unity Catalog masking/RBAC, a data-quality gate, and watermark-based late data handling. Outline steps, data contracts, and a test plan with synthetic late events and backfills?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a per-tenant retention registry (tenant_id, retention_days, hold_flag) and partition Bronze/Silver by tenant_id/date. Archive data older than retention to a separate Delta archive table; prune wit",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a Silver layer that computes per-minute anomaly scores with a 60-minute sliding window on event_time, writes to Delta table AnomalyScores, and exposes a read-only masking view; include a lightw",
-            "isCorrect": false
-          },
-          {
             "id": "c",
-            "text": "Ingest 200 GB/day from a MongoDB CDC feed (Debezium) into Delta Lake via Databricks. Build Silver to preserve per-tenant provenance (source_offset, collection, ingest_ts), support schema drift with ev",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Propose a pipeline that emits OpenLineage events at each stage, stores lineage in a dedicated Lineage table, plugs Unity Catalog masking/rbac for tenant isolation, uses Delta Sharing to expose curated",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design a CDC-driven multi-tenant pipeline with robust provenance, schema evolution, and production-grade testing. It also probes governance, late-data handling, and idempotent upserts.\n\n## Key Concepts\n- MongoDB Debezium CDC streams into Databricks\n- Delta Live Tables Silver/Gold architecture\n- Per-tenant provenance and schema drift handling\n- MERGE upserts and idempotent pipelines\n- Unity Catalog RBAC with masking\n- Watermarking for late data; data-quality gates; backfill testing\n\n## Code Example\n```python\n# DLT pseudo-snippet (Python)\nimport dlt\n\n@dlt.table\ndef silver_mongo_events():\n    raw = dlt.read_stream(\"mongo_cdc_events\")\n    # project, validate, and attach provenance\n    curated = raw.select(...)  # include source_offset, collection, ingest_ts\n    return curated\n\n@dlt.table\ndef gold_per_tenant():\n    silver = dlt.read(\"silver_mongo_events\")\n    merged = silver.merge(\n        target = \"gold_tenant\",\n        on = [\"tenant_id\", \"date\"],\n        when_not_matched_insert = {\"cols\": \"...\"},\n        when_matched_update = {\"cols\": \"...\"},\n    )\n    return merged\n```\n\n## Follow-up Questions\n- How would you test schema evolution with field renames?\n- How would you simulate backfills without impacting live streams?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "databricks-data-engineer-q-14",
-        "questionId": "q-8565",
-        "question": "Ingest 25 GB/day of Parquet logs from S3 into Bronze, design a beginner Silver layer that computes per-minute anomaly scores using a 60-minute sliding window on event_time, stores results in Delta table AnomalyScores, and exposes a read-only masking view for analytics; add a lightweight UDF to classify anomalies as high/medium/normal and enforce Unity Catalog RBAC so only authorized users read Silver and AnomalyScores; outline steps including Auto Loader, CDC-like updates, and a synthetic-data test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a Silver layer that computes per-minute anomaly scores with a 60-minute sliding window on event_time, writes to Delta table AnomalyScores, and exposes a read-only masking view; include a lightw",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Propose a multi-tenant DLT: Bronze via Auto Loader per tenant; Silver with per-tenant masking and Unity Catalog RBAC; schema drift handled via evolving schemas in DLTPipeline expectations; CDC-like ME",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Ingest 5 GB/day JSON clickstream from S3 to Bronze via Auto Loader; flatten nested payloads into Silver, deduplicate by event_id with MERGE CDC, and apply a 2-minute watermark. Build Gold as daily act",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design a multi-tenant Databricks governance pattern with a centralized Feature Registry, Unity Catalog RBAC, and a lineage from raw sources to feature outputs. Include an AuditFeatures table tracking",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis question probes time-series windowing, data governance, and end-to-end testability in Databricks beginner pipelines.\n\n## Key Concepts\n- Delta Lake sliding windows and CDC basics\n- Auto Loader Bronze to Silver\n- UDF-based anomaly classification\n- Masking views for PII\n- Unity Catalog RBAC\n\n## Code Example\n```javascript\n// Pseudo Spark: placeholder for window-based anomaly scoring\n```\n\n## Follow-up Questions\n- How would you adapt the window for bursty data?\n- How would you validate masking view performance?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "databricks-data-engineer-q-15",
-        "questionId": "q-12619",
-        "question": "In a Databricks environment ingesting 100 GB/day of Avro logs from a multi-tenant lake using Auto Loader, design a streaming Silver layer with Delta Live Tables that: 1) preserves per-file provenance in an Audit table (source_path, file_timestamp, ingest_ts), 2) handles schema drift with evolving nested fields, 3) implements CDC-like MERGE into Silver by event_id, 4) materializes a Gold table for dashboards, 5) enforces Unity Catalog RBAC and masking on PII, 6) includes a data-quality gate, 7) supports late data with a configurable watermark, 8) includes tests with synthetic late/out-of-order data. Outline concrete steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a cross-region DLDT workflow: ingest region buckets with Auto Loader; preserve per-file provenance in an AuditFiles-like table; Silver uses CDC-like MERGE by event_id with evolving JSON schema;",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a Delta Live Tables (DLT) pipeline where Auto Loader streams Avro logs from a multi-tenant lake into a Silver table with an Audit provenance. Enable schema evolution, CDC-like MERGE by event_id",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Bronze: Ingest both API feeds using Auto Loader into Delta Bronze tables with unified schema handling. Silver: Apply MERGE-CDC to deduplicate by event_id, normalize data types, and implement a 2-minute watermark for lat…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Register a dynamic JSON schema registry in Delta with versioning. On load, validate payloads via a lightweight UDF against the current schema and map to Silver fields. If drift detected, evolve the Si",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests end-to-end capabilities in a production-grade Databricks pipeline: robust ingestion, multi-tenant governance, schema drift handling, CDC semantics, and strict data quality controls under late-arriving data.\n\n## Key Concepts\n- Delta Live Tables (DLT) orchestration\n- Auto Loader with Avro and multi-tenant catalogs\n- Schema evolution for nested fields\n- CDC-like MERGE by event_id\n- Gold table for BI/dashboard access\n- Unity Catalog RBAC and masking policies\n- Data quality gates/expectations\n- Late data handling with watermark and retries\n\n## Code Example\n```python\nimport dlt\nimport pyspark.sql.functions as F\n\n@dlt.table\ndef silver(raw: DataFrame) -> DataFrame:\n    df = raw.selectExpr('*')\n    # propagate per-file provenance\n    df = df.withColumn('ingest_ts', F.current_timestamp())\n    return df\n```\n\n## Follow-up Questions\n- How would you test schema drift in nested Avro schemas?\n- How would you monitor and recover from late-data backlogs in production?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "databricks-data-engineer-q-16",
-        "questionId": "q-9769",
-        "question": "Design a three-layer Databricks pipeline ingesting 150 GB/day of JSON telemetry from IoT gateways into Bronze via Auto Loader. Silver must support adaptive schema evolution for nested fields, perform idempotent upserts into Silver by (device_id, event_time) with a 1-hour watermark for late data, and a Gold layer that aggregates device metrics. Enforce per-tenant Unity Catalog RBAC; enable GDPR delete requests via tombstones and masking; include a practical test plan with synthetic data showing nested field evolution, re-delivery, and backfill scenarios?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a Gold layer on Delta Lake with per-tenant partitioning (tenant_id, day) and streaming MERGE operations from Silver to Gold to maintain near-real-time dashboard performance. Leverage Auto Loader with file metadat…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use Auto Loader for incremental Bronze ingestion from S3. Implement per-file provenance by recording metadata in an AuditFiles table (path, ingest_ts) after each file completes. Use MERGE on event_id to upsert into Silv…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Leverage Auto Loader to land JSON into Bronze; Silver uses Delta with mergeSchema=true and CDC upserts by (device_id, event_time) plus 1h watermark; Gold derives device metrics. enforce RBAC via Unity",
+            "text": "Use Delta Live Tables to build Silver from Bronze. Define Silver with event_id, event_time, payload, and a provenance column; populate a separate AuditFiles Delta table via a lightweight batch_id UDF",
             "isCorrect": true
           },
           {
@@ -513,252 +663,102 @@
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design a multi-layer pipeline with advanced schema evolution, CDC, and governance in Databricks, including GDPR flows and per-tenant RBAC.\n\n## Key Concepts\n\n- Adaptive schema evolution for nested JSON\n- Idempotent upserts and watermarking\n- Unity Catalog RBAC and masking views\n- GDPR delete tombstones and auditability\n\n## Code Example\n\n```python\n# Delta table write with schema evolution\ndf.write.format(\"delta\").option(\"mergeSchema\",\"true\").mode(\"append\").saveAsTable(\"silver.iot_sms\")\n```\n\n## Follow-up Questions\n\n- How would you test a nested field addition without breaking downstream jobs?\n- How do you ensure tombstones don’t leak PII while preserving analytics?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "databricks-data-engineer-q-17",
-        "questionId": "q-25795",
-        "question": "Design a Databricks data pipeline for 4 tenants ingesting 100 GB/day of Parquet logs from S3. Build a Silver layer using Auto Loader with per-file provenance and automatic schema drift handling, then a streaming MERGE into a tenant-scoped Gold table partitioned by tenant_id and date. Implement a tenant-aware data quality gate, dynamic Unity Catalog masking, and a 1-day watermark for late data. Include a testing plan with synthetic late data and drift scenarios?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a Silver layer that logs lineage and enables replay. Use Auto Loader to ingest Parquet into silver_logs, write a lineage_delta table with source_file_path, ingested_at, batch_id, and target_",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a Silver layer with per-tenant provenance tracking and CDC-like MERGE operations for upserts, implementing schema drift handling via explicit evolution rules. The Gold layer aggregates metrics into a BI-ready tab…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Design a multi-tenant Delta Live Tables pipeline: ingest from S3 Auto Loader and Kafka; Bronze raw with tenant_id, ts, event_id; Silver dedups by event_id via MERGE CDC and masks PII per tenant; Gold",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use Auto Loader with per-file provenance and a drift-aware schema evolution policy, then stream a MERGE into a tenant-scoped Gold Delta table partitioned by tenant_id/date. Enforce RBAC + masking in U",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design end-to-end multi-tenant pipelines with schema evolution, streaming upserts, and data governance in Databricks.\n\n## Key Concepts\n- Auto Loader with per-file provenance and schema drift handling\n- Streaming MERGE for upserts into tenant-scoped Gold\n- Unity Catalog RBAC and dynamic masking\n- Data quality gates and late data handling with watermarking\n\n## Code Example\n\n```python\n# skeleton: define Bronze->Silver streaming, then MERGE into Gold with watermark\nfrom pyspark.sql.functions import expr\n# read stream, apply schema drift checks, write to Gold with MERGE\n```\n\n## Follow-up Questions\n- How would you test schema drift without downtime?\n- How would you rollback a failed MERGE in production?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "databricks-data-engineer-q-18",
-        "questionId": "q-24119",
-        "question": "In a multi-tenant Databricks Delta Live Tables pipeline ingesting ~150 GB/day of JSON and Parquet logs from S3, design a Silver layer that preserves per-file provenance, tolerates JSON drift via schema evolution, and captures tenant-scoped CDC. Then produce a Gold table for dashboards, enforce Unity Catalog masking, implement a data-quality gate, and handle late data with watermarking and checkpointing. Include a testing plan with synthetic late and partial files?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Three-layer Delta Live Tables pipeline: Bronze layer ingests raw JSON/Parquet from S3 with per-file provenance tracking; Silver layer applies tenant-scoped schema registry with compatibility checks and automatic evoluti…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a comprehensive Delta Live Tables pipeline with Change Data Feed enabled at the Silver layer. Utilize Auto Loader to efficiently ingest Parquet and JSON files from the multi-tenant S3 bucket, maintaining detai…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Silver: AuditFiles per-file provenance; schema evolution to tolerate JSON drift; Delta CDF for tenant-scoped CDC. Gold: tenant_id/date with masked, RBAC-controlled views. Gate: data-quality checks blo",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a Silver path that uses a central TenantSchema registry to normalize mixed JSON/Parquet per tenant, with a dynamic schema-merge UDF that evolves fields without breaking pipelines. Implement per",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nThis question probes practical Databricks skills in multi-tenant data systems, governance, and reliability beyond surface concepts.\n\n## Key Concepts\n\n- Delta Live Tables; per-file provenance; schema evolution\n- Delta Change Data Feed (CDF) for CDC\n- Unity Catalog RBAC and masking\n- Data-quality gates and late-data handling (watermarks, checkpoints)\n\n## Code Example\n\n```javascript\n// example: define a Silver table with provenance\n```\n\n## Follow-up Questions\n\n- How would you simulate late data in tests?\n- What are failure modes for watermarking and how would you recover?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "databricks-data-engineer-q-19",
-        "questionId": "q-29758",
-        "question": "In a multi-tenant Databricks Delta Live Tables pipeline ingesting ~40 GB/day of Parquet and JSON logs from S3, design a Silver layer that supports schema drift with per-tenant evolution, preserves per-file provenance and tenant isolation, and streams into a Gold table with a slowly changing dimension. Include Unity Catalog RBAC with masking, a data-quality gate that blocks downstream on failure, late-data handling, and a concise test plan with synthetic drift and late files. Be specific about the steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a per-tenant drift policy in DLT: enable schema drift evolution, store per-file provenance in AuditFiles, and write to a tenant-scoped Silver. Use a streaming MERGE into a Gold SCD-2 table.",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Outline approach: per-tenant catalogs with Unity Catalog; a central feature registry with semantic versioning; offline features stored in Delta tables; an online cache backed by Redis for 200 ms reads",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Build Silver by Auto Loader into Bronze, then Silver with per-batch provenance (batch_id, source_path) and a simple schema-evolution rule; upsert into Gold using MERGE on event_id; publish via Delta S",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Leverage Auto Loader for JSON landing, flatten to a stable schema, partition Silver by tenant_id/date, MERGE on (tenant_id, event_id) into Gold, enrich Silver with a Profile Delta table, and apply Uni",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design a scalable, tenant-aware Silver-Gold workflow with schema drift, provenance, RBAC masking, and data-quality governance. It also probes testing rigor with drift and late data.\n\n## Key Concepts\n- Drift-aware schema evolution in Delta Live Tables\n- Per-tenant provenance and isolation\n- SCD-2 merge into Gold table\n- Unity Catalog masking and RBAC\n- Data-quality gates and late-data handling\n- Synthetic data drift tests\n\n## Code Example\n```python\nimport dlt\n@dlt.table\ndef silver():\n  bronze = dlt.read('bronze')\n  # apply per-tenant evolution rules here\n  silver_tbl = bronze\n  return silver_tbl\n```\n\n## Follow-up Questions\n- How would you monitor drift rates per tenant and auto-tune thresholds?\n- What failure modes trigger reprocessing and how would you alert on them?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "databricks-data-engineer-q-20",
-        "questionId": "q-12566",
-        "question": "Ingest 40 GB/day of Parquet logs from S3 into Bronze, design a beginner Silver layer with a BI-friendly canonical schema and per-tenant policy isolation using Unity Catalog row-level filters. Describe how you’d detect schema drift, auto-backfill with Delta Time Travel, and produce a Gold table for dashboards; include a basic test plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a Silver layer that computes per-minute anomaly scores with a 60-minute sliding window on event_time, writes to Delta table AnomalyScores, and exposes a read-only masking view; include a lightw",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Load Parquet logs from S3 into Bronze with Auto Loader, define a canonical Silver schema, and create a Gold BI table by tenant/date. Apply Unity Catalog row-level filters to isolate tenants without da",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use Auto Loader to load Parquet into Bronze, then flatten nested payloads into Silver per-tenant; maintain a Gold table of daily_active_users partitioned by tenant_id/date. Implement a simple MERGE up",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use Auto Loader to ingest 8-12 TB/day JSON into Bronze; Silver deduplicates on event_id with MERGE CDC, and uses a 2-minute watermark. Mask SSN at query time via a masking VIEW over Silver. Enforce pe",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nAssesses ability to design multi-tenant data architecture with basic Drift/Backfill logic using Delta Lake features in a beginner-friendly scenario.\n\n## Key Concepts\n- Unity Catalog row-level filters for tenant isolation\n- Schema drift detection and auto-evolution\n- Delta Time Travel for backfill\n- Bronze-Silver-Gold flow and tenant-scoped dashboards\n- Lightweight test plan with synthetic tenants\n\n## Code Example\n```javascript\n// pseudo drift check and evolution outline\n```\n\n## Follow-up Questions\n- How would you test isolation under peak load?\n- What monitoring would you add for drift/backfill failures?",
+        "explanation": "## Why This Is Asked\nTests ability to design a beginner-friendly DLT-based Silver layer with provenance, masking, RBAC, and built-in quality checks using DL T expectations. It also introduces time-travel recovery and late data handling in a practical setting.\n\n## Key Concepts\n- Delta Live Tables (DLT) for declarative pipelines\n- DLT expectations for automated quality gates\n- per-file provenance via AuditFiles table and batch_id UDF\n- masking view for PII at read time\n- Unity Catalog RBAC integration\n- Time Travel for recovery from partial writes\n- watermarking to handle late data\n\n## Code Example\n```sql\n-- DL T pseudo: define Silver from Bronze\nCREATE LIVE TABLE silver_events AS\nSELECT\n  event_id,\n  event_time,\n  payload,\n  current_timestamp() AS ingest_ts,\n  source_path AS provenance_path\nFROM bronze_logs\n```\n\n```sql\n-- DL T expectations (conceptual)\nSELECT * FROM silver_events\nWHERE event_id IS NOT NULL AND event_time >= date_sub(current_timestamp(), 7)\n```\n\n## Follow-up Questions\n- How would you test fault tolerance for late data vs. early data in DL T?\n- What changes would you make if event_time skew increases beyond 7 days?",
         "difficulty": "beginner"
       },
       {
-        "id": "databricks-data-engineer-q-21",
-        "questionId": "q-5268",
-        "question": "Design a Databricks pipeline that ingests 20 GB/day of Parquet data from S3 into Bronze, then Silver with 5-minute watermark, and a Gold dataset. Expose the Gold dataset to an external partner via Delta Sharing to Google BigQuery. Outline Unity Catalog RBAC, the sharing setup, and a lightweight test plan; include trade-offs?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Adopt active DR with Region A as primary and Region B as secondary. Mirror Bronze in Region B using cross-region Auto Loader and a DR-enabled DLT pipeline; enforce per-tenant isolation via Unity Catal",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a Delta Live Tables pipeline (Silver/Gold) for 200 GB/day, multi-tenant on S3. Enforce per-tenant schema evolution, implement SCD2-style history in Gold, and use Unity Catalog RBAC with masking",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Ingest Bronze from S3 via Auto Loader; Silver with 5-minute watermark and event_id dedupe; Gold as the shared dataset. Enable Delta Sharing to Google BigQuery, grant Unity Catalog RBAC roles for inter",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Compute a per-record provenance token using sha256 of source_path, ingest_ts, and a content_hash, stored on each row and aggregated in AuditRecords. Use a versioned JSON schema registry Delta table to",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests cross-tenant data sharing, Delta Sharing, and RBAC in Unity Catalog, plus end-to-end Bronze/Silver/Gold pipeline design.\n\n## Key Concepts\n- Delta Live Tables Bronze/Silver/Gold pattern\n- Watermarking and deduplication\n- Delta Sharing to Google BigQuery\n- Unity Catalog RBAC and data lineage\n- Monitoring and testing\n\n## Code Example\n```sql\n-- Illustrative placeholder for sharing setup\nCREATE SHARE gold_share FOR GOLD_TABLE;\nGRANT USAGE ON DATABASE gold TO partner_username;\n```\n\n## Follow-up Questions\n- How would you test for permission drift and revoke access quickly?\n- What are latency implications when sharing stale Gold data?",
-        "difficulty": "intermediate"
-      },
-      {
         "id": "databricks-data-engineer-q-22",
-        "questionId": "q-3667",
-        "question": "Design a Databricks data pipeline that ingests 5 TB/day of semi-structured JSON events from S3 into a Bronze Delta table, then propagates changes to Silver and Gold marts using Delta Change Data Feed (CDF) without re-reading full history. Implement 2-minute late data handling, PII masking at query time, Unity Catalog RBAC, and referential integrity across marts. Outline CDC strategy, partitioning, and a practical test plan?",
+        "questionId": "q-15145",
+        "question": "In a Databricks Delta Live Tables pipeline ingesting 60 GB/day of multi-tenant Parquet/JSON from S3, implement a governance strategy for Delta Sharing exports that supports per-tenant opt-in for fields, dynamic field-level masking, and consent revocation, while preserving provenance and enabling real-time enrichment with a global reference dataset. Explain data lineage, RBAC, and testing plan including field-level redaction correctness and backfill safety?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Enable Delta CDF on the Bronze table for event_id. Use MERGE into Silver to apply Inserts/Updates and tombstones from Bronze. Build Gold via MERGE from Silver, preserving referential keys. Apply a lig",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Nightly two-phase compaction: Phase A creates a staging Delta table by reading the Bronze with read-consistency, rewrites small Parquet files into larger ones (target ~128 MB) using OPTIMIZE with ZORD",
+            "text": "Leverage Auto Loader for JSON landing, flatten to a stable schema, partition Silver by tenant_id/date, MERGE on (tenant_id, event_id) into Gold, enrich Silver with a Profile Delta table, and apply Uni",
             "isCorrect": false
           },
           {
+            "id": "b",
+            "text": "Implement a per-tenant opt-in Delta Sharing export with field-level redaction via Unity Catalog masking, governed by per-tenant policy versions. Capture per-file provenance, support consent revocation",
+            "isCorrect": true
+          },
+          {
             "id": "c",
-            "text": "Design a Silver layer partitioned by region and date while maintaining per-minute region counts in a RegionMinuteAgg table; implement event_id-based upserts from Bronze using MERGE operations; create a region-scoped mas…",
+            "text": "Leverage Delta Live Tables to build a Silver layer that preserves per-tenant provenance, supports nested JSON evolution, and performs CDC-like MERGE into a tenant/date-partitioned Gold table. Enforce",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a MERGE CDC on Silver using event_id, enforce a 5-minute watermark, and track last_good_version in a small Delta table. On failure, time-travel Silver/Gold to that version and flip an alias to re-",
+            "text": "Implement a two-branch flow: during Bronze ingestion, run a quick pre-check pass that lists files in the S3 prefix and validates Parquet footer/schema against a lightweight schema snapshot. If a file",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nTests deep knowledge of CDC patterns, late data handling, and data governance in a realistic Databricks setup.\n\n## Key Concepts\n\n- Delta Lake Change Data Feed (CDF)\n- MERGE CDC for Silver\n- Gold derivation and referential integrity\n- Query-time masking\n- Unity Catalog RBAC and lineage\n- Late data windowing\n\n## Code Example\n\n```python\n# Enable CDF\nspark.sql(\"ALTER TABLE bronze SET TBLPROPERTIES (delta.enableChangeDataFeed = true)\")\n# Pseudo-merges shown conceptually; implement with exact match/conditions in production\n# MERGE Bronze -> Silver on event_id with updates and deletes\n```\n\n## Follow-up Questions\n\n- How would you handle schema evolution across Bronze to downstream without breaking queries?\n- What metrics would you monitor to ensure CDC latency remains within target?",
+        "explanation": "## Why This Is Asked\nAddresses governance and privacy in multi-tenant data sharing, challenging the interplay of Delta Sharing, Unity Catalog masking, and provenance.\n\n## Key Concepts\n- Delta Sharing export governance and per-tenant opt-in\n- Field-level masking policies in Unity Catalog\n- Per-tenant policy versioning and revocation workflows\n- Provenance capture (per-file) and backfill-safe exports\n- Isolated enrichment path without leaking sensitive fields\n\n## Code Example\n```sql\n-- Example masking policy skeleton\nCREATE MASKING POLICY tenant_field_masking AS (\n  -- logic to redact sensitive fields based on tenant\n);\n```\n\n## Follow-up Questions\n- How would you validate latency and correctness of consent revocation?\n- How would you backfill/enforce policy changes across historical exports without breaking consistency?",
         "difficulty": "advanced"
       },
       {
         "id": "databricks-data-engineer-q-23",
-        "questionId": "q-9339",
-        "question": "In a Databricks workspace serving multiple tenants and external vendors, design a Delta Sharing-based data-sharing pattern that preserves Unity Catalog RBAC and per-tenant isolation, while masking PII for vendors. Outline the sharing policy, per-tenant masking view, audit model, and a revocation workflow. How would you implement and test it with synthetic tenants and vendors?",
+        "questionId": "q-24840",
+        "question": "In a Databricks pipeline ingesting 20 GB/day of Parquet logs from S3 for multiple tenants, design a beginner-friendly Silver layer with: (1) Auto Loader-based ingestion tracking per-file provenance, (2) deterministic MERGE-based upserts into a tenant-scoped Gold table, (3) a Unity Catalog RBAC-masked view for BI, (4) a Delta Sharing export policy per tenant, and (5) a CI-ready data quality tests harness (pytest + Spark) that synthesizes late data and subtle schema drift and asserts expected row counts and nullability constraints. Outline concrete steps and trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Publish per-tenant catalogs in Unity Catalog and expose them through a Delta Sharing provider. Assign vendor roles with least-privilege access; implement dynamic masking views to redact PII for each vendor share; mainta…",
-            "isCorrect": true
+            "text": "Implement Silver with per-tenant pipelines in Delta Live Tables, preserving per-file provenance in AuditFiles; use a central Schema Registry for evolution; apply CDC via MERGE into Silver filtered by",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Design uses Auto Loader for S3 and Kafka in Bronze, Silver performs CDC MERGE by event_id, Gold is the consumable layer. Add a drift-detection pass that scores per-field distribution changes and quara",
+            "text": "Ingest 200 GB/day from a MongoDB CDC feed (Debezium) into Delta Lake via Databricks. Build Silver to preserve per-tenant provenance (source_offset, collection, ingest_ts), support schema drift with ev",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Design a per-tenant lifecycle using Delta Lake tiering: hot Delta tables partitioned by tenant_id/date retained for 30 days; migrate data from days 31–90 to a cost-optimized warm archive tier using Delta/Parquet; archiv…",
-            "isCorrect": false
+            "text": "Use Auto Loader to ingest Parquet with per-file provenance into Bronze; Silver upserts into tenant-scoped Gold by event_id using MERGE; a masking view via Unity Catalog RBAC; tenant-specific Delta Sha",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Design a Silver layer to enforce versioned DataContracts per tenant, emit per-file provenance, block incompatible schema changes, MERGE into tenant Gold on (tenant_id, event_id), hook a policy engine",
+            "text": "Implement a comprehensive data pipeline using Auto Loader for Bronze ingestion, standardize column naming conventions while maintaining schema evolution capabilities, establish a Customer dimension Delta table for refer…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests governance capabilities, secure data sharing implementation, and practical application of Delta Sharing with Unity Catalog RBAC and PII masking.\n\n## Key Concepts\n- Delta Sharing provider configuration and per-tenant manifests\n- Unity Catalog RBAC and tenant isolation strategies\n- Dynamic masking views for PII protection in shared data\n- Comprehensive audit logging and revocation workflows\n- Testing methodology using synthetic tenants/vendors and manifest refresh cycles\n\n## Code Example\n```json\n{\n  \"manifest\": {\n    \"include\": [\"tenantA.sales\"],\n    \"provider\": \"corp_provider\",\n    \"rights\": [\"read\"],\n    \"vendor\": \"VendorX\"\n  }\n}\n```\n```sql\nCREATE VIEW VendorX.sales_masked AS\nSELECT",
-        "difficulty": "intermediate"
+        "explanation": "## Why This Is Asked\nThis question probes practical Databricks data engineering skills at a beginner level with a realistic multi-tenant pipeline, focusing on end-to-end lineage, upserts, RBAC, data sharing, and testability.\n\n## Key Concepts\n- Auto Loader ingestion and per-file provenance\n- MERGE-based upserts for Gold\n- Unity Catalog RBAC and masking\n- Delta Sharing policies per tenant\n- CI-style data quality tests with synthetic late data and drift\n\n## Code Example\n```javascript\n// Pseudo-code illustrating MERGE between Silver and Gold\nMERGE INTO gold AS g\nUSING silver AS s\nON g.tenant_id = s.tenant_id AND g.event_id = s.event_id\nWHEN MATCHED THEN UPDATE SET ...\nWHEN NOT MATCHED THEN INSERT ...\n```\n\n## Follow-up Questions\n- How would you test RBAC masking changes without duplicating data?\n- What are the trade-offs of per-tenant Delta Sharing exports vs shared exports?",
+        "difficulty": "beginner"
       },
       {
         "id": "databricks-data-engineer-q-24",
-        "questionId": "q-23539",
-        "question": "In a multi-tenant Databricks data lake ingesting 100 GB/day per tenant of Parquet logs from S3, design a cross-tenant ConformedDim layer in Delta Live Tables that (1) implements per-tenant SCD2 for a shared dimension, (2) provides a tenant-scoped view of the conformed data with RBAC, (3) supports a deterministic upsert into a Gold analytics table, (4) enforces masking and dynamic filters via Unity Catalog, (5) includes data quality gates and late-data handling with a configurable watermark, and (6) a testing plan with synthetic late/backfill data. Provide concrete ingestion contracts and checkpointing strategy?",
+        "questionId": "q-9191",
+        "question": "Ingest 25 GB/day Parquet logs from S3 and 25 GB/day API JSON metadata into Bronze. Design a beginner Silver layer that normalizes event_id across sources, enriches events by joining metadata, and maintains per file provenance in an AuditFiles Delta table with a batch_id UDF. Add a masking view for PII, enforce Unity Catalog RBAC, and implement basic quality checks; include a test plan with synthetic data including a partially written Parquet and a malformed JSON data file?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Design a multi-tenant Bronze-Silver-Gold pipeline: Bronze layer ingests from two tenant-specific S3 folders using Auto Loader with cloudFiles; Silver layer enforces per-tenant isolation through Unity Catalog RBAC combin…",
+            "text": "Ingest Bronze from S3 via Auto Loader; Silver with 5-minute watermark and event_id dedupe; Gold as the shared dataset. Enable Delta Sharing to Google BigQuery, grant Unity Catalog RBAC roles for inter",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Normalize event_time to a timestamp, standardize user_id as string, and map action to a fixed set. Silver computes per-user daily activity: date, user_id, sessions, page_views. Apply a 5-minute waterm",
+            "text": "Implement Auto Loader to ingest 12 GB/day of JSON from S3 into Bronze, then Silver adds per-file quality metrics into a Delta table with columns file_path, ingest_ts, row_count, nulls_per_column, unkn",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use a streaming Silver with a Provenance table storing row_hash, source_path, file_timestamp, ingest_ts per record. Enable JSON drift handling via evolutionPolicy and explicit schema checks. Implement",
-            "isCorrect": false
+            "text": "Propose a Silver layer that normalizes event_id across Parquet and API metadata, enriches events by joining metadata, and writes via MERGE CDC to Silver, tracks per file provenance in AuditFiles Delta",
+            "isCorrect": true
           },
           {
             "id": "d",
-            "text": "Implement Auto Loader per tenant to ingest data into Bronze tables, then apply SCD Type 2 logic in Silver to create a cross-tenant conformed_dim table containing tenant_id, surrogate_key, effective_start_date, and end_d…",
-            "isCorrect": true
+            "text": "Outline a cross-cloud Delta Live Tables plan: ingest 60 GB/day into AWS S3 Bronze; design Silver with per-tenant provenance and CDC via Delta CDF; publish Gold via Delta Sharing to Google Cloud; enfor",
+            "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nThis question evaluates your ability to design multi-tenant data modeling and pipeline architecture across Bronze-Silver-Gold layers using Delta Live Tables. It assesses practical knowledge of SCD Type 2 implementation for shared dimensions, cross-tenant conformed dimensions, governance via Unity Catalog, data quality enforcement, late-data handling, and robust testing strategies for production pipelines.\n\n## Key Concepts\n- **Delta Live Tables (DLT)** for declarative pipeline development\n- **MERGE operations** for deterministic upserts to Gold tables\n- **SCD Type 2** for slowly changing dimensions that preserves historical changes\n- **Unity Catalog** for centralized access control and governance\n- **Auto Loader** for incremental file ingestion from cloud storage\n- **DLT Expectations** for declarative data quality enforcement\n\n## Architecture Overview\n\n### Bronze Layer (Ingestion)\n- Use Auto Loader to ingest 100 GB/day per tenant from S3\n- Land raw Parquet logs into partitioned Bronze tables\n- Implement checkpointing via Auto Loader's auto-compaction for exactly-once semantics\n\n### Silver Layer (Conformed Dimension)\n- Build cross-tenant conformed_dim table with SCD2 tracking\n- Maintain tenant_id, surrogate_key, effective_start_date, and end_date\n- Apply MERGE operations for deterministic upserts based on composite keys\n- Include late-data watermark handling for configurable thresholds\n\n### Gold Layer (Analytics)\n- Implement deterministic upserts using MERGE on (surrogate_key, tenant_id)\n- Optimize for analytical queries with aggregation-ready structures\n- Expose tenant-scoped views with automatic filtering\n\n## Governance Implementation\n\n### RBAC via Unity Catalog\n- Create catalog-level permissions per tenant\n- Define service principals or groups for tenant isolation\n- Apply row-level security through dynamic filters\n\n### Data Masking\n- Configure column-level masking for sensitive fields\n- Use dynamic UDFs for tenant-specific redaction rules\n- Audit access patterns through Unity Catalog lineage\n\n### Data Quality Gates\n- Define DLT expectations with threshold ratios\n- Reject or quarantine invalid records based on severity\n- Implement late-data watermark for configurable tolerance windows\n\n## Testing Strategy\n\n### Synthetic Data Generation\n- Generate late-arriving records with timestamps beyond watermark threshold\n- Create historical backfill datasets with varying effective dates\n- Simulate tenant isolation violations for RBAC validation\n\n### Validation Scenarios\n- SCD2 logic: Verify historical changes are preserved correctly\n- Data quality: Confirm invalid records are rejected or quarantined\n- Watermark behavior: Test late data handling under various conditions\n- RBAC enforcement: Validate tenant-scoped access controls",
-        "difficulty": "advanced"
+        "explanation": "## Why This Is Asked\nTests ability to design a practical two-source to Silver pipeline with governance, lineage, and data quality in a beginner-friendly setting.\n\n## Key Concepts\n- Multi-source ingestion and schema normalization\n- Delta Lake provenance and AuditFiles usage\n- MERGE CDC to Silver\n- Unity Catalog RBAC and masking views\n- Basic data quality checks and realistic synthetic data testing\n\n## Code Example\n```javascript\n// UDF to generate batch_id from path and timestamp\nfunction batchId(path, ts) {\n  return path + '-' + new Date(ts).toISOString();\n}\n```\n\n## Follow-up Questions\n- How would you handle missing event_id in some records?\n- How would you validate RBAC changes in a dev environment?",
+        "difficulty": "beginner"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-10-20T14:39:53.690Z",
+    "createdAt": "2026-10-21T07:08:14.111Z",
     "version": 1
   }
 ]
