@@ -8,28 +8,358 @@
     "questions": [
       {
         "id": "snowflake-core-q-0",
+        "questionId": "q-25073",
+        "question": "Advanced Snowflake-core: A SaaS data lake stores per-tenant events in RAW.TENANT_EVENTS(tenant_id STRING, event_id STRING, event_type STRING, payload VARIANT, event_ts TIMESTAMP_NTZ). Data arrives via S3 with duplicates and up to 2 hours late. Design a near-real-time per-tenant anomaly pipeline using Streams and Tasks that deduplicates by event_id, computes a rolling 24h anomaly_score per tenant, stores results in ANALYTICS.TENANT_ALERTS(tenant_id STRING, window_start DATE, anomaly_score NUMBER, alert BOOL), and pushes alert rows into QA.ALERTS. Provide exact SQL for core objects and the late-arrival catch-up strategy?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Mirror the RAW and curated databases to a DR Snowflake account via cross-region replication, keep DR warehouses online at reduced capacity, and auto-promote on failover with near-zero data loss levera",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Solution: Create a STREAM on RAW.TENANT_EVENTS to capture incremental changes. Implement a 5-minute scheduled TASK that deduplicates by event_id using ROW_NUMBER(), computes a rolling 24-hour anomaly_score per tenant us…",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use a session variable CURRENT_TENANT to scope ROW_ACCESS_POLICY on RAW.TRANSACTIONS and expose data through a SECURE VIEW that masks email unless CURRENT_ROLE() = 'ADMIN'. Steps: create roles ADMIN and ANALYST, map use…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design uses Snowpipe to load RAW.clickstream(event_id, user_id, ts, payload) into RAW. A STREAM/MERGE deduplicates on event_id. A masking policy hides user_id in downstream VIEWs. A TASK runs hourly t",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nThis question tests the ability to design a robust, idempotent streaming pipeline for per-tenant analytics with late data handling and anomaly detection, while balancing latency, cost, and correctness.\n\n## Key Concepts\n\n- Snowflake Streams and Tasks for incremental processing\n- Deduplication by event_id using ROW_NUMBER() with idempotent MERGE patterns\n- Rolling 24-hour window aggregation per tenant\n- Threshold-based alerting pushed to QA.ALERTS\n- Late-arrival catch-up strategy using change tracking and historical reprocessing\n\n## Code Example\n\n```sql\n-- Stream to capture incremental changes on raw events table\nCREATE OR REPLACE STREAM RAW.TENANT_EVENTS_STM\nON TABLE RAW.TENANT_EVENTS\nAPPEND_ONLY = TRUE;\n\n-- Main processing task: deduplicate, compute anomaly score, merge results\nCREATE OR REPLACE TASK RAW.PROCESS_TENANT_EVENTS\nWAREHOUSE = COMPUTE_WH\nSCHEDULE = '5 MINUTE'\nAS\nMERGE INTO ANALYTICS.TENANT_ALERTS t\nUSING (\n    SELECT\n        tenant_id,\n        DATE_TRUNC('DAY', event_ts) AS window_start,\n        AVG(anomaly_score) AS anomaly_score,\n        CASE WHEN AVG(anomaly_score) > 0.95 THEN TRUE ELSE FALSE END AS alert\n    FROM (\n        SELECT\n            tenant_id,\n            event_ts,\n            event_id,\n            ROW_NUMBER() OVER (PARTITION BY tenant_id, event_id ORDER BY event_ts) AS rn,\n            -- Anomaly score calculation (simplified example)\n            CASE\n                WHEN payload:error_rate::NUMBER > 0.1 THEN 1.0\n                WHEN payload:latency_p99::NUMBER > 5000 THEN 0.8\n                ELSE 0.2\n            END AS anomaly_score\n        FROM RAW.TENANT_EVENTS_STM\n        WHERE event_ts >= DATEADD(DAY, -1, CURRENT_DATE())\n    )\n    WHERE rn = 1\n    GROUP BY tenant_id, window_start\n) s\nON t.tenant_id = s.tenant_id AND t.window_start = s.window_start\nWHEN MATCHED THEN UPDATE\n    SET t.anomaly_score = s.anomaly_score, t.alert = s.alert\nWHEN NOT MATCHED THEN INSERT (tenant_id, window_start, anomaly_score, alert)\n    VALUES (s.tenant_id, s.window_start, s.anomaly_score, s.alert);\n\n-- Push alerts to QA.ALERTS\nINSERT INTO QA.ALERTS (tenant_id, window_start, anomaly_score, alert)\nSELECT tenant_id, window_start, anomaly_score, alert\nFROM ANALYTICS.TENANT_ALERTS\nWHERE alert = TRUE\nAND window_start = CURRENT_DATE();\n\n-- Late-arrival catch-up task: runs every hour to reprocess recent window\nCREATE OR REPLACE TASK RAW.CATCHUP_LATE_ARRIVALS\nWAREHOUSE = COMPUTE_WH\nSCHEDULE = '60 MINUTE'\nAS\nMERGE INTO ANALYTICS.TENANT_ALERTS t\nUSING (\n    SELECT\n        tenant_id,\n        DATE_TRUNC('DAY', event_ts) AS window_start,\n        AVG(anomaly_score) AS anomaly_score,\n        CASE WHEN AVG(anomaly_score) > 0.95 THEN TRUE ELSE FALSE END AS alert\n    FROM (\n        SELECT\n            tenant_id,\n            event_ts,\n            event_id,\n            ROW_NUMBER() OVER (PARTITION BY tenant_id, event_id ORDER BY event_ts) AS rn,\n            CASE\n                WHEN payload:error_rate::NUMBER > 0.1 THEN 1.0\n                WHEN payload:latency_p99::NUMBER > 5000 THEN 0.8\n                ELSE 0.2\n            END AS anomaly_score\n        FROM RAW.TENANT_EVENTS\n        WHERE event_ts >= DATEADD(DAY, -1, CURRENT_DATE())\n        AND METADATA$ACTION = 'INSERT'\n    )\n    WHERE rn = 1\n    GROUP BY tenant_id, window_start\n) s\nON t.tenant_id = s.tenant_id AND t.window_start = s.window_start\nWHEN MATCHED THEN UPDATE\n    SET t.anomaly_score = s.anomaly_score, t.alert = s.alert;\n\n-- Resume tasks\nALTER TASK RAW.PROCESS_TENANT_EVENTS RESUME;\nALTER TASK RAW.CATCHUP_LATE_ARRIVALS RESUME;\n```\n\nThis design ensures:\n1. **Idempotency**: Using ROW_NUMBER() guarantees each event_id is processed exactly once\n2. **Low latency**: 5-minute TASK provides near-real-time processing\n3. **Late data handling**: Hourly catch-up task reprocesses the last 24 hours to capture data arriving within the 2-hour window\n4. **Separation of concerns**: Main pipeline handles streaming data; catch-up task handles late arrivals independently",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-1",
+        "questionId": "q-9301",
+        "question": "Snowflake multi-tenant analytics: isolate tenant data in shared databases and mask PII in shared views. Design a practical approach using per-tenant SESSION_CONTEXT, ROW ACCESS POLICIES, and SECURE VIEWS. Include masking for email/phone, an audit trail, and a test TASK. Provide exact SQL for: 1) masking policy; 2) secure view with policy; 3) session context and tenant-scoped query; 4) a test TASK validating access?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Enable per-tenant ingestion via Snowpipe with dedicated stages and pipes for each tenant. Implement Streams on RAW tables to capture inserts, with Tasks orchestrating per-tenant Materialized View cache refreshes. Enforc…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a per-tenant session_context (TENANT_ID) to drive a ROW ACCESS POLICY and serve data through a SECURE VIEW. Implement masking policies on email/phone revealing values only when SESSION_CONTEXT('TE",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Ingest with RAW.EVENTS_STREAM and a minute-based TASK that aggregates per-tenant counts over the last 2 minutes, writing to ANALYTICS.ANOMALIES (tenant_id, ts, count, score). Create QA.V_TENANT_EVENTS",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Stage yesterday's events in STG_EVENTS, aggregate into DAILY.EVENTS_SUMMARY using MERGE for idempotence, then log metrics in QA.ETL_AUDIT and alert QA.ETL_ALERTS if zero events. Schedule nightly via a",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests knowledge of Snowflake security constructs (ROW ACCESS POLICY, SECURE VIEW, MASKING POLICY) and practical tenant isolation in a shared environment.\n\n## Key Concepts\n- Row Access Policies driven by session context\n- Dynamic masking on PII fields\n- Secure views for standardized access\n- Tenant-oriented auditing and testability\n\n## Code Example\n```sql\n-- Example skeletons (not complete in this snippet):\n-- 1) Masking policy for email/phone\nCREATE MASKING POLICY email_phone_mask AS (v STRING) RETURNS STRING ->\nCASE WHEN CURRENT_ROLE() = 'ADMIN' OR CURRENT_SESSION_CONTEXT('TENANT_ID') = TENANT_ID THEN v ELSE 'REDACTED' END;\n\n-- 2) Secure view with ROW ACCESS POLICY applied\nCREATE OR REPLACE SECURE VIEW V_TENANT_DATA AS\nSELECT * FROM RAW.TENANT_DATA\nWHERE TENANT_ID = CURRENT_SESSION_CONTEXT('TENANT_ID');\n\n-- 3) Session context and tenant-scoped query\nSELECT * FROM V_TENANT_DATA;\n\n-- 4) Simple TASK to validate access\nCREATE TASK TASK_VALIDATE_TENANT\nWAREHOUSE = 'COMPUTE_WH'\nSCHEDULE = 'USING CRON 0 * * * *'\nAS\nSELECT COUNT(*) FROM V_TENANT_DATA;\n```\n\n## Follow-up Questions\n- How would you test masking across roles and tenants?\n- What are performance considerations with many ROW ACCESS POLICIES?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "snowflake-core-q-2",
+        "questionId": "q-23083",
+        "question": "Snowflake-core intermediate: Ingest RAW.USAGE_EVENTS (tenant_id STRING, event_id STRING, region STRING, currency STRING, revenue_estimate NUMBER, ts TIMESTAMP_NTZ). Data arrives late up to 48h. Design a per-tenant, per-region, per-day revenue reconciliation that converts revenue_estimate to USD using daily CURRENCY_RATES, writes to DAILY_METRICS (tenant_id, date DATE, region, currency, revenue_usd NUMBER, events NUMBER) via STREAM and NIGHTLY_TASK. Include late-arrival handling, idempotent MERGE, and anomaly alerts. Provide exact SQL for core steps?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Create a stream on raw.clicks to capture inserts, then a daily Task at 02:00 UTC that reads yesterday's data, aggregates by user_id and day, and MERGE-UPSERTs into dashboard.daily_user_engagement (tot",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a Stream on RAW.USAGE_EVENTS and a NIGHTLY_TASK that aggregates yesterday's data per tenant_id, region, currency, converting revenue_estimate to USD via DAILY_CURRENCY_RATES; MERGE results i",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use a STREAM on PUBLIC.WEB_EVENTS, create a DAILY_WEB_SUMMARY table, implement a JavaScript stored procedure to MERGE stream inserts into DAILY_WEB_SUMMARY and log LAST_RUN_TS into QA.PIPELINE_LOG, an",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "**Answer:** Implement a JSONL file format, an external stage pointing to s3://logs-bucket/access/, and a Snowpipe (P_ACCESS_LOGS) to load into STAGING.ACCESS_LOGS. Then use a nightly TASK to MERGE into PUBLIC.ACCESS_LOG…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests end-to-end Snowflake pipeline design: late data handling, currency normalization, and idempotent upserts in a production-like setting.\n\n## Key Concepts\n- Snowflake Streams and Tasks for incremental processing\n- MERGE upserts with deterministic keys\n- Currency conversion join with daily rates\n- Late-arrival window management and anomaly alerts\n\n## Code Example\n```javascript\n-- Skeleton: create stream\nCREATE STREAM s_raw_usage ON TABLE RAW.USAGE_EVENTS;\n\n-- Target table (example)\nCREATE OR REPLACE TABLE DAILY_METRICS (\n  tenant_id STRING, date DATE, region STRING, currency STRING, revenue_usd NUMBER, events NUMBER\n);\n\n-- Nightly task (pseudocode)\nCREATE OR REPLACE TASK NIGHTLY_RECON\n  WAREHOUSE = 'WH_A' SCHEDULE = '1 DAY' AS\n  MERGE INTO DAILY_METRICS t\n  USING (\n    SELECT tenant_id, CAST(DATE(ts) AS DATE) AS date, region, currency,\n           SUM(revenue_estimate * rate) AS revenue_usd,\n           COUNT(*) AS events\n    FROM RAW.USAGE_EVENTS\n    JOIN DAILY_CURRENCY_RATES r ON CAST(DATE(ts) AS DATE) = r.date AND currency = r.currency\n    WHERE ts >= DATEADD(DAY, -1, CURRENT_DATE())\n    GROUP BY tenant_id, CAST(DATE(ts) AS DATE), region, currency\n  ) s\n  ON (t.tenant_id = s.tenant_id AND t.date = s.date AND t.region = s.region AND t.currency = s.currency)\n  WHEN MATCHED THEN UPDATE SET revenue_usd = s.revenue_usd, events = s.events\n  WHEN NOT MATCHED THEN INSERT (tenant_id, date, region, currency, revenue_usd, events)\n  VALUES (s.tenant_id, s.date, s.region, s.currency, s.revenue_usd, s.events);\n```\n\n## Follow-up Questions\n- How would you test the late-arrival window and ensure idempotency?\n- How would you monitor currency-rate failures and partial reconciliations?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "snowflake-core-q-3",
+        "questionId": "q-2790",
+        "question": "Beginner Snowflake-core: daily ingest loads 1M rows into `staging.image_events` (image_id STRING, ts TIMESTAMP_NTZ, status STRING, size_bytes NUMBER). Propose a minimal ETL to populate a curated table `analytics.image_events` with columns `image_id STRING, day DATE, status STRING, size_kb NUMBER`, where day = DATE(ts) and size_kb = size_bytes/1024. Provide exact SQL for table creation and a single MERGE to upsert the batch. Include how you'd validate row counts and data types?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design an end-to-end global pattern: ingest per-region RAW tables via Snowpipe, surface changes with Streams, consolidate into CURATED.EVENTS_TENANT via a daily Task, expose fast dashboards with a Mat",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a daily MERGE from staging.image_events into analytics.image_events on (image_id, day). Transform day = DATE(ts), size_kb = size_bytes/1024. Create analytics.image_events(image_id STRING, day DATE",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "## Solution Overview This solution implements a nightly MERGE from a stream on RAW_EVENTS into DAILY_METRICS, with dedicated handling for late-arriving data and anomaly detection. ### Step 1: Create the Stream for Chang…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use a STREAM on RAW.USER_ACTIVITY to capture inserts, a NIGHTLY TASK computing yesterday’s per-app metrics, and an INSERT into DIGEST.APP_ACTIVITY. Then check against EXPECTED_USERS per app and insert",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design a simple, reliable ETL path with upserts, basic data typing, and data validation for a common Snowflake pattern.\n\n## Key Concepts\n- MERGE for incremental upserts\n- Derived columns: day from TIMESTAMP_NTZ and size_kb from bytes\n- Simple validation: row counts and sample value checks\n\n## Code Example\n```sql\nCREATE TABLE IF NOT EXISTS analytics.image_events (\n  image_id STRING,\n  day DATE,\n  status STRING,\n  size_kb NUMBER\n);\n\nMERGE INTO analytics.image_events AS t\nUSING (\n  SELECT image_id, DATE(ts) AS day, status, size_bytes/1024.0 AS size_kb\n  FROM staging.image_events\n) AS s\nON t.image_id = s.image_id AND t.day = s.day\nWHEN MATCHED THEN UPDATE SET t.status = s.status, t.size_kb = s.size_kb\nWHEN NOT MATCHED THEN INSERT (image_id, day, status, size_kb) VALUES (s.image_id, s.day, s.status, s.size_kb);\n```\n\n## Follow-up Questions\n- How would you handle late-arriving data or corrections to past days?\n- How would you automate this daily run and validate no regressions?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "snowflake-core-q-4",
+        "questionId": "q-20297",
+        "question": "You're operating a global media analytics platform in Snowflake with RAW tables per region (RAW.EVENTS_US, RAW.EVENTS_EU, RAW.EVENTS_APAC). You must deliver per-tenant dashboards with strict isolation, near real-time updates, and controlled external sharing. Design an end-to-end Snowflake-core pattern using Snowpipe, Streams, Tasks, and Materialized Views to unify data into CURATED.EVENTS_TENANT and serve VWAP-like metrics. Include concrete SQL for: (a) creating a STREAM on each RAW table, (b) a TASK to merge region data into CURATED, (c) a MV on CURATED for tenant dashboards, (d) ROW ACCESS POLICIES and a dynamic masking policy, (e) a daily cost-alert mechanism. Provide SQL?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a STREAM on PUBLIC.WEB_EVENTS, create a DAILY_WEB_SUMMARY table, implement a JavaScript stored procedure to MERGE stream inserts into DAILY_WEB_SUMMARY and log LAST_RUN_TS into QA.PIPELINE_LOG, an",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a STREAM on RAW.EVENTS and a 5-minute TASK that MERGEs into DIGEST.EVENT_LINEAGE with lineage_id = md5(tenant_id||event_id). Deduplicate on event_id, fill source_path from metadata, and set ingest",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "SQL: CREATE MASKING POLICY mask_secret_token(val STRING) RETURNS STRING -> CASE WHEN CURRENT_ROLE() IN ('SYSADMIN','ROLE_SECURITY') THEN val ELSE 'REDACTED' END; ALTER TABLE RAW.DEVICE_LOGS ALTER COLU",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design an end-to-end global pattern: ingest per-region RAW tables via Snowpipe, surface changes with Streams, consolidate into CURATED.EVENTS_TENANT via a daily Task, expose fast dashboards with a Mat",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design scalable, secure Snowflake-core pipelines across regions with strict tenant isolation, cost controls, and real-time updates.\n\n## Key Concepts\n- Snowpipe for region-wide ingestion\n- Streams for change data tracking\n- Tasks for periodic consolidation\n- Materialized Views for fast dashboards\n- ROW ACCESS POLICIES and dynamic masking for isolation and data protection\n- Cost-alert mechanisms to guard multi-tenant spends\n\n## Code Example\n```sql\n-- Example: create a STREAM on a RAW table\nCREATE OR REPLACE STREAM RAW.EVENTS_US_STREAM ON TABLE RAW.EVENTS_US (APPEND_ONLY = FALSE);\n```\n\n## Follow-up Questions\n- How would you handle schema drift across regions while preserving backward compatibility?\n- How would you test tenant isolation and data leakage scenarios in this design?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-5",
+        "questionId": "q-5263",
+        "question": "Snowflake-core intermediate: You run a global e-commerce analytics pipeline. In RAW_ORDERS(order_id STRING, customer_id STRING, amount NUMBER, currency STRING, placed_at TIMESTAMP_NTZ), you need near real-time dashboards by country and currency conversion. Outline (a) ingestion to a curated table with 5-minute latency, (b) a daily currency_rate table and a view that converts to USD, (c) a secure partner share with masked customer emails, (d) cross-region replication strategy for DR with minimal data loss, and (e) exact SQL for each step?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a single RAW.TRADE with TENANT_ID, ingest via Snowpipe, create a STREAM on RAW.TRADE and a TASK to incrementally populate a per-tenant VWAP MV per symbol. Enforce isolation with ROW ACCESS POLICIE",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design uses a STREAM on RAW.USER_EVENTS to power a NIGHTLY_TASK that upserts per-tenant daily aggregates into DIGEST.USER_ACTIVITY (date, tenant_id, user_id, events, first_ts, last_ts). A downstream M",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a STREAM on RAW.SITE_EVENTS and MERGE INTO CLEAN.SITE_EVENTS BY event_id, selecting the latest ts with ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY ts DESC). Nightly TASK processes last 24h,",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Use Snowpipe to ingest RAW_ORDERS into CURATED_ORDERS with a 5-minute TASK driven by a STREAM on RAW_ORDERS. Currency conversion via a daily CURRENCY_RATE table; USD_REVENUE view joins CURATED_ORDERS",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssesses ability to design near‑real‑time Snowflake pipelines with data sharing and DR.\n\n## Key Concepts\n- Snowpipe, Tasks, Streams for low-latency ingestion\n- CURATED_ORDERS and USD_REVENUE view for on‑the‑fly currency\n- Masking policies and secure views for partner data sharing\n- ACCOUNT REPLICATION and Failover Groups for DR\n\n## Code Example\n```sql\n-- Ingestion pipe and task (illustrative)\nCREATE OR REPLACE PIPE p_raw_orders AS COPY INTO CURATED_ORDERS FROM @staging\n  FILE_FORMAT=(TYPE=CSV);\nCREATE TASK t_ingest_5m WAREHOUSE = w_load SCHEDULE = '5 MINUTE' AS\n  ALTER PIPE p_raw_orders REFRESH;\n\n-- USD conversion view\nCREATE OR REPLACE VIEW USD_REVENUE AS\nSELECT o.order_id, o.customer_id, o.amount, o.currency, o.placed_at,\n       o.amount * r.rate AS usd_amount\nFROM CURATED_ORDERS o\nJOIN CURRENCY_RATE r ON o.currency = r.currency;\n```\n\n## Follow-up Questions\n- How would you validate currency conversions across currencies with holiday/weekend rate gaps?\n- What failure scenarios would trigger DR failover, and how would you test them?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "snowflake-core-q-6",
+        "questionId": "q-27031",
+        "question": "Intermediate Snowflake-core: Ingest telemetry from a feature-flag service into RAW.FEATURE_LOGS (tenant_id STRING, service_id STRING, flag STRING, payload VARIANT, ts TIMESTAMP_NTZ). Data arrives with duplicates and late up to 72h; payload evolves over time. Design an idempotent nightly reconciliation that expands payload via META.SCHEMA_MAP(flag, field_path, target_column), then aggregates per-tenant, per-service, per-flag daily activations and revenue (if payload.amount exists) into DIGEST.FEATURE_SUMMARY (date DATE, tenant_id STRING, service_id STRING, flag STRING, activations NUMBER, revenue NUMBER) using a STREAM and NIGHTLY TASK. Include late-arrival handling, anomaly alerts. Provide exact SQL for core objects and late-arrival strategy?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "CREATE DATABASE DEV_CLONE CLONE PROD_DB; CREATE VIEW DEV_CLONE.PUBLIC.SALES_DEV_LAST90 AS SELECT * FROM DEV_CLONE.PUBLIC.SALES WHERE sale_ts >= DATEADD(day,-90,CURRENT_TIMESTAMP()); CREATE OR REPLACE",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "I would stage duplicates in ORDERS_STG from RAW.ORDERS using ROW_NUMBER() to keep only the latest per order_id, then MERGE into PROD.ORDERS to upsert: update when newer, insert when new. Populate QA.O",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement a nightly pipeline: create digest_sales(region STRING, day DATE, total_amount NUMBER); create digest_audit(region, day, run_at, status). Schedule a TASK at 02:00 to populate digest_sales wit",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement via a STREAM on RAW.FEATURE_LOGS and a NIGHTLY TASK that MERGEs into DIGEST.FEATURE_SUMMARY using the composite key (date, tenant_id, service_id, flag). Use DATE_TRUNC('day', ts) for the date partition. Handle…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests the practical ability to build idempotent Snowflake pipelines with evolving payloads and late-arriving data.\n\n## Key Concepts\n- Streams, Tasks, and MERGE semantics in Snowflake\n- Dynamic schema mapping with META.SCHEMA_MAP\n- Late-arrival handling via watermark windows\n- Data quality alerts via QC views\n\n## Code Example\n```sql\n-- Create STREAM on RAW.FEATURE_LOGS\nCREATE OR REPLACE STREAM RAW.FEATURE_LOGS_STREAM \nON TABLE RAW.FEATURE_LOGS \nAPPEND_ONLY = FALSE;\n\n-- Nightly MERGE into DIGEST.FEATURE_SUMMARY\nMERGE INTO DIGEST.FEATURE_SUMMARY t\nUSING (\n  WITH dedup AS (\n    SELECT \n      DATE_TRUNC('day', ts) AS date,\n      tenant_id,\n      service_id,\n      flag,\n      payload,\n      ROW_NUMBER() OVER (\n        PARTITION BY tenant_id, service_id, flag, DATE_TRUNC('day', ts) \n        ORDER BY ts DESC\n      ) AS rn\n    FROM RAW.FEATURE_LOGS\n    WHERE ts >= DATEADD(day, -3, CURRENT_DATE)\n  )\n  SELECT \n    date,\n    tenant_id,\n    service_id,\n    flag,\n    COUNT(*) AS activations,\n    SUM(payload:amount::NUMBER) AS revenue\n  FROM dedup\n  WHERE rn = 1\n  GROUP BY date, tenant_id, service_id, flag\n) s\nON t.date = s.date \n   AND t.tenant_id = s.tenant_id \n   AND t.service_id = s.service_id \n   AND t.flag = s.flag\nWHEN MATCHED THEN UPDATE SET \n  t.activations = s.activations,\n  t.revenue = s.revenue\nWHEN NOT MATCHED THEN INSERT (date, tenant_id, service_id, flag, activations, revenue)\nVALUES (s.date, s.tenant_id, s.service_id, s.flag, s.activations, s.revenue);\n\n-- Create NIGHTLY TASK\nCREATE OR REPLACE TASK NIGHTLY_FEATURE_RECONCILE\nSCHEDULE = 'USING CRON 0 2 * * * America/New_York'\nAS \nCALL NIGHTLY_FEATURE_RECONCILE_PROC();\n\n-- Late-arrival watermark procedure\nCREATE OR REPLACE PROCEDURE NIGHTLY_FEATURE_RECONCILE_PROC()\nRETURNS VARCHAR\nLANGUAGE SQL\nAS $$\n  DECLARE watermark DATE := DATEADD(day, -3, CURRENT_DATE);\n  BEGIN\n    -- Reprocess last 72 hours to catch late arrivals\n    MERGE INTO DIGEST.FEATURE_SUMMARY t\n    USING (\n      WITH expanded AS (\n        SELECT \n          DATE_TRUNC('day', ts) AS date,\n          fl.tenant_id,\n          fl.service_id,\n          fl.flag,\n          sm.target_column,\n          GET(fl.payload, sm.field_path) AS field_value\n        FROM RAW.FEATURE_LOGS fl\n        JOIN META.SCHEMA_MAP(fl.flag) sm\n        WHERE fl.ts >= :watermark\n      )\n      SELECT \n        date,\n        tenant_id,\n        service_id,\n        flag,\n        COUNT(*) AS activations,\n        SUM(IFNULL(field_value, 0)) AS revenue\n      FROM expanded\n      GROUP BY date, tenant_id, service_id, flag\n    ) s\n    ON t.date = s.date AND t.tenant_id = s.tenant_id \n       AND t.service_id = s.service_id AND t.flag = s.flag\n    WHEN MATCHED THEN UPDATE SET \n      t.activations = s.activations,\n      t.revenue = s.revenue\n    WHEN NOT MATCHED THEN INSERT \n      (date, tenant_id, service_id, flag, activations, revenue)\n    VALUES (s.date, s.tenant_id, s.service_id, s.flag, s.activations, s.revenue);\n    \n    -- Anomaly alert for schema drift\n    IF (SELECT COUNT(*) FROM RAW.FEATURE_LOGS \n        WHERE ts >= :watermark \n        AND payload IS NULL) > 0 THEN\n      CALL SYSTEM$LOG('ALERT', 'Schema drift detected in feature flags');\n    END IF;\n    \n    RETURN 'Success';\n  END;\n$$;\n```",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "snowflake-core-q-7",
+        "questionId": "q-5837",
+        "question": "Scenario: RAW.SALES(account_id, sale_id, customer_email, amount, ts, region) feeds a partner data share. Deliver a sanitized daily dataset with no plain emails. Implement: (1) SHA256 hashing producing hashed_email, (2) a secure view exposing hashed_email, region, and date(ts), (3) a daily TASK loading CURATED.SALES_SECURE from RAW.SALES, (4) a secure share to the partner account, (5) a validation query ensuring no plain emails exist in the share. Provide exact SQL?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose a tenant-aware governance layer: build a per-tenant secure view on raw_events(payload) masking firmware_version for tenants without access, enforce isolation with a ROW ACCESS POLICY on tenant",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement an idempotent nightly load: stage RAW.ORDERS_DELTA into ORDERS_STAGE; MERGE PROD.ORDERS using ORDERS_STAGE on order_id = order_id; WHEN MATCHED THEN UPDATE SET user_id = s.user_id, amount = s.amount, order_ts…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Implement an automated data pipeline from S3 to Snowflake using Snowpipe for continuous JSON ingestion. Configure a stage and file format to parse JSON event logs into a RAW.EVENTS table with a VARIANT payload column. C…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Hash emails with SHA2(256) and present hashed_email in a secure view; include region, date(ts) and amount_bucket; do not expose customer_email. Use a daily TASK to populate CURATED.SALES_SECURE from R",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests data sanitization, secure sharing, and automation in Snowflake.\n\n## Key Concepts\n- Data sharing and shares\n- Secure views and masking/hash policies\n- TASKs for scheduled ingestion\n- Validation via information_schema\n\n## Code Example\n```sql\n-- 1) Build secure view with hashed_email\nCREATE OR REPLACE VIEW CURATED.SALES_SECURE AS\nSELECT account_id, sale_id, region,\n       DATE(ts) AS sale_date,\n       amount,\n       SHA2(customer_email, 256) AS hashed_email\nFROM RAW.SALES;\n```\n```sql\n-- 4) Create share and grant access\nCREATE SHARE partner_share;\nALTER SHARE partner_share ADD DATABASE mydb;\nALTER SHARE partner_share ADD SCHEMAS mydb.CURATED;\nALTER SHARE partner_share ADD ACCOUNTS = ('<PARTNER_ACCOUNT_ID>');\n```\n```sql\n-- 5) Validation: no plain email column in secure view\nSELECT COUNT(*) AS plain_email_column\nFROM INFORMATION_SCHEMA.COLUMNS\nWHERE TABLE_SCHEMA = 'CURATED' AND TABLE_NAME = 'SALES_SECURE' AND COLUMN_NAME = 'CUSTOMER_EMAIL';\n```",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "snowflake-core-q-8",
+        "questionId": "q-10149",
+        "question": "Design an end-to-end Snowflake-core pipeline for a multi-tenant analytics lake that must isolate tenants, mask PII in transit and at rest, and enable secure cross-tenant sharing. Ingest RAW.EVENTS(tenant_id STRING, event_id STRING, payload VARIANT, ts TIMESTAMP_NTZ). Use per-tenant SECURE_VIEW masking to redact customer_email in payload. Use a Stream on RAW.EVENTS and a Task that daily upserts into DIGEST.TENANT_EVENTS(tenant_id STRING, day DATE, total_events NUMBER, pii_events NUMBER). Expose only per-tenant data via a secure view and optional Snowflake Data Share. Include exact SQL for ingestion, masking view, stream, merge, and Task definitions, plus late-arrival handling and monitoring?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a ROW_ACCESS_POLICY on RAW.TICKETS filtering by tenant_id = current_tenant() and surface data via a SECURE_VIEW V_TICKETS. Maintain a tenant-to-role mapping and switch roles on login (e.g.,",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Use a STREAM on RAW.APP_EVENTS and a NIGHTLY_TASK that backfills 96 hours of data. MERGE into DIGEST.APP_USAGE_SUMMARY (date, tenant_id, feature, active_users, revenue) grouped by tenant/feature/date with dedup by event…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Create a STREAM on RAW.SENSOR_READINGS and a NIGHTLY TASK that aggregates per device/date from a deduplicated source and MERGEs into DIGEST.DEVICE_DAILY. Deduplicate with SELECT DISTINCT device_id, ts",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Design a multi-tenant Snowflake pipeline that isolates tenants, masks PII, and enables secure cross-tenant sharing. ## 1. Base Table with Tenant Isolation ```sql -- Create raw events table with clustering for tenant iso…",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis question tests your ability to build a production-grade analytics pipeline in Snowflake that handles multi-tenant data isolation and security.\n\n## Key Concepts You Need to Demonstrate\n\n1. **Tenant Isolation**: Use SECURE_VIEW with session context for row-level security\n2. **PII Masking**: Mask customer_email in payload VARIANT both in transit (views) and at rest (separate tables)\n3. **Incremental Processing**: Use Streams for CDC and Tasks for scheduled MERGE operations\n4. **Late-Arrival Handling**: Implement Time Travel windows (48-72 hours) in the aggregation query to capture straggler events\n5. **Idempotent Design**: MERGE statements ensure safe re-execution for recovery scenarios\n6. **Monitoring**: Use TASK_HISTORY and stream monitoring for pipeline health\n\n## What Your Answer Should Include\n\n- **Ingestion**: COPY INTO with error handling for reliable data loading\n- **Masking View**: SECURE_VIEW with OBJECT_CONSTRUCT to rebuild payload without PII\n- **Stream**: Non-append-only stream to capture UPDATEs and DELETEs\n- **Task**: Daily scheduled MERGE with late-arrival window logic\n- **Monitoring**: Query TASK_HISTORY and stream state for observability\n\n## Critical Details\n- The payload VARIANT requires special handling for masking (cannot simply use REPLACE)\n- Time Travel window should be configurable based on business requirements\n- Cluster RAW.EVENTS by (tenant_id, ts) for optimal query performance\n- Use CURRENT_SESSION_CONTEXT to enforce tenant isolation in secure views",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "snowflake-core-q-9",
+        "questionId": "q-24416",
+        "question": "Advanced Snowflake-core: You operate a multi-tenant analytics platform ingesting per-event data into RAW_EVENTS (tenant_id STRING, event_id STRING, amount NUMBER, ts TIMESTAMP_NTZ). Design a latency-tolerant, idempotent daily-aggregate pipeline using Streams, Tasks, and a MATERIALIZED VIEW. Provide exact SQL for core objects (STREAM, TASK, MERGE) and describe handling of late-arriving data and per-tenant cost controls?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "I would implement clustering on REGION and ORDER_TS to constrain scans; create two tasks: one to write daily regional totals to QA.DAILY_REGION_SALES_SUMMARY, another to append the day's detailed rows",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Implement a minimal, practical solution using a masking policy, a filtered view, and a share. 1) Create masking policy mp_customer_id_mask that masks CUSTOMER_ID to a4 chars + ****. 2) Alter TABLE RAW",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a STREAM on RAW_EVENTS feeding a daily MERGE into DAILY_AGG (tenant_id, day, revenue, events). Include a late-arrival window (previous 2 days) with dedup on event_id. Store results in a MATERIALIZ",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Proposed approach: implement a SQL function can_view_unit(unit_id STRING) returning true when a row exists in PERMISSIONS for the CURRENT_ROLE() with can_view = TRUE for that unit. Attach a ROW ACCESS",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests multi-tenant isolation, late data handling, idempotent MERGE logic, and cost governance using Snowflake Streams, Tasks, and MV. Encourages thinking about dedup keys, windowing, and clustering strategies.\n\n## Key Concepts\n- Streams and Tasks for incremental, scheduled pipelines\n- Idempotent MERGE with event_id dedup\n- Late-arrival window handling and cross-day reconciliation\n- Materialized Views for fast tenant-scoped reads\n- Clustering and cost controls (warehouse sizing, resource monitors)\n\n## Code Example\n```sql\n-- Core objects (illustrative)\nCREATE STREAM RAW_EVENTS_ST (tenant_id STRING, event_id STRING, amount NUMBER, ts TIMESTAMP_NTZ) ON TABLE RAW_EVENTS;\nCREATE MATERIALIZED VIEW mv_daily_agg AS SELECT tenant_id, DATE(ts) AS day, SUM(amount) AS revenue, COUNT(*) AS events FROM RAW_EVENTS GROUP BY tenant_id, DATE(ts);\nCREATE OR REPLACE TASK t_daily_agg WAREHOUSE = compute_wh\n  SCHEDULE = 'USING CRON 0 2 * * *' AS\nMERGE INTO DAILY_AGG AS D\nUSING (SELECT tenant_id, DATE(ts) AS day, SUM(amount) AS revenue, COUNT(*) AS events, MAX(event_id) AS max_eid\n       FROM RAW_EVENTS_ST\n       GROUP BY tenant_id, DATE(ts)) AS S\nON D.tenant_id = S.tenant_id AND D.day = S.day\nWHEN MATCHED THEN UPDATE SET revenue = D.revenue + S.revenue, events = D.events + S.events\nWHEN NOT MATCHED THEN INSERT (tenant_id, day, revenue, events) VALUES (S.tenant_id, S.day, S.revenue, S.events);\n```\n\n## Follow-up Questions\n- How would you test late-data scenarios and ensure no double-counts?\n- How would you adapt this to cross-tenant rollups with SLA targets?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-10",
+        "questionId": "q-18124",
+        "question": "Advanced Snowflake-core: In a multi-tenant data lake, 1,000+ tenants ingest event streams into RAW tables in Snowflake. You must guarantee per-tenant isolation, near real-time dashboards, and resilience against out-of-order events with deduplication. Propose an end-to-end architecture using Streams/Tasks, per-tenant ROW ACCESS POLICIES, and secure data sharing patterns. Include concrete SQL for core objects and a validation plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design an end-to-end per-tenant streaming pipeline in Snowflake for RAW.EVENTS(tenant_id, event_id, payload, ts). Ingest events via Snowpipe from Kafka, implement per-tenant data isolation using SECURE_VIEW with dynamic…",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Cluster by (device_id, DATE(ts)); enable AUTOMATIC_CLUSTERING. Create 7-day rolling MV mv_last7: SELECT device_id, COUNT(*) AS event_count, APPROX_PERCENTILE(CAST(payload:reading AS FLOAT), 0.5) AS me",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "ALTER TABLE SALES CLUSTER BY (SALE_DATE); -- Inspect clustering depth SELECT SYSTEM$CLUSTERING_INFORMATION('MY_DB.MY_SCHEMA.SALES'); -- If depth indicates suboptimal pruning, recluster ALTER TABLE SAL",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement per-tenant ingestion: RAW_EVENTS(tenant_id, event_id, payload, event_ts); create RAW_EVENTS_STREAM; MERGE into TENANT_EVENTS(tenant_id, event_id, payload, event_ts) using RAW_EVENTS_STREAM o",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nEvaluates multi-tenant isolation, exactly-once semantics, and handling out-of-order events at scale using Snowflake Streams/Tasks, ROW ACCESS POLICIES, and secure data sharing.\n\n## Key Concepts\n- Snowflake Streams and Tasks for incremental processing\n- ROW ACCESS POLICIES for tenant isolation\n- Per-tenant deduplication with event_id and offset tracking\n- Secure data sharing and staging patterns\n\n## Code Example\n```sql\n-- Ingest stage and RAW table\nCREATE OR REPLACE STAGE ingested_stage URL='s3://ingest-bucket/tenants/'\n  STORAGE_INTEGRATION='sf_ingest';\nCREATE OR REPLACE TABLE RAW_EVENTS (\n  tenant_id STRING,\n  event_id STRING,\n  payload VARIANT,\n  event_ts TIMESTAMP_NTZ\n);\nCREATE OR REPLACE STREAM RAW_EVENTS_STREAM ON TABLE RAW_EVENTS;\n\n-- Tenant-resolved target and upsert\nCREATE OR REPLACE TABLE TENANT_EVENTS (\n  tenant_id STRING,\n  event_id STRING,\n  payload VARIANT,\n  event_ts TIMESTAMP_NTZ\n);\nMERGE INTO TENANT_EVENTS t\nUSING RAW_EVENTS_STREAM s\nON t.tenant_id = s.tenant_id AND t.event_id = s.event_id\nWHEN NOT MATCHED THEN\n  INSERT (tenant_id, event_id, payload, event_ts)\n  VALUES (s.tenant_id, s.event_id, s.payload, s.event_ts);\n\n-- Row access policy for per-tenant isolation\nCREATE OR REPLACE ROW ACCESS POLICY tenant_rp\nON TENANT_EVENTS\nUSING (tenant_id = CURRENT_ROLE());\n```\n\n## Follow-up Questions\n- How to handle schema evolution for RAW_EVENTS without affecting TENANT_EVENTS?\n- What monitoring would you add to detect ingestion lag per tenant?\n- How would you test failover and data replay reliability for a tenant?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-11",
         "questionId": "q-22982",
         "question": "In a multi-tenant SaaS on Snowflake, RAW.TENANT_EVENTS (tenant_id STRING, event_id STRING, event_type STRING, payload VARIANT, ts TIMESTAMP_NTZ). Events can arrive out of order and with duplicates. Design a near-real-time per-tenant daily revenue pipeline: compute revenue from purchases (payload.purchase_amount), group by tenant_id and date(ts), and write to ANALYTICS.TENANT_DAILY_REVENUE (tenant_id, date, revenue). Use Snowflake Streams, Tasks, and a NIGHTLY task as fallback; include idempotent MERGE, a 12-hour late-arrival window, and alerting on gaps. Provide exact SQL for core objects?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Plan: enable SOS on RAW.EVENTS as the primary optimization and validate against baseline queries for last 7 days and last 24 hours. If needed, supplement with clustering on (DEVICE_ID, TS) and a night",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Create STREAM PUBLIC.SESSION_LOGS_STREAM ON TABLE PUBLIC.SESSION_LOGS; create QA.DAILY_REGION_STATS (report_date DATE, region STRING, sessions INT, avg_duration_min NUMBER); create NIGHTLY_TASK to MER",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
             "text": "Design a near-real-time per-tenant daily revenue pipeline using Snowflake Streams and Tasks: 1. **Stream**: Create a stream on RAW.TENANT_EVENTS filtered to event_type='purchase' 2. **Processing**: Dedup using event_id,…",
             "isCorrect": true
           },
           {
+            "id": "b",
+            "text": "I’d implement per-tenant isolation with clustering by tenant_id; expose a SECURE_VIEW masking PII; MV_APP_EVENTS_DAILY for daily aggregates refreshed by a STREAM on RAW.APP_EVENTS and a TASK; share ma",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "A minimal, auditable pipeline: **Step 1: Ingest from stage** ```sql COPY INTO RAW.EVENT_LOG FROM @data/events/ FILE_FORMAT = (TYPE = CSV); ``` **Step 2: Create stream and nightly merge task** ```sql CREATE STREAM RAW.EV…",
+            "isCorrect": false
+          },
+          {
             "id": "d",
-            "text": "Two-tier pipeline: use a stream on raw.telemetry, a TASK every 2 minutes to compute per-device 5-min rolling max temperature, flag spikes beyond a threshold, deduplicate with a sequence and METADATA$S",
+            "text": "Use a single RAW.TRADE with TENANT_ID, ingest via Snowpipe, create a STREAM on RAW.TRADE and a TASK to incrementally populate a per-tenant VWAP MV per symbol. Enforce isolation with ROW ACCESS POLICIE",
             "isCorrect": false
           }
         ],
@@ -37,80 +367,80 @@
         "difficulty": "intermediate"
       },
       {
-        "id": "snowflake-core-q-1",
-        "questionId": "q-9786",
-        "question": "Beginner Snowflake-core: You receive JSON event logs daily in an S3 bucket at s3://bucket/events/, with one JSON object per line, and you need to ingest them into Snowflake into a RAW.EVENTS table and QA metrics. Outline and implement: (a) stage, file format, and a PIPE (auto-ingest optional) to load into RAW.EVENTS(payload VARIANT) daily, (b) a view RAW.EVENTS_VIEW to extract event_id, user_id, event_type, event_ts from payload, (c) a TASK to run every 15 minutes validating that at least one row was ingested in the last interval and log counts into QA.INGEST_AUDIT, and (d) an alert row in QA.INGEST_ALERT when 0 rows. Provide exact SQL for each step?",
+        "id": "snowflake-core-q-12",
+        "questionId": "q-11187",
+        "question": "You operate a Snowflake telemetry store with RAW.EXPERIMENTS (model_id STRING, ts TIMESTAMP_NTZ, payload VARIANT). As new experiment versions emit additional fields, design a flexible ingestion path that (a) preserves raw payload, (b) exposes a structured analytics view that auto-flattens fields per schema_version, (c) handles schema drift with a versioned mapping table, and (d) enables dashboards to compute per-model daily accuracy and latency. Include exact SQL to: create a versioned mapping table, a dynamic analytics VIEW using FLATTEN and CASE, and a TASK that refreshes nightly. Discuss trade-offs?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Clone prod_db.prod_sales to sandbox_db via CREATE DATABASE sandbox_db CLONE prod_db; mask pii with masking policies: CREATE MASKING POLICY mask_ssn AS (v STRING) RETURNS STRING -> substr(v,1,3)||'***-",
+            "text": "Use Snowflake Streams on the source table and a MERGE into the SCD2 target to achieve idempotent CDC. Use src.metadata$action to distinguish INSERT, UPDATE, DELETE. For deletes, set end_date on the ex",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use Snowpipe to land tenant events into RAW_EVENTS, enforce isolation via a ROW ACCESS POLICY on TENANT_ID, and expose results through a per-tenant analytic MV. Create RAW_EVENTS_STREAM, then a TASK t",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement an automated data pipeline from S3 to Snowflake using Snowpipe for continuous JSON ingestion. Configure a stage and file format to parse JSON event logs into a RAW.EVENTS table with a VARIANT payload column. C…",
+            "text": "Keep RAW.EXPERIMENTS intact; add a versioned schema map table EXPERIMENT_SCHEMA_MAP(version STRING, field STRING, json_path STRING). Create a VIEW ANALYTICS_EXPERIMENTS that uses CASE on version to FL",
             "isCorrect": true
           },
           {
-            "id": "d",
-            "text": "Leverage Snowflake Secure Data Sharing across regions. Create a share in REGION1, grant appropriate permissions, and create a reader account in REGION2; implement per-tenant access via a ROW ACCESS POLICY on TENANT_ID a…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical Snowflake ingestion capabilities, automation workflows, and data quality monitoring using a beginner-friendly pipeline architecture.\n\n## Key Concepts\n- Snowpipe auto-ingest with JSON file format parsing\n- External stages and storage integration for S3 connectivity\n- VARIANT data type for semi-structured JSON handling\n- View creation for structured field extraction from JSON payloads\n- TASK scheduling for automated monitoring and validation\n- QA auditing and conditional alerting for ingest health\n\n## Code Example\n```sql\n-- Complete implementation including stage, file format, pipe, view, task, and QA tables\n```\n\n## Follow-up Questions\n- How would you handle schema evolution in the JSON payload structure?\n- What strategies would you implement for cost optimization and performance tuning?\n- How would you extend this pipeline for error handling and retry mechanisms?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-2",
-        "questionId": "q-19894",
-        "question": "Design a near-real-time anomaly pipeline on RAW.PURCHASE_EVENTS to compute per-minute region-wise anomaly_score and persist to ANALYTICS.PERF_ANOMALY (date DATE, region STRING, minute TIMESTAMP_NTZ, anomaly_score NUMBER). Include late-arrival handling up to 2 minutes, idempotent MERGE, and exact SQL for core steps. How would you implement the alerting threshold?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design per-squad monthly budgets using a dedicated RESOURCE_MONITOR per squad, linked to a squad tag. Track usage via ACCOUNT_USAGE.CREDIT_USAGE and a quotas table. Enforce auto_suspend on idle wareho",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "ALTER TABLE RAW_EVENTS CLUSTER BY (TO_DATE(event_ts), category); ALTER TABLE RAW_EVENTS SET AUTO_CLUSTERING = TRUE; CREATE WAREHOUSE WAREHOUSE_COSTCTRL WITH WAREHOUSE_SIZE = 'XSMALL'; CREATE RESOURCE",
-            "isCorrect": false
-          },
-          {
             "id": "c",
-            "text": "Use a per-tenant session_context (TENANT_ID) to drive a ROW ACCESS POLICY and serve data through a SECURE VIEW. Implement masking policies on email/phone revealing values only when SESSION_CONTEXT('TE",
+            "text": "## Solution Design ### Architecture Overview **Data Model** - **Staging Layer**: Raw JSON/Avro data lands in region-specific staging tables with ingestion timestamp, region identifier, and event processing status - **Co…",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Proposed approach: create a STREAM on RAW.PURCHASE_EVENTS to capture inserts; a TASK runs every minute computing region-wise totals and a 60-minute moving mean/stddev, writing to ANALYTICS.PERF_ANOMAL",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests ability to design a Snowflake-native streaming-like pipeline: streams, tasks, windowed analytics, idempotent merges, and alerting with late data handling.\n\n## Key Concepts\n\n- Snowflake Streams and Tasks\n- Windowed region-level analytics (moving mean/stddev)\n- Idempotent MERGE semantics on (date, region, minute)\n- Late-arrival handling with watermarking\n- Alerting and auditing path\n\n## Code Example\n\n```javascript\n-- Create a stream on the source table\nCREATE OR REPLACE STREAM RAW.PURCHASE_EVENTS_STREAM ON TABLE RAW.PURCHASE_EVENTS (event_id STRING, user_id STRING, region STRING, product STRING, amount NUMBER, event_ts TIMESTAMP_NTZ);\n\n-- Aggregation and MERGE into the analytics table (skeleton)\nMERGE INTO ANALYTICS.PERF_ANOMALY AS t\nUSING (\n  SELECT CAST(event_ts AS DATE) AS date, region, DATE_TRUNC('minute', event_ts) AS minute, AVG(amount) AS avg_amt\n  FROM RAW.PURCHASE_EVENTS_STREAM\n  GROUP BY CAST(event_ts AS DATE), region, DATE_TRUNC('minute', event_ts)\n) AS s\nON (t.date = s.date AND t.region = s.region AND t.minute = s.minute)\nWHEN MATCHED THEN UPDATE SET anomaly_score = s.avg_amt\nWHEN NOT MATCHED THEN INSERT (date, region, minute, anomaly_score) VALUES (s.date, s.region, s.minute, s.avg_amt);\n```\n\n## Follow-up Questions\n\n- How would you test late-arrival handling and ensure no duplicates slip through?\n- What monitoring would you add to track the moving window alignment across time zones?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "snowflake-core-q-3",
-        "questionId": "q-28990",
-        "question": "Advanced Snowflake-core: A multi-tenant CDC feed writes into RAW.CDC_EVENTS(tenant_id, table_name, pk, op, payload, ts). Events arrive out-of-order and late up to 24h. Design a generic, idempotent ingestion pipeline that applies changes to per-tenant per-table targets (e.g., RAW_TENANT_{tenant_id}.{table_name}_target) using STREAMs and a NIGHTLY_TASK. Include how to handle inserts/updates/deletes, late-arrival reconciliation, and a minimal QC/log of conflicts. Provide exact SQL for core objects and late-arrival handling?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
             "text": "Use a STREAM on RAW.EVENTS and a NIGHTLY TASK to upsert into DIGEST.TENANT_SUMMARY. Normalize per event by joining RAW.EVENTS to META.SCHEMA_MAP and extracting fields from payload with FLATTEN/OBJECT_",
             "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests ability to design drift-tolerant analytics pipelines in Snowflake, balancing raw preservation, flexible analytics, and maintainable schema evolution.\n\n## Key Concepts\n- Schema drift handling with VARIANT payloads\n- Versioned mapping tables for dynamic flattening\n- Lightweight analytics views vs. re-ingest\n- Tasks for scheduled, incremental refresh\n\n## Code Example\n```sql\n-- 1) Versioned mapping table\nCREATE OR REPLACE TABLE EXPERIMENT_SCHEMA_MAP (\n  version STRING,\n  field STRING,\n  json_path STRING\n);\n```\n```sql\n-- 2) Dynamic analytics view (conceptual)\nCREATE OR REPLACE VIEW ANALYTICS_EXPERIMENTS AS\nSELECT\n  model_id,\n  ts,\n  CASE version\n    WHEN 'v1' THEN payload:metrics.accuracy::FLOAT\n    WHEN 'v2' THEN payload:metrics.latency::FLOAT\n  END AS metric_value\nFROM RAW.EXPERIMENTS;\n```\n```sql\n-- 3) Nightly refresh task (example)\nCREATE OR REPLACE TASK REFRESH_ANALYTICS\nWAREHOUSE = 'COMPUTE_WH'\nSCHEDULE = '1 0 * * *'\nAS\nMERGE INTO PROD.ANALYTICS AS t\nUSING (\n  SELECT model_id, DATE(ts) AS day, AVG(metric_value) AS avg_metric\n  FROM ANALYTICS_EXPERIMENTS\n  GROUP BY model_id, DATE(ts)\n) AS s\nON (t.model_id = s.model_id AND t.day = s.day)\nWHEN MATCHED THEN UPDATE SET t.avg_metric = s.avg_metric\nWHEN NOT MATCHED THEN INSERT (model_id, day, avg_metric) VALUES (s.model_id, s.day, s.avg_metric);\n```\n\n## Follow-up Questions\n- How would you validate late-arriving events are incorporated correctly?\n- How would you handle version deprecation in EXPERIMENT_SCHEMA_MAP without breaking analytics?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-13",
+        "questionId": "q-16027",
+        "question": "Advanced Snowflake-core: You operate a regulated data lake ingesting RAW financial trades and user events into RAW, with curated marts for compliance reporting. Design an end-to-end data lineage and auditability pattern: (a) capture source-to-target lineage across ELT steps using Streams/Tables; (b) enforce per-tenant access controls via ROW ACCESS POLICIES and tag governance; (c) ensure reproducible transformations with time travel and versioned pipelines; (d) provide core SQL to create lineage views and a sample lineage insert for a simple transform?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Implement a multi-tenant analytics pipeline with: (a) idempotent Snowpipe ingest using dedupe_id with COPY INTO conditional logic, (b) STREAM + TASK driving MERGE into partitioned TENANT_DAILY_AGG table, (c) ROW ACCESS…",
+            "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Use a MERGE-based pipeline per (tenant_id, table_name). Maintain a STREAM on each target and a NIGHTLY_TASK that reads RAW.CDC_EVENTS for the previous day, upserts inserts/updates, and deletes on op='",
+            "text": "Outline per-tenant isolation with ROW ACCESS POLICIES on RAW.CTR and a SECURE_VIEW CTR_TENANT_VIEW; create a STREAM on RAW.CTR and a nightly TASK that MERGE INTO DIGEST.DAILY_EVENTS using a delta from",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "## End-to-End Data Lineage and Auditability Pattern for Financial Data Lake ### (a) Source-to-Target Lineage with Streams and Tasks ```sql -- Create source RAW tables CREATE OR REPLACE TABLE RAW.RAW_TRADES ( trade_id ST…",
             "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use a per-tenant Row Access Policy on RAW_EVENTS to filter by TENANT_ID in all downstream objects. Create a STREAM on RAW_EVENTS and a TASK to maintain TENANT_AGG (per-tenant, per-minute). Enable mult",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Question Is Important\n\nRegulatory environments (FINRA, SEC, GDPR, SOX) demand auditable data flows with full provenance tracking. This question tests understanding of Snowflake's native capabilities for:\n\n- **Change Data Capture (CDC)** via Streams\n- **Task automation** for ELT pipelines\n- **Time Travel** for reproducibility and audit\n- **Tag governance** for compliance classification\n- **ROW ACCESS POLICIES** for multi-tenant security\n\n## Key Technical Concepts\n\n### Streams and Tasks\n- **Streams** capture INSERT/UPDATE/DELETE changes on tables with metadata (METADATA$ACTION, METADATA$ROW_ID)\n- **Tasks** schedule and execute SQL automatically, enabling continuous ELT\n- Streams provide efficient lineage tracking by capturing only changed data\n\n### Time Travel\n- Default retention is 1 day; can extend to 90 days (ENTERPRISE edition)\n- AT(OFFSET => -seconds) or AT(TIMESTAMP => 'timestamp') syntax\n- CLONE creates point-in-time copies for reproducibility\n\n### Row Access Policies\n- Applied at table level, evaluate for every row\n- Must consider performance impact on large tables\n- Can be combined with tenant tagging for defense-in-depth\n\n### Tag Governance\n- Tags are key-value pairs at object level (table, column, view)\n- Use TAG_REFERENCES view to audit tag assignments\n- Tags support compliance classification (PII, FINANCIAL, SENSITIVITY)\n\n## Cost and Performance Considerations\n\n- **Streams**: Minimal overhead but consume storage for change tracking\n- **Time Travel**: Storage cost scales with retention period (90 days = ~3x baseline)\n- **ROW ACCESS Policies**: Add WHERE clause evaluation per query; test at scale\n- **Lineage Metadata**: Small table overhead; index lineage_id for fast lookups\n- **Tag Governance**: Negligible performance impact for reads\n\n## Validation Best Practices\n\n1. **Completeness**: Compare source row counts vs lineage record counts\n2. **Drift Detection**: Monitor record counts between runs; alert on anomalies\n3. **Audit Trails**: Query TIME_TRAVEL to verify historical states match lineage records\n4. **Reconciliation**: Join lineage metadata with target tables to verify all records have provenance",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-14",
+        "questionId": "q-25864",
+        "question": "Advanced Snowflake-core: Design a cross‑account fraud scoring pipeline that ingests JSON events from a regional data lake into a centralized warehouse and emits per‑region, per‑customer risk scores. Requirements: (a) external stage ingestion into RAW_EVENTS (event_id STRING, customer_id STRING, region STRING, amount NUMBER, ts TIMESTAMP_NTZ); (b) a STREAM on RAW_EVENTS and a NIGHTLY_TASK to compute a rolling 7‑day baseline and current score; (c) store in FRAUD_SCORES (customer_id STRING, region STRING, date DATE, score FLOAT); (d) handle late arrivals with a watermark and incremental MERGE; (e) alert when score exceeds a threshold. Provide exact SQL for core objects and the nightly task?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Design a cross-account fraud scoring pipeline: ingest JSON events from a external stage into RAW_EVENTS, use a STREAM to track changes, and a NIGHTLY_TASK to compute per-region, per-customer risk via",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use a STREAM RAW.SALES_STREAM ON RAW.SALES to capture new rows. Create a NIGHTLY TASK QC_SALES_NIGHTLY that computes yesterday vs day-before daily aggregates (rows, total_amount, avg_amount) and flags",
+            "isCorrect": false
           },
           {
             "id": "c",
@@ -119,32 +449,92 @@
           },
           {
             "id": "d",
-            "text": "To implement this, use a STREAM on RAW.INVENTORY_MOVES and a MERGE into INVENTORY_SNAPSHOT keyed by (warehouse, sku) to apply qty_change. A NIGHTLY TASK reads INVENTORY_SNAPSHOT to compute stock and d",
+            "text": "Use a per-device clustering key on (DEVICE_ID, TS) in the curated layer. Ingest via a STREAM on raw.events and run a periodic TASK to populate curated.device_scores with 5-minute windows. Expose curated.device_scores th…",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\n\nThis question probes lineage, idempotent CDC ingestion, per-table targets, and late-arrival reconciliation—common real-world needs for multi-tenant data platforms.\n\n## Key Concepts\n\n- CDC ingestion patterns with Snowflake Streams\n- Per-table and per-tenant sharding\n- Upserts and deletes via MERGE\n- Late-arrival reconciliation and QC logging\n\n## Code Example\n\n```sql\n-- (Illustrative) create and use a staging MERGE\n```\n\n## Follow-up Questions\n\n- How would you handle schema drift across tenants?\n- How would you test idempotency?",
+        "explanation": "## Why This Is Asked\nTests end-to-end Snowflake-core pipeline design: ingestion, streams, tasks, late data handling, and anomaly scoring across accounts.\n\n## Key Concepts\n- Snowflake Streams, Tasks, external stages, MERGE, watermarking, rolling baselines, alerting.\n- Data governance: access control, masking, retention.\n\n## Code Example\n```sql\n-- Core objects (illustrative)\nCREATE OR REPLACE STAGE RAW_EVENTS_STAGE URL='s3://region-lake/raw' FILE_FORMAT=(TYPE='JSON');\nCREATE OR REPLACE TABLE RAW_EVENTS(\n  event_id STRING, customer_id STRING, region STRING, amount NUMBER, ts TIMESTAMP_NTZ\n);\nCREATE OR REPLACE STREAM RAW_EVENTS_STREAM ON TABLE RAW_EVENTS (APPEND_ONLY = FALSE);\nCREATE OR REPLACE TABLE FRAUD_SCORES(customer_id STRING, region STRING, date DATE, score FLOAT);\nCREATE OR REPLACE TABLE FRAUD_WATERMARK(date DATE, max_ts TIMESTAMP_NTZ);\n```\n\n## Follow-up Questions\n- How would you test late-arrival handling and boundary conditions?\n- How would you scale the rolling baseline computation to thousands of regions and customers?",
         "difficulty": "advanced"
       },
       {
-        "id": "snowflake-core-q-4",
+        "id": "snowflake-core-q-15",
+        "questionId": "q-7790",
+        "question": "Intermediate Snowflake-core: Ingest events from RAW_API_EVENTS(tenant_id STRING, event_id STRING, payload VARIANT, event_ts TIMESTAMP_NTZ). Build a schema-evolving ETL that converts payload keys into dedicated columns on a target table FLATTENED_API_EVENTS, automatically adding new columns when new keys appear, and handles late-arriving data via Time Travel. Include exact SQL for: (a) creating RAW_API_EVENTS and a STREAM, (b) creating the initial FLATTENED_API_EVENTS with a minimal column set, (c) a nightly TASK that runs a JavaScript stored procedure to detect new keys and emit ALTER TABLE ADD COLUMN statements, (d) the INSERT into FLATTENED_API_EVENTS by expanding payload via OBJECT_PAIRS, (e) an audit table CHANGE_LOG recording added columns and reprocess events. Provide exact SQL for key steps?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a STREAM on RAW_EVENTS and MERGE into CURATED_EVENTS by event_id for idempotent dedupe. Run a 15-minute TASK to MERGE new stream rows into CURATED_EVENTS. Compute a 7-day rolling fraud_score per u",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "CREATE DATABASE DEV_CLONE CLONE PROD_DB; CREATE VIEW DEV_CLONE.PUBLIC.SALES_DEV_LAST90 AS SELECT * FROM DEV_CLONE.PUBLIC.SALES WHERE sale_ts >= DATEADD(day,-90,CURRENT_TIMESTAMP()); CREATE OR REPLACE",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Design a streaming ingest: RAW_API_EVENTS with STREAM; FLATTENED_API_EVENTS initially with a minimal set (tenant_id, event_id, event_ts, key, value); a nightly JavaScript stored procedure detects new",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Use a per-tenant STREAM on RAW_EVENTS; a NIGHTLY TASK runs for yesterday, aggregating by tenant_id: active_users = COUNT(DISTINCT payload:user_id) and total_revenue = SUM(payload:amount) for kind='pur",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nEvaluates ability to design robust, evolving schemas for semi-structured data, combining Snowflake features like Streams, OBJECT_PAIRS, and dynamic DDL via JavaScript.\n\n## Key Concepts\n- Schema evolution with dynamic DDL via JavaScript SPs\n- OBJECT_PAIRS and FLATTEN for payload extraction\n- Streams and Tasks for incremental ingest\n- Time Travel for late-arrival scenarios\n- Audit trail for schema changes\n\n## Code Example\n```javascript\nCREATE OR REPLACE PROCEDURE EVOLVE_SCHEMA()\nRETURNS STRING\nLANGUAGE JAVASCRIPT\nAS $$\n  // Build and execute dynamic ALTER TABLE statements for new keys\n  var sql = '';\n  // detect new keys from RAW_API_EVENTS payloads and append to sql\n  // sanitize key names to valid identifiers\n  snowflake.execute({sql: sql});\n  return 'ok';\n$$;\n```\n\n## Follow-up Questions\n- How would you test late-arrival reprocessing and ensure idempotence?\n- How would you scale key discovery as payload variety grows across tenants?",
+        "difficulty": "intermediate"
+      },
+      {
+        "id": "snowflake-core-q-16",
+        "questionId": "q-24438",
+        "question": "Context: You run a multi-tenant analytics platform ingesting per-tenant events into RAW_EVENTS (tenant_id STRING, event_id STRING, payload VARIANT, ts TIMESTAMP_NTZ). Data arrives late and must be queryable with strong isolation. Design an end-to-end Snowflake solution that (a) enforces per-tenant RBAC and data isolation using Row Access Policies or Secure Views, (b) moves data older than 90 days to ARCHIVE_EVENTS while keeping fast access for recent data, (c) optimizes cross-tenant queries without scanning all tenants via clustering or materialized views, (d) supports late-arriving events with idempotent MERGE into GOLD_EVENTS, and (e) provides audit of access and data movement. Provide core SQL for objects and orchestration?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a STREAM on RAW.SENSOR_READINGS to capture inserts; a nightly TASK computes yesterday's per-region min, max, avg, and count; MERGE into QA.DAILY_REGION_SUMMARY; insert a row into QA.SENSOR_SUMMARY",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Plan: nightly MERGE-based rollup from RAW.SALES_FACT to PUBLIC.SALES_DAILY_SUMMARY by region and day. Create SUMMARY(region STRING, day DATE, total_amount NUMBER, tx_count NUMBER). Schedule a TASK at",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Propose a STREAM on RAW.ORDERS and a NIGHTLY TASK that reads yesterday’s stream and upserts into DIGEST.PRODUCT_REGION_SUMMARY(date, region, category, revenue, orders) using MERGE with MATCH BY (date,",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Implement per-tenant isolation using a ROW ACCESS POLICY on RAW_EVENTS and/or a secure view. Archive data >90 days into ARCHIVE_EVENTS via a TASK that inserts old rows then deletes from RAW_EVENTS. Fo",
+            "isCorrect": true
+          }
+        ],
+        "explanation": "## Why This Is Asked\nThis probes multi-tenant isolation, archival strategy, late-arrival handling, and auditable access patterns under Snowflake at scale.\n\n## Key Concepts\n- Row Access Policies and Secure Views for tenant isolation\n- Time-based archival and deletion for cost control\n- MERGE for idempotent late-arriving data\n- Clustering by tenant_id, ts to optimize tenant-scoped queries\n- Access history/auditing integration\n\n## Code Example\n```sql\n-- Archival (move old rows to ARCHIVE_EVENTS and clean RAW_EVENTS)\nINSERT INTO ARCHIVE_EVENTS\nSELECT * FROM RAW_EVENTS WHERE ts < DATEADD(DAY, -90, CURRENT_TIMESTAMP());\nDELETE FROM RAW_EVENTS WHERE ts < DATEADD(DAY, -90, CURRENT_TIMESTAMP());\n\n-- Late-arriving merge into gold layer\nMERGE INTO GOLD_EVENTS AS g\nUSING RAW_EVENTS AS r\nON g.tenant_id = r.tenant_id AND g.event_id = r.event_id\nWHEN MATCHED THEN UPDATE SET g.payload = r.payload, g.ts = r.ts\nWHEN NOT MATCHED THEN INSERT (tenant_id, event_id, payload, ts) VALUES (r.tenant_id, r.event_id, r.payload, r.ts);\n\n-- Clustering for faster tenant-scoped queries\nALTER TABLE RAW_EVENTS CLUSTER BY (tenant_id, ts);\n\n-- Conceptual ROW ACCESS POLICY (pattern; implement with your auth model)\nCREATE ROW ACCESS POLICY tenant_isolation AS\n(tenant_id STRING) RETURNS BOOLEAN ->\n  (CURRENT_ROLE() IN ('ROLE_TENANT_*') OR tenant_id IS NULL);\n```\n\n## Follow-up Questions\n- How would you scale to 10k tenants with dynamic role mappings?\n- What are the trade-offs of row-level security vs per-tenant schemas?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-17",
         "questionId": "q-12817",
         "question": "Architect an end-to-end Snowflake-core pipeline for a crypto-exchange analytics layer serving 100+ tenants. Ingest streaming trades into RAW.TRADE via Snowpipe; use Streams and a Task to maintain a per-tenant VWAP and volatility MV per symbol; enforce strict isolation with ROW ACCESS POLICIES and dynamic masking; expose per-tenant summaries to external auditors via Secure Data Sharing without exposing raw data. Include concrete SQL skeletons and a validation plan?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Proposed approach: use RAW.TRANSLOG_STREAM; two tasks run every 2 minutes: compute risk_score = APPROX_PERCENTILE(amount, 0.99) over last 5 minutes; failed_count = COUNT(*) FILTER(WHERE status='FAILED",
+            "text": "I’d implement an incremental load with a STREAM on RAW.EVENTS and a nightly TASK. Use MERGE to upsert FACT_EVENTS from RAW.EVENTS_STREAM, then MERGE to DIM_DATE and DIM_USER, and append a row to QA.LO",
             "isCorrect": false
           },
           {
             "id": "b",
-            "text": "Aggregate per-tenant, per-region revenue and CTR with a STREAM and a NIGHTLY TASK. Use RAW.AD_EVENTS_STREAM (tenant_id, region, revenue, clicks, event_ts, event_id). Build a nightly pipeline that stor",
+            "text": "Create a named stage to store CSV files, then use COPY INTO to load data into the RAW schema. Validate row counts against manifest.json and populate QA.SALES_BATCH_AUDIT with validation metrics. Configure a TASK to moni…",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Use a Snowflake Data Share with per-tenant isolation via a Secure View that exposes only aggregated metrics and a ROW ACCESS POLICY tied to a tenant session context. Publish per-tenant access through",
+            "text": "Implement a stream on RAW.TELEMETRY_EVENTS, a nightly MERGE into DIGEST.TELEMETRY_SUMMARY keyed by (date, tenant_id, region), and a late-arrival buffer RAW.TELEMETRY_EVENTS_LATE with a reprocess step.",
             "isCorrect": false
           },
           {
@@ -157,435 +547,195 @@
         "difficulty": "advanced"
       },
       {
-        "id": "snowflake-core-q-5",
-        "questionId": "q-18459",
-        "question": "Beginner Snowflake-core: You have PUBLIC.EMPLOYEES(emp_id STRING, name STRING, email STRING, phone STRING). Create a masking policy to show only the local-part of email for role RESEARCHER, and mask all but last 4 digits of phone for RESEARCHER. Apply to EMAIL and PHONE. Create role RESEARCHER with USAGE on the schema and SELECT on the table, grant the role, and show tests switching roles to verify masks. Provide exact SQL for all steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Create masking policy mp_email(email STRING) RETURNS STRING AS (CASE WHEN CURRENT_ROLE() IN ('RESEARCHER') THEN REGEXP_SUBSTR(email, '^[^@]+') ELSE email END); ALTER TABLE PUBLIC.EMPLOYEES MODIFY COLU",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "I’d implement an incremental load with a STREAM on RAW.EVENTS and a nightly TASK. Use MERGE to upsert FACT_EVENTS from RAW.EVENTS_STREAM, then MERGE to DIM_DATE and DIM_USER, and append a row to QA.LO",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use ORDERS_LAST_LOAD_TS in QA.CONFIG to drive an incremental load. Nightly TASK performs: (a) select new rows from STG.ORDERS where order_ts > (SELECT VALUE FROM QA.CONFIG WHERE KEY='ORDERS_LAST_LOAD_",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Hash emails with SHA2(256) and present hashed_email in a secure view; include region, date(ts) and amount_bucket; do not expose customer_email. Use a daily TASK to populate CURATED.SALES_SECURE from R",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical data masking and RBAC in Snowflake, a common beginner task.\n\n## Key Concepts\n- Dynamic masking policies\n- Role-based access control\n- APPLY POLICY syntax and object grants\n\n## Code Example\n```sql\nCREATE MASKING POLICY mp_email(email STRING) RETURNS STRING AS\n  (CASE WHEN CURRENT_ROLE() IN ('RESEARCHER') THEN REGEXP_SUBSTR(email, '^[^@]+') ELSE email END);\nALTER TABLE PUBLIC.EMPLOYEES MODIFY COLUMN email SET MASKING POLICY mp_email(email);\nCREATE MASKING POLICY mp_phone(p STRING) RETURNS STRING AS\n  (CASE WHEN CURRENT_ROLE() IN ('RESEARCHER') THEN RIGHT(REGEXP_REPLACE(p,'[^0-9]',''),4) ELSE p END);\nALTER TABLE PUBLIC.EMPLOYEES MODIFY COLUMN phone SET MASKING POLICY mp_phone(phone);\n```\n\n## Follow-up Questions\n- How would you test masking with multiple roles?\n- What are performance considerations of masking policies?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-6",
-        "questionId": "q-3718",
-        "question": "Design a near-real-time anomaly detection pipeline in Snowflake for telemetry data: raw.events(tenant_id, device_id, ts, value). Propose data model, a streaming ingestion, and a scheduled task that recomputes per-tenant z-scores over the last 5 minutes every minute, flags |z|>3, and writes to curated.anomalies; expose a secure view for dashboards with per-tenant filtering and discuss latency, cost, and failure handling?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a STREAM on RAW.SALES to capture inserts/updates, and a nightly MERGE into DIGEST.SALES_SUMMARY by date, source_id, after converting amount to USD with DAILY_RATES (date, currency). Deduplicate by",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement an automated data pipeline from S3 to Snowflake using Snowpipe for continuous JSON ingestion. Configure a stage and file format to parse JSON event logs into a RAW.EVENTS table with a VARIANT payload column. C…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a STREAM on raw.events and a TASK every minute to compute per-tenant/device z-scores over the last 5 minutes; write anomalies to curated.anomalies(tenant_id, ts, device_id, value, zscore, is_anoma",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use ORDERS_LAST_LOAD_TS in QA.CONFIG to drive an incremental load. Nightly TASK performs: (a) select new rows from STG.ORDERS where order_ts > (SELECT VALUE FROM QA.CONFIG WHERE KEY='ORDERS_LAST_LOAD_",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design near-real-time per-tenant anomaly pipeline using Snowflake streams, tasks, and windowed analytics; evaluates architectural choices, latency, and cost control.\n\n## Key Concepts\n- Snowflake STREAMS and TASKS for incremental processing\n- Windowed statistics: mean/stddev per (tenant_id, device_id)\n- Per-tenant security: secure views and access controls\n- Clustering strategy and cost considerations\n\n## Code Example\n```sql\n-- simplified per-tenant z-score for last 5 minutes\nSELECT tenant_id, device_id, ts, value,\n       (value - AVG(value) OVER (PARTITION BY tenant_id, device_id\n                                 ORDER BY ts\n                                 RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW)) /\n       NULLIF(STDDEV_POP(value) OVER (PARTITION BY tenant_id, device_id\n                                 ORDER BY ts\n                                 RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING AND CURRENT ROW), 0)\n       AS zscore\nFROM raw.events;\n```\n\n## Follow-up Questions\n- How would you handle late-arriving data or out-of-order events?\n- What monitoring would you set up to detect pipeline drift or skew?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "snowflake-core-q-7",
-        "questionId": "q-25669",
-        "question": "Intermediate Snowflake-core: You ingest inventory movements into RAW.INVENTORY_MOVES (event_id STRING, sku STRING, warehouse STRING, qty_change NUMBER, ts TIMESTAMP_NTZ). Data arrives with duplicates and corrections up to 30 days. Design an idempotent nightly reconciliation that maintains current stock per (warehouse, sku) and emits daily DIGEST.STOCK_SUMMARY (date DATE, warehouse STRING, sku STRING, stock NUMBER, delta NUMBER). Include dedupe, late-arrival handling, and anomaly alerts (negative stock or >5% daily delta). Provide exact SQL for core objects and late-arrival strategy?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "To implement this, use a STREAM on RAW.INVENTORY_MOVES and a MERGE into INVENTORY_SNAPSHOT keyed by (warehouse, sku) to apply qty_change. A NIGHTLY TASK reads INVENTORY_SNAPSHOT to compute stock and d",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement a per-tenant row access policy on raw.events using tenant_id, and expose curated.events via a secure view that enforces the policy automatically. Add a masking policy for sensitive fields in",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a provider-to-consumer Secure Data Share, attach region-specific masking policies to PII columns, and grant region roles in each consumer account. Admins with higher roles see full data; regular r",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Implement a nightly pipeline: create digest_sales(region STRING, day DATE, total_amount NUMBER); create digest_audit(region, day, run_at, status). Schedule a TASK at 02:00 to populate digest_sales wit",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nEvaluates end-to-end handling of idempotent streaming upserts, backfill of late data, de-duplication, and anomaly alerts in Snowflake core.\n\n## Key Concepts\n- Streams and MERGE for upserts\n- Nightly backfill window\n- Late-arrival reconciliation and dedupe\n- Basic anomaly detection (negative stock, delta threshold)\n\n## Code Example\n```sql\nCREATE TABLE RAW.INVENTORY_MOVES( event_id STRING, sku STRING, warehouse STRING, qty_change NUMBER, ts TIMESTAMP_NTZ );\nCREATE OR REPLACE STREAM RAW.INVENTORY_MOVES_STREAM ON TABLE RAW.INVENTORY_MOVES;\nCREATE TABLE INVENTORY_SNAPSHOT (sku STRING, warehouse STRING, stock NUMBER, last_ts TIMESTAMP_NTZ);\nMERGE INTO INVENTORY_SNAPSHOT AS S\nUSING RAW.INVENTORY_MOVES_STREAM AS M\nON S.sku = M.sku AND S.warehouse = M.warehouse\nWHEN MATCHED THEN UPDATE SET stock = S.stock + M.qty_change, last_ts = M.ts\nWHEN NOT MATCHED THEN INSERT (sku, warehouse, stock, last_ts) VALUES (M.sku, M.warehouse, M.qty_change, M.ts);\n```\n\n## Follow-up Questions\n- How would you test backfill correctness across regions?\n- How would you adjust thresholds for anomaly alerts in production?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "snowflake-core-q-8",
-        "questionId": "q-18124",
-        "question": "Advanced Snowflake-core: In a multi-tenant data lake, 1,000+ tenants ingest event streams into RAW tables in Snowflake. You must guarantee per-tenant isolation, near real-time dashboards, and resilience against out-of-order events with deduplication. Propose an end-to-end architecture using Streams/Tasks, per-tenant ROW ACCESS POLICIES, and secure data sharing patterns. Include concrete SQL for core objects and a validation plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Enable per-tenant ingestion via Snowpipe with dedicated stages and pipes for each tenant. Implement Streams on RAW tables to capture inserts, with Tasks orchestrating per-tenant Materialized View cache refreshes. Enforc…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Create a materialized view MV_ORDERS_DAILY that pre-aggregates order data by region and day, implement a nightly task to automatically refresh the view, and maintain refresh metadata in QA.MV_ORDERS_DAILY_LOG for observ…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Implement per-tenant ingestion: RAW_EVENTS(tenant_id, event_id, payload, event_ts); create RAW_EVENTS_STREAM; MERGE into TENANT_EVENTS(tenant_id, event_id, payload, event_ts) using RAW_EVENTS_STREAM o",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Leverage ROW ACCESS POLICIES on a shared RAW_EVENTS and a SECURE VIEW filtered by TENANT_CONTEXT; create a STREAM on RAW_EVENTS and a DAILY_METRICS aggregation per tenant via a TASK; use MERGE to upse",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nEvaluates multi-tenant isolation, exactly-once semantics, and handling out-of-order events at scale using Snowflake Streams/Tasks, ROW ACCESS POLICIES, and secure data sharing.\n\n## Key Concepts\n- Snowflake Streams and Tasks for incremental processing\n- ROW ACCESS POLICIES for tenant isolation\n- Per-tenant deduplication with event_id and offset tracking\n- Secure data sharing and staging patterns\n\n## Code Example\n```sql\n-- Ingest stage and RAW table\nCREATE OR REPLACE STAGE ingested_stage URL='s3://ingest-bucket/tenants/'\n  STORAGE_INTEGRATION='sf_ingest';\nCREATE OR REPLACE TABLE RAW_EVENTS (\n  tenant_id STRING,\n  event_id STRING,\n  payload VARIANT,\n  event_ts TIMESTAMP_NTZ\n);\nCREATE OR REPLACE STREAM RAW_EVENTS_STREAM ON TABLE RAW_EVENTS;\n\n-- Tenant-resolved target and upsert\nCREATE OR REPLACE TABLE TENANT_EVENTS (\n  tenant_id STRING,\n  event_id STRING,\n  payload VARIANT,\n  event_ts TIMESTAMP_NTZ\n);\nMERGE INTO TENANT_EVENTS t\nUSING RAW_EVENTS_STREAM s\nON t.tenant_id = s.tenant_id AND t.event_id = s.event_id\nWHEN NOT MATCHED THEN\n  INSERT (tenant_id, event_id, payload, event_ts)\n  VALUES (s.tenant_id, s.event_id, s.payload, s.event_ts);\n\n-- Row access policy for per-tenant isolation\nCREATE OR REPLACE ROW ACCESS POLICY tenant_rp\nON TENANT_EVENTS\nUSING (tenant_id = CURRENT_ROLE());\n```\n\n## Follow-up Questions\n- How to handle schema evolution for RAW_EVENTS without affecting TENANT_EVENTS?\n- What monitoring would you add to detect ingestion lag per tenant?\n- How would you test failover and data replay reliability for a tenant?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "snowflake-core-q-9",
-        "questionId": "q-3170",
-        "question": "In a Snowflake data lake for an online retailer, raw.orders(order_id STRING, customer_id STRING, order_ts TIMESTAMP_NTZ, items VARIANT, total DECIMAL) ingested 80M rows daily via Snowpipe. Propose a production plan for end-to-end data quality: non-null and unique checks, item totals reconcile to total, automated quarantine for failures, streaming + batch QA, and exact SQL snippets plus rollback/alert procedures?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Build a streaming QA pipeline using Snowflake Streams and Tasks. Create a stream on raw.orders to capture changes, a QC view for data quality checks, and a scheduled task to quarantine failed rows and trigger alerts.",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Propose a validation UDF is_valid_event(ts, type) returning boolean: ts <= CURRENT_TIMESTAMP() and type IS NOT NULL. Use a nightly TASK to insert valid rows into CLEAN.WEB_EVENTS. Log QA results with",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Leverage a STREAM on RAW.TRANSACTIONS, a separate ARCHIVE schema and ARCHIVE_TRANSACTIONS, and a daily TASK to COPY older rows to ARCHIVE and then DELETE from RAW; use a UNION ALL view for dashboards",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Plan: Use Snowflake Secure Data Sharing. Create a provider share EXPOSURES_SHARE and three consumer shares (Oracle, Instacart, Salesforce) with incremental daily data. Apply a masking policy on pii_id",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Question Matters\n\nThis tests your ability to design end-to-end data quality in Snowflake. You need to show practical knowledge of Streams for change tracking, Tasks for automation, quarantine tables for bad data, and alerting.\n\n## Key Components\n\n1. **Snowflake Streams** - Track changes (CDC) on raw tables without extra overhead\n2. **QC Views** - SQL-based quality checks that run in real-time\n3. **Quarantine Tables** - Store rejected records for investigation\n4. **Tasks** - Schedule batch jobs to process and alert on failures\n5. **Alerts** - Notify teams when data quality issues occur\n\n## Implementation\n\n```sql\n-- 1. Create quarantine table for failed records\nCREATE TABLE IF NOT EXISTS raw.orders_quarantine (\n    like raw.orders,\n    quarantine_reason STRING,\n    quarantine_ts TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()\n);\n\n-- 2. Stream captures new rows from Snowpipe\nCREATE OR REPLACE STREAM raw.orders_stream ON TABLE raw.orders;\n\n-- 3. QC View runs validation checks\nCREATE OR REPLACE VIEW raw.orders_qc AS\nSELECT \n    order_id,\n    customer_id,\n    order_ts,\n    items,\n    total,\n    CASE \n        WHEN order_id IS NULL THEN 'NULL_ORDER_ID'\n        WHEN customer_id IS NULL THEN 'NULL_CUSTOMER_ID'\n        WHEN order_ts IS NULL THEN 'NULL_ORDER_TS'\n        WHEN total IS NULL THEN 'NULL_TOTAL'\n        WHEN items IS NULL THEN 'NULL_ITEMS'\n        ELSE NULL\n    END AS quarantine_reason\nFROM raw.orders_stream\nWHERE METADATA$ACTION = 'INSERT';\n\n-- 4. NOT NULL validation check (for monitoring/alerting)\nCREATE OR REPLACE VIEW raw.orders_null_check AS\nSELECT \n    'order_id' AS column_name,\n    COUNT(*) AS null_count\nFROM raw.orders\nWHERE order_id IS NULL\nUNION ALL\nSELECT \n    'customer_id' AS column_name,\n    COUNT(*) AS null_count\nFROM raw.orders\nWHERE customer_id IS NULL\nUNION ALL\nSELECT \n    'order_ts' AS column_name,\n    COUNT(*) AS null_count\nFROM raw.orders\nWHERE order_ts IS NULL;\n\n-- 5. UNIQUE constraint validation using GROUP BY HAVING\nCREATE OR REPLACE VIEW raw.orders_unique_check AS\nSELECT \n    'order_id' AS column_name,\n    COUNT(*) AS duplicate_count\nFROM raw.orders\nGROUP BY order_id\nHAVING COUNT(*) > 1;\n\n-- 6. Item totals reconciliation check\nCREATE OR REPLACE VIEW raw.orders_reconciliation_check AS\nSELECT order_id, total AS reported_total, items_total AS calculated_total\nFROM (\n    SELECT \n        order_id,\n        total,\n        SUM(value:quantity * value:price)::DECIMAL(10,2) AS items_total\n    FROM raw.orders,\n    LATERAL FLATTEN(input => items:items) AS f\n    GROUP BY order_id, total\n)\nWHERE total != items_total;\n\n-- 7. Task to quarantine failures and process valid records\nCREATE OR REPLACE TASK raw.process_orders_qc\n    WAREHOUSE = 'LOAD_WH'\n    SCHEDULE = '5 MINUTE'\nWHEN SYSTEM$STREAM_HAS_DATA('raw.orders_stream')\nAS\nBEGIN\n    -- Quarantine failed rows\n    INSERT INTO raw.orders_quarantine (order_id, customer_id, order_ts, items, total, quarantine_reason)\n    SELECT order_id, customer_id, order_ts, items, total, quarantine_reason\n    FROM raw.orders_qc\n    WHERE quarantine_reason IS NOT NULL;\n    \n    -- Process valid rows (continue pipeline)\n    INSERT INTO staging.orders (order_id, customer_id, order_ts, items, total)\n    SELECT order_id, customer_id, order_ts, items, total\n    FROM raw.orders_qc\n    WHERE quarantine_reason IS NULL;\n    \n    -- Clear stream after processing\n    ALTER STREAM raw.orders_stream SET SHOW_INITIAL_ROWS = FALSE;\nEND;\n\n-- 8. Alert task for critical failures\nCREATE OR REPLACE TASK raw.alert_quarantine_failures\n    WAREHOUSE = 'LOAD_WH'\n    SCHEDULE = '15 MINUTE'\nAS\nBEGIN\n    LET failure_count INTEGER := (SELECT COUNT(*) FROM raw.orders_quarantine \n        WHERE quarantine_ts > DATEADD(minute, -15, CURRENT_TIMESTAMP()));\n    \n    IF (failure_count > 0) THEN\n        -- Trigger alert (Snowflake Alert or external integration)\n        SYSTEM$SEND_EMAIL(\n            'DATA_QUALITY_ALERTS',\n            'data-engineering-team@company.com',\n            'Orders Quarantine Alert: ' || failure_count || ' failures in last 15 minutes',\n            'Review raw.orders_quarantine table for details.'\n        );\n    END IF;\nEND;\n\n-- Enable tasks\nALTER TASK raw.process_orders_qc RESUME;\nALTER TASK raw.alert_quarantine_failures RESUME;\n```\n\n## Rollback Procedure\n\n```sql\n-- Rollback: Move quarantine records back to staging for reprocessing\nINSERT INTO staging.orders (order_id, customer_id, order_ts, items, total)\nSELECT order_id, customer_id, order_ts, items, total\nFROM raw.orders_quarantine\nWHERE quarantine_reason = 'RECONCILIATION_MISMATCH';\n\n-- Or delete quarantine records after fix\nDELETE FROM raw.orders_quarantine \nWHERE quarantine_ts < DATEADD(day, -7, CURRENT_TIMESTAMP());\n```\n\n## Alert Procedures\n\n- Use **Snowflake Alerts** for automated monitoring: `CREATE ALERT order_qc_alert ...`\n- Integrate with **Snowflake Native Apps** (PagerDuty, Slack) or external tools via **Tasks + External Functions**\n- Set thresholds: Alert on >100 failures per hour or >1% error rate\n- Dashboard with **Snowflake Marketplace apps** (Data Quality Monitor)",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "snowflake-core-q-10",
-        "questionId": "q-10423",
-        "question": "You're consolidating a multi-tenant Snowflake data lake used by Oracle, Goldman Sachs, and Lyft. Implement row-level access using a ROW ACCESS POLICY to restrict data by region and tenant, while avoiding performance penalties. Outline roles, policy predicate, how you'd populate a USER_CONTEXT map, how to test correctness, and how you'd measure impact on caching and clustering?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Define a ROW ACCESS POLICY on SALES_TRANSACTIONS: USING (region, tenant_id) RETURNS BOOLEAN -> region IN (SELECT region FROM USER_CONTEXT WHERE user_name = CURRENT_USER()) AND tenant_id IN (SELECT ten",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement per-tenant lineage using STREAMS and TASKS, plus masking and access controls. Create RAW_EVENTS_STREAM on RAW_EVENTS, a TENANT_LINEAGE table populated by a nightly MERGE from the stream, and",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a STREAM on RAW.TELEMETRY_EVENTS and a NIGHTLY TASK that processes the last 2 days to tolerate 48h latency. For each (date, region, event_type): dau = COUNT(DISTINCT device_id), events = COUNT(*),",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Identify loss window using MAX(event_ts). Recover with Time Travel: CREATE TABLE PUBLIC.USER_ACTIVITY_RECOVERED AS SELECT * FROM PUBLIC.USER_ACTIVITY AT(TIMESTAMP => TIMESTAMPADD(HOUR, -24, CURRENT_TI",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests advanced security, governance, and performance trade-offs in Snowflake.\n\n## Key Concepts\n- ROW ACCESS POLICY\n- USER_CONTEXT mappings\n- Multi-tenant isolation\n- Performance impact & testing\n\n## Code Example\n```sql\nCREATE OR REPLACE ROW ACCESS POLICY rap_sales_tenant USING (region, tenant_id) RETURNS BOOLEAN ->\n  region IN (SELECT region FROM USER_CONTEXT WHERE user_name = CURRENT_USER()) AND\n  tenant_id IN (SELECT tenant_id FROM USER_CONTEXT WHERE user_name = CURRENT_USER());\n\nCREATE TABLE USER_CONTEXT (user_name STRING, region STRING, tenant_id STRING);\n```\n\n## Follow-up Questions\n- How would you audit policy violations and detect drift?\n- How would you scale this as new tenants join the lake?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "snowflake-core-q-11",
-        "questionId": "q-22829",
-        "question": "Intermediate Snowflake-core: You operate a multi-regional IoT telemetry platform. Ingest into RAW.TELEMETRY_EVENTS (device_id STRING, region STRING, event_type STRING, value NUMBER, ts TIMESTAMP_NTZ). Events may arrive late (up to 48h). Design a robust nightly reconciliation that computes per-region, per-event_type daily metrics: dau, total_value, events. Write to DIGEST.DAILY_REGION_METRICS (date DATE, region STRING, event_type STRING, dau INT, total_value NUMBER, events INT) via a STREAM and a NIGHTLY TASK. Include late-arrival strategy up to 48h, idempotent MERGE, and anomaly alerts. Provide exact SQL for core steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Create a stream on RAW.ACTIVITY_LOG to capture changes, then build a scheduled task that uses MERGE to incrementally load new rows into ANALYTICS.DAILY_ACTIVITY while preventing duplicates on the composite key (user_id,…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement a Stream on RAW.USAGE_EVENTS and a NIGHTLY_TASK that aggregates yesterday's data per tenant_id, region, currency, converting revenue_estimate to USD via DAILY_CURRENCY_RATES; MERGE results i",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a STREAM on RAW.TELEMETRY_EVENTS and a NIGHTLY TASK that processes the last 2 days to tolerate 48h latency. For each (date, region, event_type): dau = COUNT(DISTINCT device_id), events = COUNT(*),",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design uses Snowpipe to load RAW.clickstream(event_id, user_id, ts, payload) into RAW. A STREAM/MERGE deduplicates on event_id. A masking policy hides user_id in downstream VIEWs. A TASK runs hourly t",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests handling of late data, idempotent upserts and cross-region aggregation. It also asks for explicit SQL to prove correctness and attention to data quality.\n\n## Key Concepts\n- Snowflake Streams and Tasks\n- MERGE upserts with idempotence\n- Late-arrival tolerance using backfilled windows\n- Anomaly alerts via QA checks\n\n## Code Example\n```sql\nMERGE INTO DIGEST.DAILY_REGION_METRICS t USING (\n  SELECT DATE(ts) AS d, region, event_type,\n         COUNT(DISTINCT device_id) AS dau,\n         COUNT(*) AS events,\n         SUM(value) AS total_value\n  FROM RAW.TELEMETRY_EVENTS\n  WHERE ts >= DATEADD(day,-2, CURRENT_DATE()) AND ts < CURRENT_DATE()\n  GROUP BY 1, region, event_type\n) s ON t.date = s.d AND t.region = s.region AND t.event_type = s.event_type\nWHEN MATCHED THEN UPDATE SET dau = s.dau, total_value = s.total_value, events = s.events\nWHEN NOT MATCHED THEN INSERT (date, region, event_type, dau, total_value, events) VALUES (s.d, s.region, s.event_type, s.dau, s.total_value, s.events);\n```\n\n## Follow-up Questions\n- How would you test late-arrival backfills?\n- How would you extend for daily backfill of older days?",
-        "difficulty": "intermediate"
-      },
-      {
-        "id": "snowflake-core-q-12",
-        "questionId": "q-6037",
-        "question": "In Snowflake, given RAW.TRANSLOG ingesting 200M rows/day for a fintech app, design a near-real-time per-customer risk pipeline that updates CURATED.CUSTOMER_RISK every 2 minutes. Use Streams and Tasks, explain data model (RAW vs CURATED), whether to use a materialized view or a rolling aggregate table, and provide exact SQL commands to: 1) create a stream on RAW.TRANSLOG, 2) create a 2-minute TASK to compute 99th percentile of amount in the last 5 minutes and a 2-minute failed transaction count per customer, 3) MERGE results into CURATED.CUSTOMER_RISK, 4) validate with sample queries?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Add a clustering key on REGION and SALE_TS to optimize region and date-based filtering. SQL: ALTER TABLE PUBLIC.SALES_FACT CLUSTER BY (REGION, SALE_TS); Nightly maintenance: CREATE OR REPLACE TASK PUBLIC.NIGHTLY_RECLUST…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "I’d implement per-tenant isolation with clustering by tenant_id; expose a SECURE_VIEW masking PII; MV_APP_EVENTS_DAILY for daily aggregates refreshed by a STREAM on RAW.APP_EVENTS and a TASK; share ma",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Ingest uses streams per source on RAW.SALES_TXN, then a nightly TASK MERGEs into CURATED.SALES_TXN applying currency conversion from RATES (JOIN on currency where effective_date <= ts, latest rate). Q",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Proposed approach: use RAW.TRANSLOG_STREAM; two tasks run every 2 minutes: compute risk_score = APPROX_PERCENTILE(amount, 0.99) over last 5 minutes; failed_count = COUNT(*) FILTER(WHERE status='FAILED",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests ability to design near-real-time pipelines in Snowflake using streams, tasks, and upserts across RAW and CURATED zones. It also touches late-arriving data, windowed aggregates, and cost considerations.\n\n## Key Concepts\n- Snowflake Streams and Tasks for CDC pipelines\n- Windowed aggregations on streams\n- MERGE upserts into curated tables\n- Decision between MV/rolling table\n- Data governance and cost controls\n\n## Code Example\n```sql\nCREATE STREAM RAW.TRANSLOG_STREAM ON TABLE RAW.TRANSLOG;\nCREATE OR REPLACE TASK risk_update\nWAREHOUSE = 'WH_RISK'\nSCHEDULE = '2 MINUTES'\nWHEN SYSTEM$STREAM_HAS_DATA('RAW.TRANSLOG_STREAM')\nAS\nMERGE INTO CURATED.CUSTOMER_RISK AS TARGET\nUSING (\n  SELECT customer_id,\n         APPROX_PERCENTILE(amount, 0.99) AS risk_score,\n         MAX(ts) AS last_updated\n  FROM RAW.TRANSLOG_STREAM\n  WHERE METADATA$ACTION = 'INSERT'\n    AND ts >= DATEADD(MINUTE, -5, CURRENT_TIMESTAMP())\n  GROUP BY customer_id\n) AS SOURCE\nON TARGET.customer_id = SOURCE.customer_id\nWHEN MATCHED THEN UPDATE SET risk_score = SOURCE.risk_score, last_updated = SOURCE.last_updated\nWHEN NOT MATCHED THEN INSERT (customer_id, risk_score, last_updated) VALUES (SOURCE.customer_id, SOURCE.risk_score, SOURCE.last_updated);\n```\n\n## Follow-up Questions\n- How would you test with synthetic data?\n- How handle schema evolution and rollback?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "snowflake-core-q-13",
-        "questionId": "q-7735",
-        "question": "Beginner Snowflake-core: Implement cost controls for a test environment using Resource Monitors. The test warehouse TEST_WAREHOUSE must stay under 300 credits per month. Provide exact SQL to: 1) create a RESOURCE MONITOR TEST_MON with CREDIT_QUOTA = 300, TRIGGERS ON 50 PERCENT DO NOTIFY, ON 80 PERCENT DO SUSPEND; 2) attach TEST_MON to TEST_WAREHOUSE; 3) verify with SHOW RESOURCE_MONITORS and SHOW WAREHOUSES; 4) describe a simple nightly test plan to confirm NOTIFY and SUSPEND actions?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "CREATE RESOURCE MONITOR TEST_MON WITH CREDIT_QUOTA = 300 TRIGGERS ON 50 PERCENT DO NOTIFY, ON 80 PERCENT DO SUSPEND; ALTER WAREHOUSE TEST_WAREHOUSE SET RESOURCE_MONITORS = ('TEST_MON'); SHOW RESOURCE_",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Implement a pipeline with a Snowpipe ingest from S3 to RAW.DEVICE_TELEMETRY, a STREAM on RAW.DEVICE_TELEMETRY to capture changes, a hourly TASK that aggregates the previous hour by device_id (hour_ts,",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Use a STREAM on PUBLIC.API_CALLS and a nightly TASK that reads the stream, aggregates by endpoint for CURRENT_DATE(), and writes to QA.ENDPOINT_DAILY_AUDIT. If total_calls = 0, insert into QA.ALERTS.",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a STREAM on RAW.SENSOR_READINGS to capture inserts; a nightly TASK computes yesterday's per-region min, max, avg, and count; MERGE into QA.DAILY_REGION_SUMMARY; insert a row into QA.SENSOR_SUMMARY",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nCost control is a core operational skill. This question tests understanding of Snowflake Resource Monitors, thresholds, and practical follow-through from creation to verification.\n\n## Key Concepts\n\n- Resource Monitors and credit quotas\n- TRIGGERS and actions (NOTIFY vs SUSPEND)\n- Attaching monitors to warehouses\n- Basic verification via SHOW commands\n\n## Code Example\n\n```javascript\nCREATE RESOURCE MONITOR TEST_MON\n  WITH CREDIT_QUOTA = 300\n  TRIGGERS\n    ON 50 PERCENT DO NOTIFY,\n    ON 80 PERCENT DO SUSPEND;\n\nALTER WAREHOUSE TEST_WAREHOUSE SET RESOURCE_MONITORS = ('TEST_MON');\n\nSHOW RESOURCE_MONITORS;\nSHOW WAREHOUSES;\n```\n\n## Follow-up Questions\n\n- How would you handle multiple test warehouses with shared budgets?\n- What are the caveats of NOTIFY vs SUSPEND in production review cycles?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-14",
-        "questionId": "q-12882",
-        "question": "Beginner Snowflake-core: Implement an incremental ingest from RAW.EVENTS (event_id STRING, user_id STRING, event_type STRING, event_ts TIMESTAMP_NTZ) into PUBLIC.USER_EVENTS (EVENT_ID, USER_ID, EVENT_TYPE, EVENT_TS, INGEST_TS) using a STREAM and a TASK that runs every 15 minutes. Include an audit QA.ETL_AUDIT logging RUN_TS and LOADED_COUNT, and an alert QA.ETL_ALERTS if zero rows were loaded. Provide exact SQL for: (a) destination table, (b) stream, (c) audit table, (d) the TASK with MERGE from stream, (e) the alert logic?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Design a scalable per-tenant streaming pipeline for near real-time dashboards. First, create the RAW_EVENTS table with TENANT_ID, EVENT_TS, and VALUE columns to store incoming event data. Next, create a STREAM on RAW_EV…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Plan: create destination table PUBLIC.USER_EVENTS with INGEST_TS; create RAW.EVENTS_STREAM on RAW.EVENTS; create QA.ETL_AUDIT and QA.ETL_ALERTS; create a TASK that runs every 15 minutes to MERGE new i",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "**Plan:** Overwrite yesterday's per-hour event counts into QA.DAILY_EVENT_SUMMARY using a nightly task. **Step (a) — Truncate and populate:** ```sql TRUNCATE TABLE QA.DAILY_EVENT_SUMMARY; INSERT INTO QA.DAILY_EVENT_SUMM…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use a STREAM RAW.SALES_STREAM ON RAW.SALES to capture new rows. Create a NIGHTLY TASK QC_SALES_NIGHTLY that computes yesterday vs day-before daily aggregates (rows, total_amount, avg_amount) and flags",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical use of streams and tasks for incremental loads, auditing, and basic alerting in Snowflake.\n\n## Key Concepts\n- Snowflake STREAMs for change data capture\n- TASKs to schedule regular ETL\n- MERGE for idempotent upserts\n- Simple auditing and alert flow\n\n## Code Example\n```sql\n-- a) destination table\nCREATE TABLE PUBLIC.USER_EVENTS (\n  EVENT_ID STRING,\n  USER_ID STRING,\n  EVENT_TYPE STRING,\n  EVENT_TS TIMESTAMP_NTZ,\n  INGEST_TS TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()\n);\n\n-- b) stream\nCREATE OR REPLACE STREAM RAW.EVENTS_STREAM ON TABLE RAW.EVENTS (APPEND_ONLY = FALSE);\n\n-- c) audit table\nCREATE TABLE QA.ETL_AUDIT (\n  RUN_TS TIMESTAMP_NTZ,\n  LOADED_COUNT NUMBER\n);\n\n-- d) task (simplified)\n-- Creates a MERGE from the stream and logs audit; actual implementation may vary per environment\nCREATE OR REPLACE TASK ETL.PUBLIC.INGEST_EVENTS\nSCHEDULE = '15 MINUTE'\nWAREHOUSE = WH_SMALL\nAS\nMERGE INTO PUBLIC.USER_EVENTS T\nUSING (\n  SELECT EVENT_ID, USER_ID, EVENT_TYPE, EVENT_TS, CURRENT_TIMESTAMP() AS INGEST_TS\n  FROM RAW.EVENTS_STREAM\n  WHERE METADATA$ACTION = 'INSERT'\n) S\nON T.EVENT_ID = S.EVENT_ID\nWHEN NOT MATCHED THEN\n  INSERT (EVENT_ID, USER_ID, EVENT_TYPE, EVENT_TS, INGEST_TS)\n  VALUES (S.EVENT_ID, S.USER_ID, S.EVENT_TYPE, S.EVENT_TS, S.INGEST_TS);\n\n-- audit\nINSERT INTO QA.ETL_AUDIT(RUN_TS, LOADED_COUNT)\nSELECT CURRENT_TIMESTAMP(), (SELECT COUNT(*) FROM RAW.EVENTS_STREAM WHERE METADATA$ACTION = 'INSERT');\n\n-- e) alert logic\nINSERT INTO QA.ETL_ALERTS(ALERT_TS, MESSAGE)\nSELECT CURRENT_TIMESTAMP(), 'Zero rows loaded' \nWHERE (SELECT COUNT(*) FROM RAW.EVENTS_STREAM WHERE METADATA$ACTION = 'INSERT') = 0;\n```\n\n## Follow-up Questions\n- How would you test idempotency for repeated task executions?\n- How would you scale the approach for high-velocity streams?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-15",
-        "questionId": "q-18321",
-        "question": "Advanced Snowflake-core: You ingest JSON events from diverse sources into RAW.SOURCE_EVENTS and publish per-tenant dashboards. Design a auditable data lineage framework that traces each record from SOURCE_SYSTEM through COPY INTO, STREAMS, and TASKS into TARGET_TABLE, with ROW ACCESS POLICIES ensuring tenant isolation and a lightweight MV-based lineage dashboard. Provide concrete SQL for: (a) lineage table, (b) a STREAM on RAW.SOURCE_EVENTS, (c) a TASK populating lineage, (d) a VIEW exposing lineage to dashboards. Include validation strategies for schema drift and late data?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use Snowpipe to ingest RAW_ORDERS into CURATED_ORDERS with a 5-minute TASK driven by a STREAM on RAW_ORDERS. Currency conversion via a daily CURRENCY_RATE table; USD_REVENUE view joins CURATED_ORDERS",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Design a two-tier store: RAW for ingestion; CURATED with per-key versioning; SERVING for online inference with <50 ms latency. Use MERGE from RAW to CURATED to upsert latest per (feature_id,customer_i",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Build a LINEAGE table with lineage_id, tenant_id, source_system, source_path, load_ts, target_table, target_pk, row_hash. Create a STREAM on RAW.SOURCE_EVENTS, a TASK that maps source to target and in",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design uses a STREAM on RAW.USER_EVENTS to power a NIGHTLY_TASK that upserts per-tenant daily aggregates into DIGEST.USER_ACTIVITY (date, tenant_id, user_id, events, first_ts, last_ts). A downstream M",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis tests end-to-end lineage design across Snowflake primitives (COPY INTO, STREAMS, TASKS) with tenant isolation and analytics-readiness.\n\n## Key Concepts\n- Data lineage modeling with per-row mappings\n- Snowflake Streams, Tasks, and MV for efficient queries\n- ROW ACCESS POLICIES and secure sharing implications\n- Schema drift detection and late-arriving data handling\n\n## Code Example\n```sql\n-- lineage table\nCREATE TABLE LINEAGE (\n  lineage_id STRING,\n  tenant_id STRING,\n  source_system STRING,\n  source_path STRING,\n  load_ts TIMESTAMP_NTZ,\n  target_table STRING,\n  target_pk STRING,\n  row_hash STRING\n);\n\n-- stream on RAW.SOURCE_EVENTS\nCREATE STREAM RAW.SOURCE_EVENTS_STREAM ON TABLE RAW.SOURCE_EVENTS\n  APPEND_ONLY = TRUE;\n\n-- sample task skeleton\nCREATE OR REPLACE TASK BUILD_LINEAGE\n  WAREHOUSE = WH\n  SCHEDULE = '1 HOUR'\nAS\n  INSERT INTO LINEAGE (...)\n  SELECT ... FROM RAW.SOURCE_EVENTS_STREAM;\n\n-- MV for fast lookups\nCREATE MATERIALIZED VIEW LINEAGE_MV AS\nSELECT * FROM LINEAGE;\n\n-- view for dashboards\nCREATE OR REPLACE VIEW LINEAGE_VIEW AS\nSELECT * FROM LINEAGE_MV;\n```\n\n## Follow-up Questions\n- How would you implement drift alerts and late data compensation?\n- How would you test lineage accuracy end-to-end across sources?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "snowflake-core-q-16",
-        "questionId": "q-3911",
-        "question": "Beginner Snowflake-core: You need a dev sandbox for prod_sales that mirrors production but excludes PII and minimizes cost. Outline a practical plan using (1) cloning the schema, (2) masking policies for SSN and email, (3) a read-only data share to the sandbox, and (4) a nightly refresh. Include the exact SQL commands you would run for each step?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a ROW_ACCESS_POLICY on RAW.TICKETS filtering by tenant_id = current_tenant() and surface data via a SECURE_VIEW V_TICKETS. Maintain a tenant-to-role mapping and switch roles on login (e.g.,",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Clone prod_db.prod_sales to sandbox_db via CREATE DATABASE sandbox_db CLONE prod_db; mask pii with masking policies: CREATE MASKING POLICY mask_ssn AS (v STRING) RETURNS STRING -> substr(v,1,3)||'***-",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Design a scalable per-tenant streaming pipeline for near real-time dashboards. First, create the RAW_EVENTS table with TENANT_ID, EVENT_TS, and VALUE columns to store incoming event data. Next, create a STREAM on RAW_EV…",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Use Snowpipe to ingest RAW_ORDERS into CURATED_ORDERS with a 5-minute TASK driven by a STREAM on RAW_ORDERS. Currency conversion via a daily CURRENCY_RATE table; USD_REVENUE view joins CURATED_ORDERS",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\n\nTests practical workflow for creating safe dev sandboxes in Snowflake: cloning, masking policies, secure sharing, and scheduled refresh. Encourages thinking about cost control and data governance at beginner level.\n\n## Key Concepts\n\n- Cloning and zero-copy databases\n- Masking policies on sensitive columns\n- Data sharing and access controls\n- Scheduling and automation with TASK\n\n## Code Example\n\n```javascript\n-- masking policy example\nCREATE MASKING POLICY mask_ssn AS (v STRING) RETURNS STRING -> substr(v,1,3) || '***-****';\n```\n\n## Follow-up Questions\n\n- How would you test masking effectiveness?\n- How would you handle schema changes in prod and reflect them in sandbox?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-17",
-        "questionId": "q-3938",
-        "question": "Beginner Snowflake-core: Onboard a new partner to run analytics on sanitized sales data without touching PII or prod tables. Design a minimal reproducible setup using (1) zero-copy cloning for a dev sandbox, (2) a masking policy on email and phone in a curated view, (3) a secure view enforcing partner_role access, (4) a read-only data share to the partner’s account, and (5) a daily refresh pipeline with Snowflake Tasks. Provide exact SQL for each step?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Implement a Stream on RAW.USAGE_EVENTS and a NIGHTLY_TASK that aggregates yesterday's data per tenant_id, region, currency, converting revenue_estimate to USD via DAILY_CURRENCY_RATES; MERGE results i",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Clone: CREATE DATABASE sandbox_curated CLONE prod_curated; Masking: CREATE MASKING POLICY mp_email AS (e STRING) RETURNS STRING -> CASE WHEN CURRENT_ROLE() IN ('PARTNER') THEN e ELSE NULL END; Secure",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "I’d implement per-tenant isolation with clustering by tenant_id; expose a SECURE_VIEW masking PII; MV_APP_EVENTS_DAILY for daily aggregates refreshed by a STREAM on RAW.APP_EVENTS and a TASK; share ma",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "I would implement a STREAM on RAW.SENSOR_EVENTS to capture inserts, then a NIGHTLY_TASK that computes per-device, per-metric daily average and a 7-day baseline (mean/stddev). Flag if day_avg deviates",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nThis probes practical Snowflake-core skills: sandboxing with zero-copy cloning, data masking decisions, secure views for role-based access, external sharing, and scheduled refreshes. It tests end-to-end governance with minimal risk.\n\n## Key Concepts\n- Zero-copy cloning for safe sandboxes\n- Dynamic/masked data handling for PII\n- Secure views with access control\n- Data shares across accounts\n- Snowflake Tasks for automation\n\n## Code Example\n```sql\n-- Masking policy example (SQL)\nCREATE MASKING POLICY mp_email AS (email STRING) RETURNS STRING ->\n  CASE WHEN CURRENT_ROLE() IN ('PARTNER') THEN email ELSE NULL END;\n```\n\n## Follow-up Questions\n- How would you audit data access across the shared sandbox?\n- What are the considerations for revoking access if the partner no longer should see data?",
-        "difficulty": "beginner"
-      },
-      {
         "id": "snowflake-core-q-18",
-        "questionId": "q-15209",
-        "question": "Describe a scalable, per-tenant near-real-time analytics pipeline in Snowflake for a SaaS analytics platform: ingest per-tenant events with Snowpipe into RAW.TENANT_EVENTS, propagate changes via Streams into per-tenant VWAP and top movers materialized views, enforce strict isolation with ROW ACCESS POLICIES and Secure Views, and expose data to external partners via a Data Share. Include concrete SQL skeletons for core objects and a validation plan?",
+        "questionId": "q-21444",
+        "question": "Advanced Snowflake-core: In a multi-tenant data lake, RAW_EVENTS (tenant_id STRING, event_id STRING, type STRING, payload VARIANT, ts TIMESTAMP_NTZ). Implement tenant-level data governance and automated lineage from RAW_EVENTS into CURATED_EVENTS and DAILY_METRICS using Streams, Tasks, and OBJECT_DEPENDENCIES. Include (1) a STREAM on RAW_EVENTS, (2) a TASK that materializes per-tenant lineage into TENANT_LINEAGE (source_object, target_object, operation, ts), (3) a masked CURATED_EVENTS view enforcing per-tenant access via masking policy and a tenant context, (4) a daily AUDIT_LINEAGE showing missing downstream artifacts or stale lineage. Provide exact SQL for each step?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "Architect a per-tenant real-time pipeline: Snowpipe ingests RAW.TENANT_EVENTS (tenant_id, symbol, price, qty, ts); a STREAM RAW.TENANT_EVENTS_STR feeds a TENANT_VWAP_MV (tenant_id, symbol, vwap, volum",
+            "text": "Implement per-tenant lineage using STREAMS and TASKS, plus masking and access controls. Create RAW_EVENTS_STREAM on RAW_EVENTS, a TENANT_LINEAGE table populated by a nightly MERGE from the stream, and",
             "isCorrect": true
           },
           {
             "id": "b",
-            "text": "I would implement a nightly MERGE from RAW.SESSIONS to PROCESSED.SESSIONS on session_id, deriving duration from payload.duration. A STREAM on PROCESSED_SESSIONS feeds QA.SESSIONS_QC with inserted/upda",
+            "text": "Implement a multi-tenant architecture: one shared RAW schema, per-tenant roles, ROW ACCESS POLICIES on RAW.* filtered by TENANT_ID, and DYNAMIC DATA MASKING for PII. Expose data via SECURE_VIEWS per t",
             "isCorrect": false
           },
           {
             "id": "c",
-            "text": "Create a masking policy that reveals full emails only to SYSADMIN and ANALYST_ADMIN, masking the username otherwise. SQL: CREATE MASKING POLICY email_masking_policy(email STRING) RETURNS STRING -> CAS",
+            "text": "Archive older than 30 days to PUBLIC.USER_EVENTS_ARCHIVE, purge from main, log archived count into QA.RETENTION_AUDIT, and alert if zero rows archived. Schedule nightly with a TASK using cron 0 2 * *",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Ingest with RAW.EVENTS_STREAM and a minute-based TASK that aggregates per-tenant counts over the last 2 minutes, writing to ANALYTICS.ANOMALIES (tenant_id, ts, count, score). Create QA.V_TENANT_EVENTS",
+            "text": "Propose per-tenant streams ingest into RAW, then use per-tenant Streams and Tasks to materialize a MV keyed by tenant_id. Enforce ROW ACCESS and a masking policy on the VARIANT payload, and publish to",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nTests ability to design scalable Snowflake-core pipelines for multi-tenant workloads, combining real-time ingestion, incremental updates, and external sharing with strict isolation.\n\n## Key Concepts\n- Snowpipe ingestion into RAW with tenant_id partitioning\n- Streams and Tasks for CDC-like updates to per-tenant models\n- Materialized Views dedicated to tenant-level aggregates\n- Row Access Policies and Secure Views for isolation\n- Data Sharing to external partners and latency considerations\n\n## Code Example\n```sql\n-- Ingest: RAW table\nCREATE TABLE RAW.TENANT_EVENTS (\n  tenant_id STRING,\n  symbol STRING,\n  price NUMBER(18,4),\n  qty NUMBER,\n  ts TIMESTAMP_NTZ\n);\n\n-- PIPE definition (high level)\nCREATE PIPE RAW.TENANT_EVENTS_PIPE AS\n  COPY INTO RAW.TENANT_EVENTS\n  FROM @stage/tenant_events\n  FILE_FORMAT = (TYPE = 'JSON');\n\n-- STREAM and MV\nCREATE MATERIALIZED VIEW TENANT_VWAP_MV AS\nSELECT tenant_id, symbol, AVG(price) AS vwap, SUM(qty) AS volume\nFROM RAW.TENANT_EVENTS\nGROUP BY tenant_id, symbol;\n\n-- Row access policy (outline)\nCREATE OR REPLACE ROW ACCESS POLICY RAP_TENANT AS\n  (tenant_id STRING) RETURNS BOOLEAN -> CURRENT_TENANT() = tenant_id;\n\n-- Secure view for partners\nCREATE OR REPLACE SECURE VIEW V_TENANT_VWAP AS\nSELECT * FROM TENANT_VWAP_MV\nWHERE RAP_TENANT(tenant_id);\n\n-- Data share (outline)\nCREATE SHARE partner_share;\nGRANT USAGE ON DATABASE mydb TO SHARE partner_share;\n```\n\n## Follow-up Questions\n- How would you handle tenant schema evolution without affecting isolation?\n- How would you monitor latency, preservation of real-time guarantees, and cost as tenants scale?",
+        "explanation": "## Why This Is Asked\nTests end-to-end data governance with per-tenant safeguards, lineage tracking, and production-like auditing.\n\n## Key Concepts\n- Streams and Tasks for incremental lineage\n- OBJECT_DEPENDENCIES for lineage checks\n- Masking/Row-level policies with tenant context\n- Multi-tenant governance and daily audits\n\n## Code Example\n```sql\n-- 1) Stream\nCREATE OR REPLACE STREAM RAW_EVENTS_STREAM ON TABLE RAW_EVENTS;\n\n-- 2) Lineage table + nightly task\nCREATE OR REPLACE TABLE TENANT_LINEAGE (tenant_id STRING, source_object STRING, target_object STRING, operation STRING, ts TIMESTAMP_NTZ);\nCREATE OR REPLACE TASK NIGHTLY_LINEAGE WAREHOUSE = WH_LINEAGE SCHEDULE = 'USING CRON 0 1 * * *'\nAS MERGE INTO TENANT_LINEAGE tgt\nUSING (SELECT tenant_id, 'RAW_EVENTS' AS source_object, 'CURATED_EVENTS' AS target_object, METADATA$ACTION AS operation, CURRENT_TIMESTAMP AS ts FROM RAW_EVENTS_STREAM) src\nON (tgt.tenant_id = src.tenant_id AND tgt.source_object = src.source_object AND tgt.target_object = src.target_object)\nWHEN NOT MATCHED THEN INSERT (tenant_id, source_object, target_object, operation, ts) VALUES (src.tenant_id, src.source_object, src.target_object, src.operation, src.ts);\n\n-- 3) Masking policy and curated view\nCREATE MASKING POLICY tenant_mask AS (val VARCHAR) RETURNS VARCHAR -> CASE WHEN current_role() = 'SYSADMIN' THEN val ELSE NULL END;\nCREATE VIEW CURATED_EVENTS AS SELECT event_id, tenant_id, payload FROM CURATED_EVENTS_BASE WITH MASKING POLICY tenant_mask;\n\n-- 4) Daily audit\nCREATE OR REPLACE VIEW AUDIT_LINEAGE AS SELECT tenant_id, COUNT(*) AS downstream_rows, MAX(ts) AS last_seen FROM TENANT_LINEAGE GROUP BY tenant_id;\n```\n\n## Follow-up Questions\n- How would you add an alert for tenants with stale lineage?\n- How would you test this pipeline end-to-end for late data?\"",
         "difficulty": "advanced"
       },
       {
         "id": "snowflake-core-q-19",
-        "questionId": "q-13832",
-        "question": "In a Snowflake-centric data platform used by a global retailer, you must maintain separate prod/dev/stage environments per region and per tenant with near-zero drift and quick DR. Design a DR strategy using zero-copy cloning, Time Travel, and cross-region Snowflake Data Sharing; include automation with Tasks for region failover, and provide concrete SQL samples for cloning, promoting a clone to prod, and validating recovery?",
+        "questionId": "q-12157",
+        "question": "Snowflake-core beginner: You maintain a landing table RAW.WEB_EVENTS (event_id STRING, user_id STRING, event_type STRING, event_ts TIMESTAMP_NTZ). A nightly ETL loads to CLEAN.WEB_EVENTS. Propose a minimal plan to ensure data quality and lineage: (a) validate event_ts is not future and event_type is not NULL, (b) implement a nightly TASK to run cleanup and insert only valid rows into CLEAN.WEB_EVENTS, (c) log results to QA.WEB_EVENTS_QC with counts by status, (d) raise an ALERT if any invalid rows were found. Include exact SQL for each step?",
         "type": "single",
         "options": [
           {
             "id": "a",
-            "text": "## Architecture Overview ### Database Layers 1. **RAW_DB** - Staged partner data ingested via Snowpipe 2. **PROCESSED_DB** - Cleaned and transformed data with business logic 3. **SHARED_DB** - Partner-specific secure vi…",
+            "text": "Load uses COPY INTO RAW.SESSION_LOGS from @RAW_LOG_STAGE (FILE_FORMAT => 'JSON_FORMAT') with a SELECT to map value:session_id, value:event, value:event_ts, OBJECT_CONSTRUCT(*) AS raw. Create STREAM on",
             "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Propose a validation UDF is_valid_event(ts, type) returning boolean: ts <= CURRENT_TIMESTAMP() and type IS NOT NULL. Use a nightly TASK to insert valid rows into CLEAN.WEB_EVENTS. Log QA results with",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "-- (a) Recover data into PUBLIC.CUSTOMERS_RESTORE using Time Travel CREATE TABLE PUBLIC.CUSTOMERS_RESTORE CLONE PUBLIC.CUSTOMERS AT (TIMESTAMP => TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL '1 DAY')); -- (b) Verify row…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Propose a STREAM on RAW.ORDERS and a NIGHTLY TASK that reads yesterday’s stream and upserts into DIGEST.PRODUCT_REGION_SUMMARY(date, region, category, revenue, orders) using MERGE with MATCH BY (date,",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests end-to-end data quality flow using Snowflake Tasks, UDFs, and QA logging. It gauges how a candidate implement end-to-end validation, auditable logs, and alerting with minimal boilerplate.\n\n## Key Concepts\n- Snowflake UDFs\n- Data validation patterns\n- Tasks and pipelines\n- QA logging and alerts\n\n## Code Example\n```javascript\n-- Example: UDF signature illustration only\nCREATE FUNCTION is_valid_event(ts TIMESTAMP_NTZ, t STRING) RETURNS BOOLEAN LANGUAGE SQL AS 'ts <= CURRENT_TIMESTAMP() AND t IS NOT NULL';\n```\n\n## Follow-up Questions\n- How would you test the pipeline with edge-case data?\n- How would you scale the validation to high-volume streams?",
+        "difficulty": "beginner"
+      },
+      {
+        "id": "snowflake-core-q-20",
+        "questionId": "q-6061",
+        "question": "In a Snowflake data lake serving 10 tenants with strict data isolation and cost controls, design a scalable tenancy model using per-tenant schemas, roles, masking policies, and resource monitors, plus secure shares for common datasets. Explain how you enforce per-tenant quotas, prevent cross-tenant leakage, and validate isolation under peak load. Include concrete SQL snippets for: onboarding a tenant, masking policy, resource monitor, and isolation validation?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Propose a tenancy model with per-tenant schemas and roles, dynamic masking, and per-tenant resource monitors plus per-tenant secure shares for common datasets. Explain quota enforcement, leakage preve",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "**(a) Create the masking policy:** ```sql CREATE MASKING POLICY email_mask AS (VAL STRING) RETURNS STRING -> CASE WHEN CURRENT_ROLE() = 'ADMIN' THEN VAL ELSE CONCAT(LEFT(VAL, 3), REPEAT('*', LENGTH(VAL) - CHARINDEX('@',…",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Use a STREAM on RAW.USER_ACTIVITY to capture inserts, a NIGHTLY TASK computing yesterday’s per-app metrics, and an INSERT into DIGEST.APP_ACTIVITY. Then check against EXPECTED_USERS per app and insert",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Ingest events via Snowpipe into RAW.TENANT_<ID>.TRADES, then use per-tenant Streams to capture changes and feed into CURATED.VWAP_TENANT tables. Implement Tasks to materialize VWAP calculations per symbol on a scheduled…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\n\nTests ability to design a scalable multi-tenant Snowflake architecture focusing on strict isolation and cost controls, leveraging schemas, roles, masking policies, resource monitors, and secure shares.\n\n## Key Concepts\n\n- Per-tenant isolation via separate schemas and roles\n- Cost controls with per-tenant RESOURCE MONITORs\n- Dynamic data masking and row-level access patterns\n- Secure data sharing for common datasets without leakage\n- Validation under peak load and automated tests\n\n## Code Example\n\n```javascript\n-- Onboard tenant\nCREATE SCHEMA TENANT_TEN01;\nCREATE ROLE TENANT_TEN01_ROLE;\nGRANT USAGE ON SCHEMA TENANT_TEN01 TO ROLE TENANT_TEN01_ROLE;\nGRANT USAGE ON DATABASE DB TO ROLE TENANT_TEN01_ROLE;\n\n-- Masking policy example\nCREATE MASKING POLICY tenant_email_mask AS (val STRING) RETURNS STRING\n  -> CASE WHEN CURRENT_ROLE() = 'TENANT_TEN01_ROLE' THEN 'REDACTED' ELSE val END;\n\n-- Resource monitor per tenant\nCREATE RESOURCE MONITOR RM_TEN01 WITH CREDIT_LIMIT = 1000;\nALTER WAREHOUSE WH_TEN01 SET RESOURCE_MONITOR = RM_TEN01;\n\n-- Isolation validation\n-- Ensure cross-tenant access is denied\nSELECT * FROM TENANT_TEN02.SALES LIMIT 1;\n```\n\n## Follow-up Questions\n\n- How would you automate tenant onboarding and deprovisioning at scale?\n- How would you evolve schemas without breaking active tenants?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-21",
+        "questionId": "q-21685",
+        "question": "In a multi-tenant SaaS on Snowflake, RAW_EVENTS(tenant_id STRING, event_id STRING, payload VARIANT, ts TIMESTAMP_NTZ) ingested for hundreds of tenants. You must provide per-tenant isolation, support late arriving events, and keep costs predictable. Design the architecture and provide concrete SQL for: 1) a per-tenant access-control approach (ROW ACCESS POLICY and secure views), 2) a STREAM on RAW_EVENTS and a TASK that materializes daily per-tenant metrics into DAILY_METRICS (tenant_id, date, total_events, distinct_users), 3) a MERGE-based upsert for late-arriving events, 4) a per-tenant RESOURCE_MONITOR with alerting. Provide exact SQL for each step?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Leverage ROW ACCESS POLICIES on a shared RAW_EVENTS and a SECURE VIEW filtered by TENANT_CONTEXT; create a STREAM on RAW_EVENTS and a DAILY_METRICS aggregation per tenant via a TASK; use MERGE to upse",
+            "isCorrect": true
+          },
+          {
+            "id": "b",
+            "text": "Use a STREAM on RAW.ACTIVITY to feed a nightly MERGE into DIGEST.ACTIVITY_DAILY, with date(ts) as the day, tenant_id, and an upsert for active_users, events, and revenue (payload.amount when event_typ",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Create a STREAM on RAW_TRANSACTIONS to capture new/updated rows, a QA_LOG table to record issues, and a TASK every 6 hours that invokes a stored procedure performing three checks: non-null critical fields, amount >= 0,…",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "CREATE TABLE CLEAN_EVENTS( event_id STRING, user_id STRING, event_type STRING, event_ts TIMESTAMP_NTZ ); -- Extraction query with FLATTEN SELECT e.event_id, f.value:'user'.'id' AS user_id, f.value:'type' AS event_type,…",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nAssesses design of scalable, secure multi-tenant data pipelines in Snowflake with real-time ingestion, governance, and cost controls.\n\n## Key Concepts\n- Row access policies\n- Secure views\n- Streams and Tasks\n- MERGE for idempotent late arrivals\n- Resource monitors and alerts\n\n## Code Example\n```sql\n-- Pseudo-SQL: session tenant context\nSET current_tenant = 'tenant_001';\nCREATE OR REPLACE ROW ACCESS POLICY rap_tenant AS (tenant_id STRING) RETURNS BOOLEAN -> (tenant_id = $current_tenant);\nCREATE OR REPLACE SECURE VIEW v_events AS SELECT * FROM RAW_EVENTS WHERE tenant_id = $current_tenant;\n```\n\n## Follow-up Questions\n- How would you test late-arrival events without duplicates?\n- How would you scale the per-tenant monitors to thousands of tenants?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-22",
+        "questionId": "q-8286",
+        "question": "Design an end-to-end Snowflake pipeline for real-time telemetry: RAW.TELEMETRY(tenant_id STRING, device_id STRING, ts TIMESTAMP_NTZ, payload VARIANT) ingested via Snowpipe from S3. Requirements: per-tenant isolation with ROW ACCESS POLICIES, 1-minute latency for the last 5 minutes, cost controls via separate warehouses, and a STREAM+TASK path that materializes per-tenant aggregates in PROD.TELEMETRY_AGG. Provide concrete SQL snippets and steps?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a STREAM on RAW.TELEMETRY and a NIGHTLY TASK to aggregate data by region and metric for the prior day: date(ts). Load results into DIGEST.TELEMETRY_SUMMARY with columns date, region, metric, avg_v",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Design uses Snowpipe to load RAW.clickstream(event_id, user_id, ts, payload) into RAW. A STREAM/MERGE deduplicates on event_id. A masking policy hides user_id in downstream VIEWs. A TASK runs hourly t",
+            "isCorrect": false
+          },
+          {
+            "id": "c",
+            "text": "Explain the ingestion path using a Snowpipe from S3 into RAW.TELEMETRY(tenant_id, device_id, ts, payload). Then a STREAM on RAW.TELEMETRY and a TASK that MERGE-UPDATEs PROD.TELEMETRY_AGG by tenant_id",
+            "isCorrect": true
+          },
+          {
+            "id": "d",
+            "text": "Implement a multi-tenant architecture: one shared RAW schema, per-tenant roles, ROW ACCESS POLICIES on RAW.* filtered by TENANT_ID, and DYNAMIC DATA MASKING for PII. Expose data via SECURE_VIEWS per t",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nReal-time telemetry with strict tenant isolation and cost controls is a common, non-trivial Snowflake pattern.\n\n## Key Concepts\n- Snowpipe, external stage, and file formats for streaming ingestion.\n- STREAM + TASK for incremental per-tenant aggregation.\n- ROW ACCESS POLICIES for tenant isolation; clustering strategy for hot data.\n- Separate warehouses for ingestion vs. analytics; latency alerting.\n\n## Code Example\n```sql\n-- sample snippets\nCREATE FILE FORMAT sf_json ...;\nCREATE STAGE s3_stage URL='s3://bucket/telemetry' CREDENTIALS=(...);\nCREATE PIPE raw_telemetry_pipe AS COPY INTO RAW.TELEMETRY FROM STAGE s3_stage FILE_FORMAT = sf_json;\nCREATE STREAM s_raw_telemetry ON TABLE RAW.TELEMETRY;\nCREATE OR REPLACE TASK t_agg\n  WAREHOUSE = 'WH_ANALYTICS'\n  SCHEDULE = '5 MIN'\nAS\nMERGE INTO PROD.TELEMETRY_AGG AS a\nUSING (SELECT tenant_id, DATE_TRUNC('MINUTE', ts) bucket, COUNT(*) as cnt, MAX(ts) as last_ts\n       FROM RAW.TELEMETRY\n       GROUP BY tenant_id, bucket) AS s\nON a.tenant_id = s.tenant_id AND a.bucket = s.bucket\nWHEN MATCHED THEN UPDATE SET cnt = s.cnt, last_ts = s.last_ts\nWHEN NOT MATCHED THEN INSERT (tenant_id, bucket, cnt, last_ts) VALUES (s.tenant_id, s.bucket, s.cnt, s.last_ts);\n```\n\n## Follow-up Questions\n- How would you validate latency across tenants and detect skew?\n- How would schema evolution in payload VARIANT be handled without breaking downstream dashboards?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-23",
+        "questionId": "q-16111",
+        "question": "Advanced Snowflake-core: Build a cost-efficient, multi-region ingestion and governance pattern for a SaaS telemetry platform. Data arrives as NDJSON in S3 per region. Requirements: per-tenant Snowpipe ingest; use Streams to drive incremental transforms into CURATED_TENANT (tenant_id, event_time); cluster on tenant_id; create a Secure Data Share exposing only aggregated metrics to partners; add QC checks and a validation plan for isolation and freshness. Provide core SQL skeleton?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Use a DR pattern built on regional zero-copy clones of the prod databases for each region/tenant, with Time Travel for point-in-time restores. Mirror governance with cross-region data sharing to keep",
+            "isCorrect": false
+          },
+          {
+            "id": "b",
+            "text": "Per-tenant, region-aware ingest: Snowpipe ingests NDJSON into RAW per region; Streams track changes, a daily Task MERGEs into CURATED_TENANT (partitioned by tenant_id, event_time); cluster on tenant_i",
+            "isCorrect": true
+          },
+          {
+            "id": "c",
+            "text": "Use per-tenant streams on RAW.SALES and RAW.PAYMENTS, merge into DIGEST.TENANT_DAILY; apply a SECURE_VIEW to mask customer_email. A NIGHTLY_TASK computes yesterday’s per-tenant totals from both stream",
+            "isCorrect": false
+          },
+          {
+            "id": "d",
+            "text": "Architect a 90-day live retention with archival: create raw.events_archive LIKE raw.events; daily TASK moves rows with ts < dateadd(day,-90,current_timestamp()) to archive and deletes from live; enabl",
+            "isCorrect": false
+          }
+        ],
+        "explanation": "## Why This Is Asked\nTests end-to-end capability: multi-region ingestion, per-tenant isolation, and governance via Snowflake security features. Probes practical use of Streams, Tasks, clustering, and data sharing in a single workflow.\n\n## Key Concepts\n- Snowpipe + Streams + Tasks for incremental ingestion\n- Per-tenant data layout and clustering strategy\n- Secure Data Sharing with aggregated data\n- Row Access Policies and dynamic masking for PII\n- Data quality checks and validation plans\n\n## Code Example\n```sql\n-- RAW region ingest (pseudo-objects)\nCREATE STAGE raw_region1;\nCREATE PIPE raw_to_raw_stage1 AS COPY INTO RAW_TENANT FROM @raw_region1 FILE_FORMAT=(TYPE=JSON);\n\n-- Change data capture\nCREATE STREAM st_raw_tenant ON TABLE RAW_TENANT;\n\n-- Daily transform into curated per tenant\nCREATE OR REPLACE TASK t_curate_tenant\n  WAREHOUSE = w1\n  SCHEDULE = 'CRON 0 2 * * *'\nAS MERGE INTO CURATED_TENANT AS c\nUSING st_raw_tenant AS s\nON c.tenant_id = s.TENANT_ID\nWHEN MATCHED THEN UPDATE SET c.event_time = s.EVENT_TIME, c.metrics = s.METRICS\nWHEN NOT MATCHED THEN INSERT (tenant_id, event_time, metrics) VALUES (s.TENANT_ID, s.EVENT_TIME, s.METRICS);\n```\n\n## Follow-up Questions\n- How would you tune for cost when tenant cardinality scales to millions?\n- How would you test data freshness and isolation across regions and partners?",
+        "difficulty": "advanced"
+      },
+      {
+        "id": "snowflake-core-q-24",
+        "questionId": "q-11399",
+        "question": "Intermediate Snowflake-core: You’re migrating an existing data warehouse to Snowflake with zero downtime. Design a zero downtime migration pattern using a shadow table, STREAMs, TASKs, and a final switchover. Provide exact SQL for a single table, e.g., CUSTOMER(customer_id STRING, email STRING, last_login TIMESTAMP_NTZ), covering: shadow copy, incremental sync, QA validation, cutover steps, and rollback plan?",
+        "type": "single",
+        "options": [
+          {
+            "id": "a",
+            "text": "Adopt a shadow-table migration: create CUSTOMER_SHADOW, a stream on CUSTOMER, a TASK to MERGE changes into SHADOW, run QA comparing counts and checks, then switch a PROD VIEW to point to the shadow an",
+            "isCorrect": true
           },
           {
             "id": "b",
@@ -594,171 +744,21 @@
           },
           {
             "id": "c",
-            "text": "Use a DR pattern built on regional zero-copy clones of the prod databases for each region/tenant, with Time Travel for point-in-time restores. Mirror governance with cross-region data sharing to keep",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Use a STREAM on RAW.CDN_LOGS and a NIGHTLY TASK to upsert into DIGEST.CDN_SERVICE_SUMMARY. For each date and endpoint compute: traffic = COUNT(*); p95_latency = APPROX_PERCENTILE(latency_ms, 0.95); er",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests deep Snowflake DR capabilities: clones, time travel, cross-region sharing, automation, and validation under multi-region multi-tenant constraints.\n\n## Key Concepts\n- Zero-copy cloning for DR and environment parity\n- Time Travel for PITR and quick rollback\n- Cross-region Snowflake Data Sharing for metadata and data\n- Tasks/warehouses automation for automatic failover\n- Access control and tenant isolation in DR\n- Validation: drills, record counts, latency, data parity\n\n## Code Example\n```sql\n-- Create a regional prod clone for DR\nCREATE CLONE prod_db REGIONAL_US_EAST_clone;\n\n-- Switch to standby on failover (conceptual)\n-- Additional steps would include re-pointing warehouses, reconfiguring network allowlists, and refreshing grants\n```\n\n## Follow-up Questions\n- Describe how you would test DR readiness without impacting production, and what metrics you would watch.\n- How would you handle metadata and catalog drift across regions during failover?",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "snowflake-core-q-20",
-        "questionId": "q-2303",
-        "question": "Scenario: a Snowflake account holds prod_sales.customers with PII. External partners at Oracle, Microsoft, and Nvidia need a sanitized subset for analytics. Propose a beginner-friendly data-share plan: masking policies for PII, a region-limited secure view, and an account-based share. Include commands to implement?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "I would stage duplicates in ORDERS_STG from RAW.ORDERS using ROW_NUMBER() to keep only the latest per order_id, then MERGE into PROD.ORDERS to upsert: update when newer, insert when new. Populate QA.O",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "-- 1. Clone production schema to development using zero-copy clone -- Creates dev_db.sales_clone as a clone of prod_db.sales (no data copied) CREATE SCHEMA dev_db.sales_clone CLONE prod_db.sales; -- 2. Restrict writes o…",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Share a sanitized dataset via Snowflake data sharing. Create a masking policy for PII, apply it to emails/phones, and expose an EU-only secure view. Add that view to an account-based share granted to",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Create a STREAM on RAW_TRANSACTIONS to capture new/updated rows, a QA_LOG table to record issues, and a TASK every 6 hours that invokes a stored procedure performing three checks: non-null critical fields, amount >= 0,…",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nInterview context explanation.\n\n## Key Concepts\n- Data sharing basics; account-based vs reader accounts\n- Secure views for row-level access; masking policies\n- Grant hierarchy and testing access\n\n## Code Example\n```sql\n-- mask policy\nCREATE MASKING POLICY pii_mask AS (VAL STRING) RETURNS STRING\n  CASE WHEN CURRENT_ROLE() IN ('EU_ANALYST') THEN 'REDACTED' ELSE VAL END;\n\n-- apply mask\nALTER TABLE prod_sales.customers MODIFY COLUMN email SET MASKING POLICY pii_mask;\n```\n\n## Follow-up Questions\n- How would you audit share usage?\n- How would you revoke access?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-21",
-        "questionId": "q-24743",
-        "question": "Beginner Snowflake-core: You have a JSON feed of user sessions arriving hourly in stage @s3_session_data. Build a beginner pipeline to load into RAW.SESSIONS, create a STREAM to capture changes, and a nightly TASK that: (a) copies new data to CLEAN.SESSIONS, (b) summarizes yesterday's per-user sessions into ANALYTICS.DAILY_ACTIVE_SESSIONS, (c) appends to QA.ACTIVE_SESSIONS_LOG, and (d) raises an alert in QA.ALERTS if any user had zero sessions yesterday. Include exact SQL for each step?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Proposed plan: isolate tenants in dedicated schemas; stream raw.flags (tenant_id, feature_id, user_id, eval_ts, value) into curated.flags_cache via a 30s TASK, backed by a flags_view. enforce row-leve",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Create a stream on raw.clicks to capture inserts, then a daily Task at 02:00 UTC that reads yesterday's data, aggregates by user_id and day, and MERGE-UPSERTs into dashboard.daily_user_engagement (tot",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Stage the JSON feed from S3 into RAW.SESSIONS via COPY INTO using a JSON FILE_FORMAT. Create RAW.SESSIONS_STREAM on RAW.SESSIONS. Load new rows into CLEAN.SESSIONS from the stream. Nightly TASK: compu",
-            "isCorrect": true
-          },
-          {
-            "id": "d",
-            "text": "Design a lightweight, auditable nightly Snowflake pipeline: ingest RAW.LOGS via a STREAM, normalize ts with TRY_TO_TIMESTAMP_NTZ, compute per-user daily activity, and load into QA.DAILY_USER_ACTIVITY.",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests practical Snowflake-core skills: staging JSON data, using streams for CDC, and orchestrating a nightly job with a concrete audit trail.\n\n## Key Concepts\n- External stages and file formats for JSON\n- COPY INTO data loading\n- Streams on RAW tables\n- NIGHTLY TASKs for aggregations and QA\n- Alerts via LEFT JOIN against a users dimension\n\n## Code Example\n```sql\n-- Create stage/file format and load\nCREATE OR REPLACE FILE FORMAT json_format TYPE = 'JSON';\nCREATE STAGE s3_session_data URL='s3://data/sessions/' FILE_FORMAT = json_format;\nCOPY INTO RAW.SESSIONS FROM @s3_session_data PATTERN = '.*' FILE_FORMAT = (TYPE='JSON');\n```\n```sql\nCREATE STREAM RAW.SESSIONS_STREAM ON TABLE RAW.SESSIONS;\n```\n```sql\nCREATE OR REPLACE TASK analytics.daily_active_sessions\nWAREHOUSE = compute_wh\nSCHEDULE = 'USING CRON 0 2 * * *'\nAS\nINSERT INTO ANALYTICS.DAILY_ACTIVE_SESSIONS (user_id, date, sessions_count, unique_devices)\nSELECT user_id, DATEADD(day,-1,CURRENT_DATE) AS date, COUNT(*) AS sessions_count, COUNT(DISTINCT device) AS unique_devices\nFROM CLEAN.SESSIONS\nWHERE login_ts >= DATEADD(day,-1,CURRENT_DATE) AND login_ts < CURRENT_DATE\nGROUP BY user_id;\n```\n```sql\n-- Append details and raise zero-session alerts\nINSERT INTO QA.ACTIVE_SESSIONS_LOG (session_id, user_id, login_ts, log_ts)\nSELECT session_id, user_id, login_ts, CURRENT_TIMESTAMP()\nFROM CLEAN.SESSIONS\nWHERE login_ts >= DATEADD(day,-1,CURRENT_DATE) AND login_ts < CURRENT_DATE;\n\nINSERT INTO QA.ALERTS (alert_ts, message)\nSELECT CURRENT_TIMESTAMP(), 'Zero sessions yesterday' \nFROM DIM_USERS u\nLEFT JOIN (\n  SELECT user_id FROM CLEAN.SESSIONS\n  WHERE login_ts >= DATEADD(day,-1,CURRENT_DATE) AND login_ts < CURRENT_DATE\n) s ON u.user_id = s.user_id\nWHERE s.user_id IS NULL;\n```\n\n## Follow-up Questions\n- How would you test the nightly TASK locally before enabling production?\n- How would you handle schema drift in the incoming JSON without downtime?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-22",
-        "questionId": "q-14015",
-        "question": "Beginner Snowflake-core: nightly ETL that upserts new rows from PUBLIC.SALES_RAW into PUBLIC.SALES_AGG by country totals: daily sum(amount) per country is added to total_amount; last_event_ts tracks the latest sale_ts. Provide exact SQL for: (a) MERGE into PUBLIC.SALES_AGG using a per-country aggregation from PUBLIC.SALES_RAW, (b) a TASK scheduled nightly to run the MERGE, (c) a QA table QA.SALES_AGG_QC that records run_ts, country_count, added_amount and a simple alert when country_count is 0. Include the SQL to create and populate QA as needed?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Use a Stream on RAW.ENTRIES to MERGE into DIGEST.TENANT_KPIS (tenant_id, day, kpi_value). nightly Task triggers MERGE for all tenants; enforce isolation via ROW ACCESS POLICIES on a SECURE_VIEW DIGEST",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Use a STREAM on RAW.SITE_EVENTS and MERGE INTO CLEAN.SITE_EVENTS BY event_id, selecting the latest ts with ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY ts DESC). Nightly TASK processes last 24h,",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "Best path: add a clustering key on (ts, device_id) to improve pruning for the last-24h window and rely on Snowflake's automatic clustering to maintain it. Avoid premature materialized views in a begin",
+            "text": "Use RAW.SALES_STREAM to capture changes, and a NIGHTLY TASK that re-computes top 10 products by revenue per region for yesterday (sale_ts between dateadd(day,-1,current_date()) and current_date()), th",
             "isCorrect": false
           },
           {
             "id": "d",
-            "text": "Use a MERGE that aggregates 24h data from SALES_RAW by country, updating total_amount and last_event_ts in SALES_AGG; insert if new country. Schedule a NIGHTLY_SALES_AGG task to run the MERGE at 02:00",
-            "isCorrect": true
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests the ability to design a repeatable, auditable nightly ETL using MERGE and TASK, with basic QA hooks.\n\n## Key Concepts\n- MERGE upsert with aggregation\n- TASK scheduling\n- Lightweight QA auditing\n- Idempotent incremental logic\n\n## Code Example\n```sql\nMERGE INTO PUBLIC.SALES_AGG AS tgt\nUSING (\n  SELECT country, SUM(amount) AS added_amount, MAX(sale_ts) AS last_event_ts\n  FROM PUBLIC.SALES_RAW\n  WHERE sale_ts >= DATEADD(day,-1, CURRENT_TIMESTAMP())\n  GROUP BY country\n) AS src\nON tgt.country = src.country\nWHEN MATCHED THEN UPDATE SET total_amount = tgt.total_amount + src.added_amount, last_event_ts = GREATEST(tgt.last_event_ts, src.last_event_ts)\nWHEN NOT MATCHED THEN INSERT (country, total_amount, last_event_ts) VALUES (src.country, src.added_amount, src.last_event_ts);\n```\n\n## Follow-up Questions\n- How would you handle late-arriving data?\n- How would you monitor failures in production?",
-        "difficulty": "beginner"
-      },
-      {
-        "id": "snowflake-core-q-23",
-        "questionId": "q-14339",
-        "question": "Advanced Snowflake-core: You run a SaaS analytics platform with 200+ tenants. Each tenant streams events (clicks, transactions) into RAW tables. You must deliver near-real-time, tenant-isolated dashboards with per-tenant MV caches, and support on-demand data sharing with partner networks. Design an end-to-end pattern using Snowpipe, Streams, Tasks, Materialized Views, Row Access Policies, and Secure Data Sharing. Provide concrete SQL for pattern setup and a validation plan?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "Enable per-tenant ingestion via Snowpipe with dedicated stages and pipes for each tenant. Implement Streams on RAW tables to capture inserts, with Tasks orchestrating per-tenant Materialized View cache refreshes. Enforc…",
-            "isCorrect": true
-          },
-          {
-            "id": "b",
-            "text": "Use a STREAM on RAW.SUPPORT_LOG; a NIGHTLY_TASK to replay yesterday’s data, deduplicate by ticket_id with MERGE into DIGEST.SUPPORT_SUMMARY (date, region, product, tickets, avg_rating). Handle 48h lat",
-            "isCorrect": false
-          },
-          {
-            "id": "c",
-            "text": "CREATE RESOURCE MONITOR TEST_MON WITH CREDIT_QUOTA = 300 TRIGGERS ON 50 PERCENT DO NOTIFY, ON 80 PERCENT DO SUSPEND; ALTER WAREHOUSE TEST_WAREHOUSE SET RESOURCE_MONITORS = ('TEST_MON'); SHOW RESOURCE_",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Identify loss window using MAX(event_ts). Recover with Time Travel: CREATE TABLE PUBLIC.USER_ACTIVITY_RECOVERED AS SELECT * FROM PUBLIC.USER_ACTIVITY AT(TIMESTAMP => TIMESTAMPADD(HOUR, -24, CURRENT_TI",
+            "text": "Use a masking policy on email and phone that returns NULL or 'REDACTED' unless current_role() IN ('PII_AUDIT'). Create REDACTED_VW_ANALYTICS as SELECT tenant_id, user_id, masking(email) AS email, mask",
             "isCorrect": false
           }
         ],
-        "explanation": "## Why This Is Asked\nAssesses depth in end-to-end Snowflake architectural patterns, multi-tenant isolation strategies, and data sharing capabilities.\n\n## Key Concepts\n- Snowpipe-driven per-tenant ingestion with auto-scaling\n- Streams and Tasks for near-real-time materialization pipelines\n- Per-tenant Materialized Views with clustering optimization\n- Row Access Policies for security isolation\n- Secure Data Sharing for partner network integration\n\n## Code Example\n```sql\n-- Per-tenant MV setup with isolation\nCREATE OR REPLACE DATABASE saas_analytics;\nUSE DATABASE saas_analytics;\nCREATE SCHEMA ten",
-        "difficulty": "advanced"
-      },
-      {
-        "id": "snowflake-core-q-24",
-        "questionId": "q-22047",
-        "question": "Intermediate Snowflake-core: You maintain an enterprise customer dimension extracted into RAW.CUSTOMERS (customer_id STRING, name STRING, email STRING, region STRING, updated_at TIMESTAMP_NTZ). Data can arrive late and with updates to any field. Build an SCD Type 2 pipeline to populate DIM.CUSTOMER (customer_id STRING, name STRING, email STRING, region STRING, effective_date DATE, expiry_date DATE, is_active BOOLEAN) using a STREAM on RAW.CUSTOMERS and a NIGHTLY TASK. Include the late-arrival handling (up to 24h), idempotent MERGE logic, and performance considerations (clustering, cost). Provide exact SQL for core objects and the merge steps?",
-        "type": "single",
-        "options": [
-          {
-            "id": "a",
-            "text": "## Architecture Overview ### Database Layers 1. **RAW_DB** - Staged partner data ingested via Snowpipe 2. **PROCESSED_DB** - Cleaned and transformed data with business logic 3. **SHARED_DB** - Partner-specific secure vi…",
-            "isCorrect": false
-          },
-          {
-            "id": "b",
-            "text": "Implement an SCD Type 2: stream RAW.CUSTOMERS into RAW.CUSTOMERS_STREAM, create DIM.CUSTOMER, and a nightly MERGE that closes the old active row when any field changes and inserts a new active row wit",
-            "isCorrect": true
-          },
-          {
-            "id": "c",
-            "text": "Use a STREAM on raw.events and a TASK every minute to compute per-tenant/device z-scores over the last 5 minutes; write anomalies to curated.anomalies(tenant_id, ts, device_id, value, zscore, is_anoma",
-            "isCorrect": false
-          },
-          {
-            "id": "d",
-            "text": "Design uses a STREAM on RAW.USER_EVENTS to power a NIGHTLY_TASK that upserts per-tenant daily aggregates into DIGEST.USER_ACTIVITY (date, tenant_id, user_id, events, first_ts, last_ts). A downstream M",
-            "isCorrect": false
-          }
-        ],
-        "explanation": "## Why This Is Asked\nTests mastery of slowly changing dimensions in Snowflake using Streams and Tasks, with idempotence and late-arrival handling. It also probes performance choices like clustering.\n\n## Key Concepts\n- SCD Type 2\n- Snowflake Streams & Tasks\n- MERGE upserts for history tables\n- Late-arrival handling and idempotence\n- Clustering for read patterns\n\n## Code Example\n```javascript\n-- Create stream\nCREATE STREAM RAW.CUSTOMERS_STREAM ON TABLE RAW.CUSTOMERS;\n\n-- Create dim table\nCREATE TABLE DIM.CUSTOMER (\n  customer_id STRING, name STRING, email STRING, region STRING,\n  effective_date DATE, expiry_date DATE, is_active BOOLEAN\n);\n\n-- Nightly merge (simplified)\nMERGE INTO DIM.CUSTOMER AS D\nUSING (\n  SELECT c.customer_id, c.name, c.email, c.region, c.updated_at\n  FROM RAW.CUSTOMERS_STREAM c\n  WHERE c.updated_at <= DATEADD(hour, 24, CURRENT_TIMESTAMP())\n    QUALIFY ROW_NUMBER() OVER (PARTITION BY c.customer_id ORDER BY c.updated_at DESC) = 1\n) AS S\nON D.customer_id = S.customer_id AND D.is_active = TRUE\nWHEN MATCHED AND (D.name <> S.name OR D.email <> S.email OR D.region <> S.region) THEN\n  UPDATE SET expiry_date = CURRENT_DATE - 1, is_active = FALSE\nWHEN NOT MATCHED THEN\n  INSERT (customer_id, name, email, region, effective_date, expiry_date, is_active)\n  VALUES (S.customer_id, S.name, S.email, S.region, CURRENT_DATE, NULL, TRUE);\n```\n\n## Follow-up Questions\n- How would you detect and reconcile schema evolution (added/removed columns) in this pattern?\n- How would you test idempotence and epoch-accurate history in CI/CD?",
+        "explanation": "## Why This Is Asked\n\nTests ability to design zero-downtime migrations using Snowflake streams, tasks, views, and synonyms, with rollback and QA.\n\n## Key Concepts\n\n- Shadow table pattern for live migrations\n- Streams and Tasks for incremental sync\n- Cutover via view/synonym swap\n- Rollback and QA validation\n\n## Code Example\n\n```sql\n-- Shadow table and stream setup\nCREATE OR REPLACE TABLE CUSTOMER_SHADOW LIKE CUSTOMER;\nCREATE OR REPLACE STREAM CUSTOMER_STREAM ON TABLE CUSTOMER;\n\n-- Incremental merge into shadow\nCREATE OR REPLACE TASK migrate_customer_shadow\n  WAREHOUSE = WH\n  SCHEDULE = 'USING CRON 0 * * * *'\nAS\nMERGE INTO CUSTOMER_SHADOW AS SH\nUSING CUSTOMER_STREAM AS SRC\nON SH.CUSTOMER_ID = SRC.CUSTOMER_ID\nWHEN MATCHED THEN UPDATE SET EMAIL = SRC.EMAIL, LAST_LOGIN = SRC.LAST_LOGIN\nWHEN NOT MATCHED THEN INSERT (CUSTOMER_ID, EMAIL, LAST_LOGIN) VALUES (SRC.CUSTOMER_ID, SRC.EMAIL, SRC.LAST_LOGIN);\n```\n\n```sql\n-- QA checks for migration\nCREATE OR REPLACE TABLE QA.MIGRATION_QA AS\nSELECT\n  (SELECT COUNT(*) FROM CUSTOMER) AS source_rows,\n  (SELECT COUNT(*) FROM CUSTOMER_SHADOW) AS shadow_rows,\n  (SELECT MAX(LAST_LOGIN) FROM CUSTOMER) AS source_last_login;\n```\n\n```sql\n-- Cutover and rollback\nCREATE OR REPLACE VIEW PROD.CUSTOMER AS SELECT * FROM CUSTOMER_SHADOW;\n DROP TABLE IF EXISTS CUSTOMER;\n```\n\n## Follow-up Questions\n\n- How would you scale this to 1000+ tables with dependencies?\n- How would you implement automated QA checks and alerting in case of drift?",
         "difficulty": "intermediate"
       }
     ],
     "passingScore": 70,
-    "createdAt": "2026-10-31T08:01:52.928Z",
+    "createdAt": "2026-10-31T14:43:06.514Z",
     "version": 1
   }
 ]
