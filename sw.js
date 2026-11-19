@@ -4,7 +4,7 @@
  */
 
 // Cache version tied to build time — changes on every deploy, busting stale asset caches
-const CACHE_VERSION = '1795082488334';
+const CACHE_VERSION = '1795109320936';
 const STATIC_CACHE = `code-reels-static-${CACHE_VERSION}`;
 const DATA_CACHE = `code-reels-data-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `code-reels-runtime-${CACHE_VERSION}`;
